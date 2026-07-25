@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -55,8 +54,7 @@ class _CameraThumbnail {
 }
 
 class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
-  static const Duration _thumbnailMotionDuration =
-      Duration(milliseconds: 420);
+  static const Duration _thumbnailMotionDuration = Duration(milliseconds: 420);
   static const double _thumbnailWidth = 112;
   static const double _thumbnailHeight = 78;
   static const double _thumbnailGap = 10;
@@ -335,7 +333,8 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     }
   }
 
-  Future<void> _focusAt(TapDownDetails details, BoxConstraints constraints) async {
+  Future<void> _focusAt(
+      TapDownDetails details, BoxConstraints constraints) async {
     final controller = _controller;
     if (controller == null || _closing) return;
     final point = Offset(
@@ -426,8 +425,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   }
 
   Widget _buildThumbnailStrip() {
-    final double stripWidth =
-        _thumbnailWidth * 3 + _thumbnailGap * 2;
+    final double stripWidth = _thumbnailWidth * 3 + _thumbnailGap * 2;
 
     return SizedBox(
       width: stripWidth,

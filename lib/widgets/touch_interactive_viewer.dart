@@ -43,9 +43,24 @@ class _TouchInteractiveViewerState extends State<TouchInteractiveViewer> {
     final currentFocalPoint = details.localFocalPoint;
 
     final Matrix4 next = Matrix4.identity()
-      ..translate(currentFocalPoint.dx, currentFocalPoint.dy)
-      ..scale(relativeScale)
-      ..translate(-_startFocalPoint.dx, -_startFocalPoint.dy)
+      ..translateByDouble(
+        currentFocalPoint.dx,
+        currentFocalPoint.dy,
+        0.0,
+        1.0,
+      )
+      ..scaleByDouble(
+        relativeScale,
+        relativeScale,
+        relativeScale,
+        1.0,
+      )
+      ..translateByDouble(
+        -_startFocalPoint.dx,
+        -_startFocalPoint.dy,
+        0.0,
+        1.0,
+      )
       ..multiply(_startMatrix);
 
     widget.transformationController.value = next;

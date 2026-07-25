@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:archive/archive.dart';
@@ -323,11 +322,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         pinId: pin.id,
       );
       if (!mounted || _selectedPinId != pin.id) return;
-      final List<PhotoData> photos = rows.map((row) => PhotoData(
-            id: row['photoId'].toString(),
-            fileName: row['fileName']?.toString() ?? '001.jpg',
-            bytes: Uint8List.fromList(row['bytes'] as Uint8List),
-          )).toList(growable: false);
+      final List<PhotoData> photos = rows
+          .map((row) => PhotoData(
+                id: row['photoId'].toString(),
+                fileName: row['fileName']?.toString() ?? '001.jpg',
+                bytes: Uint8List.fromList(row['bytes'] as Uint8List),
+              ))
+          .toList(growable: false);
       setState(() {
         // Keep only the currently viewed pin's full-resolution images in RAM.
         _photosByPinId.clear();
@@ -593,7 +594,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     _nextPinNumber = _pins.length + 1;
   }
 
-
   List<PhotoData> _photosForPin(String pinId) {
     return List<PhotoData>.unmodifiable(
       _photosByPinId[pinId] ?? const <PhotoData>[],
@@ -845,7 +845,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   Future<void> _renderPage(int pageNumber) async {
     final pdfx.PdfDocument? document = _pdfDocument;
-    if (document == null || pageNumber < 1 || pageNumber > document.pagesCount) {
+    if (document == null ||
+        pageNumber < 1 ||
+        pageNumber > document.pagesCount) {
       return;
     }
 
@@ -913,7 +915,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     await _renderPage(pageNumber);
   }
 
-
   String _threeDigits(int value) => value.toString().padLeft(3, '0');
 
   Future<ui.Image> _decodeUiImage(Uint8List bytes) async {
@@ -934,12 +935,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   ) {
     final Color pinColor = Color(pin.colorValue);
     final bool lightColor = pinColor.computeLuminance() > 0.62;
-    final Color edgeColor = lightColor
-        ? const Color(0xFF3B3420)
-        : Colors.white;
-    final Color textColor = lightColor
-        ? const Color(0xFF10151C)
-        : Colors.white;
+    final Color edgeColor = lightColor ? const Color(0xFF3B3420) : Colors.white;
+    final Color textColor = lightColor ? const Color(0xFF10151C) : Colors.white;
     final double radius = 12 * exportScale;
     final double angle = pin.directionDegrees * math.pi / 180;
     final Offset forward = Offset(math.sin(angle), -math.cos(angle));
@@ -982,9 +979,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
     final String label = pin.number.toString();
     final double baseFontSize = 11 * exportScale;
-    final double fontSize = label.length >= 3
-        ? baseFontSize - 2 * exportScale
-        : baseFontSize;
+    final double fontSize =
+        label.length >= 3 ? baseFontSize - 2 * exportScale : baseFontSize;
     final ui.ParagraphBuilder paragraphBuilder = ui.ParagraphBuilder(
       ui.ParagraphStyle(
         textAlign: TextAlign.center,
@@ -1122,11 +1118,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           projectId: widget.projectId,
           pinId: pin.id,
         );
-        final List<PhotoData> photos = storedPhotos.map((row) => PhotoData(
-              id: row['photoId'].toString(),
-              fileName: row['fileName']?.toString() ?? '001.jpg',
-              bytes: row['bytes'] as Uint8List,
-            )).toList(growable: false);
+        final List<PhotoData> photos = storedPhotos
+            .map((row) => PhotoData(
+                  id: row['photoId'].toString(),
+                  fileName: row['fileName']?.toString() ?? '001.jpg',
+                  bytes: row['bytes'] as Uint8List,
+                ))
+            .toList(growable: false);
         if (photos.isEmpty) {
           archive.addFile(ArchiveFile.directory('$folder/'));
           continue;
@@ -1167,7 +1165,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     }
   }
 
-
   void _scheduleSave({
     bool pins = true,
     bool drawings = true,
@@ -1190,17 +1187,19 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     return _saveTail;
   }
 
-  List<Map<String, dynamic>> _serializePins() => _pins.map((p) => {
-        'id': p.id,
-        'number': p.number,
-        'pageNumber': p.pageNumber,
-        'xRatio': p.xRatio,
-        'yRatio': p.yRatio,
-        'directionDegrees': p.directionDegrees,
-        'photoCount': p.photoCount,
-        'note': p.note,
-        'colorValue': p.colorValue,
-      }).toList(growable: false);
+  List<Map<String, dynamic>> _serializePins() => _pins
+      .map((p) => {
+            'id': p.id,
+            'number': p.number,
+            'pageNumber': p.pageNumber,
+            'xRatio': p.xRatio,
+            'yRatio': p.yRatio,
+            'directionDegrees': p.directionDegrees,
+            'photoCount': p.photoCount,
+            'note': p.note,
+            'colorValue': p.colorValue,
+          })
+      .toList(growable: false);
 
   List<Map<String, dynamic>> _serializeStrokes() => _strokesByPage.entries
       .expand((e) => e.value)
@@ -1305,9 +1304,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       final restoredPins = (data['pins'] as List? ?? const []).map((v) {
         final m = v as Map<String, dynamic>;
         return PinData(
-          id: m['id'] as String, number: (m['number'] as num).toInt(),
+          id: m['id'] as String,
+          number: (m['number'] as num).toInt(),
           pageNumber: (m['pageNumber'] as num).toInt(),
-          xRatio: (m['xRatio'] as num).toDouble(), yRatio: (m['yRatio'] as num).toDouble(),
+          xRatio: (m['xRatio'] as num).toDouble(),
+          yRatio: (m['yRatio'] as num).toDouble(),
           directionDegrees: (m['directionDegrees'] as num?)?.toDouble() ?? 0,
           photoCount: (m['photoCount'] as num?)?.toInt() ?? 0,
           note: m['note'] as String? ?? '',
@@ -1319,13 +1320,15 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         final m = v as Map<String, dynamic>;
         final page = (m['pageNumber'] as num).toInt();
         final stroke = DrawingStroke(
-          id: m['id'] as String, pageNumber: page,
+          id: m['id'] as String,
+          pageNumber: page,
           width: (m['width'] as num?)?.toDouble() ?? 3,
           color: Color((m['color'] as num?)?.toInt() ?? 0xFFE53935),
           points: (m['points'] as List? ?? const []).map((v) {
             final p = v as Map<String, dynamic>;
             return DrawingPoint(
-              position: Offset((p['x'] as num).toDouble(), (p['y'] as num).toDouble()),
+              position: Offset(
+                  (p['x'] as num).toDouble(), (p['y'] as num).toDouble()),
               pressure: (p['pressure'] as num?)?.toDouble() ?? 0.5,
             );
           }).toList(),
@@ -1338,11 +1341,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       for (final dynamic raw in (data['photoMeta'] as List? ?? const [])) {
         final Map<String, dynamic> meta = Map<String, dynamic>.from(raw as Map);
         final String pinId = meta['pinId']?.toString() ?? '';
-        if (pinId.isNotEmpty) photoCounts[pinId] = (photoCounts[pinId] ?? 0) + 1;
+        if (pinId.isNotEmpty) {
+          photoCounts[pinId] = (photoCounts[pinId] ?? 0) + 1;
+        }
       }
       for (int i = 0; i < restoredPins.length; i++) {
         restoredPins[i] = restoredPins[i].copyWith(
-          photoCount: photoCounts[restoredPins[i].id] ?? restoredPins[i].photoCount,
+          photoCount:
+              photoCounts[restoredPins[i].id] ?? restoredPins[i].photoCount,
         );
       }
       if (!mounted) return;
@@ -1352,15 +1358,21 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         _pdfName = data['pdfName'] as String? ?? '図面.pdf';
         _pdfPath = '${widget.projectId}-${persistentBytes.length}';
         _pageCount = document.pagesCount;
-        _pins..clear()..addAll(restoredPins);
-        _strokesByPage..clear()..addAll(restoredStrokes);
+        _pins
+          ..clear()
+          ..addAll(restoredPins);
+        _strokesByPage
+          ..clear()
+          ..addAll(restoredStrokes);
         _photosByPinId.clear();
-        _nextPinNumber = (data['nextPinNumber'] as num?)?.toInt() ?? (_pins.length + 1);
+        _nextPinNumber =
+            (data['nextPinNumber'] as num?)?.toInt() ?? (_pins.length + 1);
         _pinColor = Color((data['pinColor'] as num?)?.toInt() ?? 0xFF1976D2);
         _penColor = Color((data['penColor'] as num?)?.toInt() ?? 0xFFE53935);
         _selectedTool = null;
         _penWidth = (data['penWidth'] as num?)?.toDouble() ?? 3;
-        _currentPage = ((data['currentPage'] as num?)?.toInt() ?? 1).clamp(1, _pageCount);
+        _currentPage =
+            ((data['currentPage'] as num?)?.toInt() ?? 1).clamp(1, _pageCount);
       });
       await _renderPage(_currentPage);
       if (widget.exportOnOpen && mounted) {
@@ -1377,7 +1389,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     final strokes = _strokesByPage[_currentPage];
     if (strokes == null || strokes.isEmpty) return;
     final before = strokes.length;
-    strokes.removeWhere((stroke) => stroke.points.any((p) => (p.position - position).distance < 0.025));
+    strokes.removeWhere((stroke) =>
+        stroke.points.any((p) => (p.position - position).distance < 0.025));
     if (strokes.length != before) {
       setState(() {});
       _scheduleSave();
@@ -1562,13 +1575,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
             children: [
               const Padding(
                 padding: EdgeInsets.all(16),
-                child: Text('ページ一覧', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+                child: Text('ページ一覧',
+                    style:
+                        TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
               ),
               Expanded(
                 child: GridView.builder(
                   padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
                   gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: 4, crossAxisSpacing: 12, mainAxisSpacing: 12, childAspectRatio: 0.72,
+                    crossAxisCount: 4,
+                    crossAxisSpacing: 12,
+                    mainAxisSpacing: 12,
+                    childAspectRatio: 0.72,
                   ),
                   itemCount: _pageCount,
                   itemBuilder: (_, index) {
@@ -1581,25 +1599,37 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                       },
                       child: Container(
                         decoration: BoxDecoration(
-                          border: Border.all(color: selected ? AppColors.accent : AppColors.border, width: selected ? 3 : 1),
+                          border: Border.all(
+                              color: selected
+                                  ? AppColors.accent
+                                  : AppColors.border,
+                              width: selected ? 3 : 1),
                           borderRadius: BorderRadius.circular(8),
                         ),
                         child: Column(
                           children: [
                             Expanded(
                               child: ClipRRect(
-                                borderRadius: const BorderRadius.vertical(top: Radius.circular(7)),
+                                borderRadius: const BorderRadius.vertical(
+                                    top: Radius.circular(7)),
                                 child: FutureBuilder<Uint8List?>(
                                   future: _renderThumbnail(pageNumber),
                                   builder: (_, snapshot) => snapshot.hasData
-                                      ? Image.memory(snapshot.data!, fit: BoxFit.contain)
-                                      : const Center(child: CircularProgressIndicator(strokeWidth: 2)),
+                                      ? Image.memory(snapshot.data!,
+                                          fit: BoxFit.contain)
+                                      : const Center(
+                                          child: CircularProgressIndicator(
+                                              strokeWidth: 2)),
                                 ),
                               ),
                             ),
                             Padding(
                               padding: const EdgeInsets.all(8),
-                              child: Text('$pageNumberページ', style: TextStyle(fontWeight: selected ? FontWeight.w800 : FontWeight.w500)),
+                              child: Text('$pageNumberページ',
+                                  style: TextStyle(
+                                      fontWeight: selected
+                                          ? FontWeight.w800
+                                          : FontWeight.w500)),
                             ),
                           ],
                         ),
@@ -1706,9 +1736,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                     SizedBox(
                       width: 72,
                       child: Text(
-                        _pageCount > 0
-                            ? '$_currentPage / $_pageCount'
-                            : '読込中',
+                        _pageCount > 0 ? '$_currentPage / $_pageCount' : '読込中',
                         textAlign: TextAlign.center,
                         style: const TextStyle(
                           color: AppColors.textPrimary,
@@ -1756,8 +1784,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                             onClose: _closePinPanel,
                             onDelete: _deleteSelectedPin,
                             onAddPhotos: _addPhotosToSelectedPin,
-                            onShowAllPhotos:
-                                _showAllPhotosForSelectedPin,
+                            onShowAllPhotos: _showAllPhotosForSelectedPin,
                             onNoteChanged: (_) {
                               _saveSelectedPinNote();
                             },
@@ -1766,9 +1793,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                 ],
               ),
       ),
-      bottomNavigationBar: _pdfDocument == null
-          ? null
-          : _buildBottomToolbar(),
+      bottomNavigationBar: _pdfDocument == null ? null : _buildBottomToolbar(),
     );
   }
 
@@ -1930,8 +1955,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       ),
     );
   }
-
-
 }
 
 class _ToolbarButton extends StatelessWidget {
@@ -1977,16 +2000,15 @@ class _ToolbarButton extends StatelessWidget {
                       : Colors.transparent,
                   borderRadius: BorderRadius.circular(11),
                   border: Border.all(
-                    color: selected
-                        ? const Color(0xFF4AA8FF)
-                        : Colors.transparent,
+                    color:
+                        selected ? const Color(0xFF4AA8FF) : Colors.transparent,
                     width: 1.5,
                   ),
                   boxShadow: selected
                       ? <BoxShadow>[
                           BoxShadow(
-                            color: const Color(0xFF168BFF)
-                                .withValues(alpha: 0.44),
+                            color:
+                                const Color(0xFF168BFF).withValues(alpha: 0.44),
                             blurRadius: 11,
                             spreadRadius: 1,
                           ),
