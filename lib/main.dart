@@ -77,41 +77,10 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<String?> _askName({String initial = ''}) async {
-    final TextEditingController controller =
-        TextEditingController(text: initial);
     final String? result = await showDialog<String>(
       context: context,
-      builder: (BuildContext context) => AlertDialog(
-        backgroundColor: const Color(0xFF07182D),
-        surfaceTintColor: Colors.transparent,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(20),
-          side: const BorderSide(color: AppColors.border),
-        ),
-        title: Text(initial.isEmpty ? '新規プロジェクト' : '案件名を変更'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: '案件名',
-            border: OutlineInputBorder(),
-          ),
-          onSubmitted: (String value) =>
-              Navigator.pop(context, value.trim()),
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('キャンセル'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('決定'),
-          ),
-        ],
-      ),
+      builder: (BuildContext context) => _ProjectNameDialog(initial: initial),
     );
-    controller.dispose();
     return result == null || result.isEmpty ? null : result;
   }
 
@@ -342,6 +311,69 @@ class _HomeScreenState extends State<HomeScreen> {
       Icons.local_hospital_rounded,
     ];
     return icons[index % icons.length];
+  }
+}
+
+class _ProjectNameDialog extends StatefulWidget {
+  const _ProjectNameDialog({required this.initial});
+
+  final String initial;
+
+  @override
+  State<_ProjectNameDialog> createState() => _ProjectNameDialogState();
+}
+
+class _ProjectNameDialogState extends State<_ProjectNameDialog> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initial);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit(String value) {
+    Navigator.of(context).pop(value.trim());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: const Color(0xFF07182D),
+      surfaceTintColor: Colors.transparent,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(20),
+        side: const BorderSide(color: AppColors.border),
+      ),
+      title: Text(
+        widget.initial.isEmpty ? '新規プロジェクト' : '案件名を変更',
+      ),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        decoration: const InputDecoration(
+          labelText: '案件名',
+          border: OutlineInputBorder(),
+        ),
+        onSubmitted: _submit,
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('キャンセル'),
+        ),
+        FilledButton(
+          onPressed: () => _submit(_controller.text),
+          child: const Text('決定'),
+        ),
+      ],
+    );
   }
 }
 
