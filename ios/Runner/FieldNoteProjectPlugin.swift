@@ -14,7 +14,7 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
       binaryMessenger: registrar.messenger()
     )
     let instance = FieldNoteProjectPlugin()
-    instance.viewController = registrar.viewController()
+    instance.viewController = registrar.viewController
     registrar.addMethodCallDelegate(instance, channel: channel)
   }
 
