@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:hive_flutter/hive_flutter.dart';
 
 import '../models/project_summary.dart';
+import 'project_file_store.dart';
 
 /// Large-project storage for FieldNote.
 ///
@@ -67,10 +68,14 @@ class ProjectRepository {
   }
 
   static Future<List<ProjectSummary>> listProjects() async {
+    final List<ProjectSummary> fileProjects =
+        await ProjectFileStore.listProjects();
+    final Map<String, ProjectSummary> projectsById = <String, ProjectSummary>{
+      for (final ProjectSummary project in fileProjects) project.id: project,
+    };
     final Box<dynamic> meta = await _metaBox();
     final Box<dynamic> pinsBox = await _pinsBox();
     final Box<dynamic> photoMetaBox = await _photoMetaBox();
-    final List<ProjectSummary> projects = <ProjectSummary>[];
 
     final Map<String, int> photoCounts = <String, int>{};
     for (final dynamic key in photoMetaBox.keys) {
@@ -89,14 +94,17 @@ class ProjectRepository {
           DateTime.tryParse(record['updatedAt']?.toString() ?? '') ??
               DateTime.fromMillisecondsSinceEpoch(0);
       final List<dynamic> pins = _asList(pinsBox.get(projectId));
-      projects.add(ProjectSummary(
-        id: projectId,
-        name: record['projectName']?.toString() ?? '名称未設定',
-        updatedAt: updatedAt,
-        pageCount: (record['pageCount'] as num?)?.toInt() ?? 0,
-        photoCount: photoCounts[projectId] ?? 0,
-        pinCount: pins.length,
-      ));
+      projectsById.putIfAbsent(
+        projectId,
+        () => ProjectSummary(
+          id: projectId,
+          name: record['projectName']?.toString() ?? '名称未設定',
+          updatedAt: updatedAt,
+          pageCount: (record['pageCount'] as num?)?.toInt() ?? 0,
+          photoCount: photoCounts[projectId] ?? 0,
+          pinCount: pins.length,
+        ),
+      );
     }
 
     // Until a legacy project is opened/migrated, keep it visible on Home.
@@ -105,17 +113,20 @@ class ProjectRepository {
       final String? rawIndex = legacy.get(_legacyIndexKey) as String?;
       if (rawIndex != null) {
         final List<dynamic> oldList = jsonDecode(rawIndex) as List<dynamic>;
-        final Set<String> existingIds = projects.map((e) => e.id).toSet();
         for (final dynamic item in oldList) {
           final ProjectSummary old = ProjectSummary.fromJson(_asMap(item));
-          if (!existingIds.contains(old.id)) projects.add(old);
+          projectsById.putIfAbsent(old.id, () => old);
         }
       }
     } catch (_) {
       // A broken legacy index must not hide valid v5 projects.
     }
 
-    projects.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    final List<ProjectSummary> projects = projectsById.values.toList();
+    projects.sort(
+      (ProjectSummary a, ProjectSummary b) =>
+          b.updatedAt.compareTo(a.updatedAt),
+    );
     return projects;
   }
 
@@ -134,20 +145,99 @@ class ProjectRepository {
     await box.put(id, current);
   }
 
+  static Future<void> createProject({
+    required String id,
+    required String name,
+  }) async {
+    await ProjectFileStore.createProject(
+      projectId: id,
+      projectName: name,
+    );
+    if (ProjectFileStore.isAuthoritative) {
+      try {
+        await touchProject(id: id, name: name);
+      } catch (_) {
+        // The project folder and manifest already exist.
+      }
+    } else {
+      await touchProject(id: id, name: name);
+    }
+  }
+
   static Future<void> savePdfOnce({
     required String projectId,
     required String projectName,
-    required String pdfName,
     required Uint8List bytes,
   }) async {
     if (bytes.isEmpty) throw StateError('PDFデータが空です。');
-    final Box<dynamic> box = await _pdfBox();
-    await box.put(projectId, Uint8List.fromList(bytes));
-    await touchProject(
-      id: projectId,
-      name: projectName,
-      values: <String, dynamic>{'pdfName': pdfName},
+    await ProjectFileStore.saveOriginalPdf(
+      projectId: projectId,
+      projectName: projectName,
+      bytes: bytes,
     );
+    Future<void> updateCache() async {
+      final Box<dynamic> box = await _pdfBox();
+      if (ProjectFileStore.isAuthoritative) {
+        await box.delete(projectId);
+      } else {
+        await box.put(projectId, Uint8List.fromList(bytes));
+      }
+      await touchProject(
+        id: projectId,
+        name: projectName,
+        values: <String, dynamic>{'pdfName': '$projectName.pdf'},
+      );
+    }
+
+    if (ProjectFileStore.isAuthoritative) {
+      try {
+        await updateCache();
+      } catch (_) {
+        // The user-visible project folder is already safely committed.
+      }
+    } else {
+      await updateCache();
+    }
+  }
+
+  static Future<void> saveProjectSnapshot({
+    required String projectId,
+    required String projectName,
+    required Map<String, dynamic> metadata,
+    required List<Map<String, dynamic>> pins,
+    required List<Map<String, dynamic>> strokes,
+  }) async {
+    // The project folder is authoritative on iPad. Loading through the public
+    // API preserves photo metadata even when Hive was rebuilt or cleared.
+    final List<Map<String, dynamic>> photos =
+        await loadPhotoMetadata(projectId);
+    await ProjectFileStore.saveSnapshot(
+      projectId: projectId,
+      projectName: projectName,
+      metadata: metadata,
+      pins: pins,
+      strokes: strokes,
+      photos: photos,
+    );
+    Future<void> updateCache() async {
+      await savePins(projectId: projectId, pins: pins);
+      await saveDrawings(projectId: projectId, strokes: strokes);
+      await touchProject(
+        id: projectId,
+        name: projectName,
+        values: metadata,
+      );
+    }
+
+    if (ProjectFileStore.isAuthoritative) {
+      try {
+        await updateCache();
+      } catch (_) {
+        // Hive is only an index/cache when ordinary project files are present.
+      }
+    } else {
+      await updateCache();
+    }
   }
 
   static Future<void> savePins({
@@ -166,35 +256,71 @@ class ProjectRepository {
 
   static Future<void> savePhoto({
     required String projectId,
+    required String projectName,
     required String pinId,
+    required int pinNumber,
     required String photoId,
     required String fileName,
     required Uint8List bytes,
     Uint8List? thumbnailBytes,
   }) async {
     if (bytes.isEmpty) throw StateError('写真データが空です。');
-    final Box<dynamic> bytesBox = await _photoBytesBox();
-    final Box<dynamic> metaBox = await _photoMetaBox();
-    final Box<dynamic> thumbnailBox = await _thumbnailBox();
+    await ProjectFileStore.savePhoto(
+      projectId: projectId,
+      projectName: projectName,
+      pinId: pinId,
+      pinNumber: pinNumber,
+      photoId: photoId,
+      fileName: fileName,
+      bytes: bytes,
+    );
     final String key = _photoKey(projectId, photoId);
-
-    // Binary first, metadata second. A crash cannot leave visible metadata that
-    // points to missing image bytes.
-    await bytesBox.put(key, Uint8List.fromList(bytes));
-    if (thumbnailBytes != null && thumbnailBytes.isNotEmpty) {
-      await thumbnailBox.put(key, Uint8List.fromList(thumbnailBytes));
+    Future<void> updateCache() async {
+      final Box<dynamic> metaBox = await _photoMetaBox();
+      final Box<dynamic> thumbnailBox = await _thumbnailBox();
+      if (ProjectFileStore.isAuthoritative) {
+        await (await _photoBytesBox()).delete(key);
+      } else {
+        // Web has no ordinary project folder, so Hive remains the primary store.
+        await (await _photoBytesBox()).put(
+          key,
+          Uint8List.fromList(bytes),
+        );
+      }
+      if (thumbnailBytes != null && thumbnailBytes.isNotEmpty) {
+        await thumbnailBox.put(key, Uint8List.fromList(thumbnailBytes));
+      }
+      await metaBox.put(key, <String, dynamic>{
+        'projectId': projectId,
+        'pinId': pinId,
+        'pinNumber': pinNumber,
+        'photoId': photoId,
+        'fileName': fileName,
+        'createdAt': DateTime.now().toIso8601String(),
+        'byteLength': bytes.length,
+      });
     }
-    await metaBox.put(key, <String, dynamic>{
-      'projectId': projectId,
-      'pinId': pinId,
-      'photoId': photoId,
-      'fileName': fileName,
-      'createdAt': DateTime.now().toIso8601String(),
-      'byteLength': bytes.length,
-    });
+
+    if (ProjectFileStore.isAuthoritative) {
+      try {
+        await updateCache();
+      } catch (_) {
+        // The full-size photo and its manifest record are already committed.
+      }
+    } else {
+      await updateCache();
+    }
   }
 
   static Future<List<Map<String, dynamic>>> loadPhotoMetadata(
+      String projectId) async {
+    final List<Map<String, dynamic>>? files =
+        await ProjectFileStore.loadPhotoMetadata(projectId);
+    if (files != null) return files;
+    return _loadHivePhotoMetadata(projectId);
+  }
+
+  static Future<List<Map<String, dynamic>>> _loadHivePhotoMetadata(
       String projectId) async {
     final Box<dynamic> metaBox = await _photoMetaBox();
     final List<Map<String, dynamic>> result = <Map<String, dynamic>>[];
@@ -202,8 +328,8 @@ class ProjectRepository {
       final Map<String, dynamic> meta = _asMap(metaBox.get(key));
       if (meta['projectId']?.toString() == projectId) result.add(meta);
     }
-    result.sort((a, b) =>
-        (a['createdAt']?.toString() ?? '').compareTo(b['createdAt']?.toString() ?? ''));
+    result.sort((a, b) => (a['createdAt']?.toString() ?? '')
+        .compareTo(b['createdAt']?.toString() ?? ''));
     return result;
   }
 
@@ -211,6 +337,13 @@ class ProjectRepository {
     required String projectId,
     required String pinId,
   }) async {
+    final List<Map<String, dynamic>>? files =
+        await ProjectFileStore.loadPhotosForPin(
+      projectId: projectId,
+      pinId: pinId,
+    );
+    if (files != null) return files;
+
     final Box<dynamic> metaBox = await _photoMetaBox();
     final Box<dynamic> bytesBox = await _photoBytesBox();
     final Box<dynamic> thumbnailBox = await _thumbnailBox();
@@ -227,15 +360,19 @@ class ProjectRepository {
       if (bytes == null || bytes.isEmpty) continue;
       result.add(<String, dynamic>{...meta, 'bytes': bytes});
     }
-    result.sort((a, b) =>
-        (a['createdAt']?.toString() ?? '').compareTo(b['createdAt']?.toString() ?? ''));
+    result.sort((a, b) => (a['createdAt']?.toString() ?? '')
+        .compareTo(b['createdAt']?.toString() ?? ''));
     return result;
   }
 
   static Future<List<Map<String, dynamic>>> loadAllPhotos(
       String projectId) async {
+    final List<Map<String, dynamic>>? files =
+        await ProjectFileStore.loadAllPhotos(projectId);
+    if (files != null) return files;
+
     final List<Map<String, dynamic>> meta =
-        await loadPhotoMetadata(projectId);
+        await _loadHivePhotoMetadata(projectId);
     final Box<dynamic> bytesBox = await _photoBytesBox();
     final List<Map<String, dynamic>> result = <Map<String, dynamic>>[];
     for (final Map<String, dynamic> item in meta) {
@@ -253,23 +390,43 @@ class ProjectRepository {
     required String projectId,
     required String pinId,
   }) async {
-    final Box<dynamic> metaBox = await _photoMetaBox();
-    final Box<dynamic> bytesBox = await _photoBytesBox();
-    final Box<dynamic> thumbnailBox = await _thumbnailBox();
-    final List<dynamic> keys = <dynamic>[];
-    for (final dynamic key in metaBox.keys) {
-      final Map<String, dynamic> meta = _asMap(metaBox.get(key));
-      if (meta['projectId']?.toString() == projectId &&
-          meta['pinId']?.toString() == pinId) {
-        keys.add(key);
+    await ProjectFileStore.deletePhotosForPin(
+      projectId: projectId,
+      pinId: pinId,
+    );
+    Future<void> clearCache() async {
+      final Box<dynamic> metaBox = await _photoMetaBox();
+      final Box<dynamic> bytesBox = await _photoBytesBox();
+      final Box<dynamic> thumbnailBox = await _thumbnailBox();
+      final List<dynamic> keys = <dynamic>[];
+      for (final dynamic key in metaBox.keys) {
+        final Map<String, dynamic> meta = _asMap(metaBox.get(key));
+        if (meta['projectId']?.toString() == projectId &&
+            meta['pinId']?.toString() == pinId) {
+          keys.add(key);
+        }
       }
+      await metaBox.deleteAll(keys);
+      await bytesBox.deleteAll(keys);
+      await thumbnailBox.deleteAll(keys);
     }
-    await metaBox.deleteAll(keys);
-    await bytesBox.deleteAll(keys);
-    await thumbnailBox.deleteAll(keys);
+
+    if (ProjectFileStore.isAuthoritative) {
+      try {
+        await clearCache();
+      } catch (_) {
+        // The photo folder and manifest records are already removed.
+      }
+    } else {
+      await clearCache();
+    }
   }
 
   static Future<Map<String, dynamic>?> loadProject(String id) async {
+    final Map<String, dynamic>? fileProject =
+        await ProjectFileStore.loadProject(id);
+    if (fileProject != null) return fileProject;
+
     final Box<dynamic> metaBox = await _metaBox();
     Map<String, dynamic> meta = _asMap(metaBox.get(id));
 
@@ -284,16 +441,97 @@ class ProjectRepository {
 
     final List<dynamic> pins = _asList((await _pinsBox()).get(id));
     final List<dynamic> strokes = _asList((await _drawingsBox()).get(id));
-    final List<Map<String, dynamic>> photoMeta = await loadPhotoMetadata(id);
+    final List<Map<String, dynamic>> photoMeta =
+        await _loadHivePhotoMetadata(id);
 
     // Only metadata is loaded at startup. Full image bytes are loaded per pin.
-    return <String, dynamic>{
+    final Map<String, dynamic> project = <String, dynamic>{
       ...meta,
       'pdfBytes': pdfBytes,
       'pins': pins,
       'strokes': strokes,
       'photoMeta': photoMeta,
     };
+    await _migrateProjectToFiles(id, project);
+    return project;
+  }
+
+  static Future<void> _migrateProjectToFiles(
+    String projectId,
+    Map<String, dynamic> project,
+  ) async {
+    final Uint8List? pdf = _asBytes(project['pdfBytes']);
+    if (pdf == null || pdf.isEmpty) return;
+    final String name = project['projectName']?.toString() ?? '名称未設定';
+    await ProjectFileStore.saveOriginalPdf(
+      projectId: projectId,
+      projectName: name,
+      bytes: pdf,
+    );
+    final List<Map<String, dynamic>> pins =
+        _asList(project['pins']).map(_asMap).toList();
+    final List<Map<String, dynamic>> strokes =
+        _asList(project['strokes']).map(_asMap).toList();
+    final List<Map<String, dynamic>> photos =
+        _asList(project['photoMeta']).map(_asMap).toList();
+    await ProjectFileStore.saveSnapshot(
+      projectId: projectId,
+      projectName: name,
+      metadata: <String, dynamic>{
+        for (final String key in <String>[
+          'pageCount',
+          'currentPage',
+          'nextPinNumber',
+          'pinColor',
+          'penColor',
+          'penWidth',
+          'pendingDirectionPinId',
+        ])
+          if (project.containsKey(key)) key: project[key],
+      },
+      pins: pins,
+      strokes: strokes,
+      photos: photos,
+    );
+    final List<Map<String, dynamic>> fullPhotos =
+        await _loadAllHivePhotos(projectId);
+    final Map<String, int> pinNumbers = <String, int>{
+      for (final Map<String, dynamic> pin in pins)
+        if (pin['id'] != null && pin['number'] is num)
+          pin['id'].toString(): (pin['number'] as num).toInt(),
+    };
+    for (final Map<String, dynamic> photo in fullPhotos) {
+      final Uint8List? bytes = _asBytes(photo['bytes']);
+      final String pinId = photo['pinId']?.toString() ?? '';
+      final int? pinNumber = pinNumbers[pinId];
+      if (bytes == null || bytes.isEmpty || pinNumber == null) continue;
+      await ProjectFileStore.savePhoto(
+        projectId: projectId,
+        projectName: name,
+        pinId: pinId,
+        pinNumber: pinNumber,
+        photoId: photo['photoId']?.toString() ?? '',
+        fileName: photo['fileName']?.toString() ?? '001.jpg',
+        bytes: bytes,
+      );
+    }
+  }
+
+  static Future<List<Map<String, dynamic>>> _loadAllHivePhotos(
+      String projectId) async {
+    final List<Map<String, dynamic>> meta =
+        await _loadHivePhotoMetadata(projectId);
+    final Box<dynamic> bytesBox = await _photoBytesBox();
+    final List<Map<String, dynamic>> result = <Map<String, dynamic>>[];
+    for (final Map<String, dynamic> item in meta) {
+      final String photoId = item['photoId'].toString();
+      final Uint8List? bytes =
+          _asBytes(bytesBox.get(_photoKey(projectId, photoId)));
+      if (bytes != null && bytes.isNotEmpty) {
+        result.add(<String, dynamic>{...item, 'bytes': bytes});
+      }
+    }
+    return result;
   }
 
   static Future<Map<String, dynamic>?> _migrateLegacyProject(String id) async {
@@ -301,20 +539,20 @@ class ProjectRepository {
       final Box<dynamic> legacy = await Hive.openBox<dynamic>(_legacyBoxName);
       final String? raw = legacy.get('project_$id') as String?;
       if (raw == null) return null;
-      final Map<String, dynamic> old =
-          jsonDecode(raw) as Map<String, dynamic>;
+      final Map<String, dynamic> old = jsonDecode(raw) as Map<String, dynamic>;
       final Uint8List? pdf = _asBytes(old['pdfBytes']);
       if (pdf == null || pdf.isEmpty) return null;
       final String name = old['projectName']?.toString() ?? '名称未設定';
       await savePdfOnce(
         projectId: id,
         projectName: name,
-        pdfName: old['pdfName']?.toString() ?? '図面.pdf',
         bytes: pdf,
       );
+      final List<Map<String, dynamic>> legacyPins =
+          _asList(old['pins']).map(_asMap).toList();
       await savePins(
         projectId: id,
-        pins: _asList(old['pins']).map(_asMap).toList(),
+        pins: legacyPins,
       );
       await saveDrawings(
         projectId: id,
@@ -333,6 +571,11 @@ class ProjectRepository {
       );
 
       final Map<String, dynamic> oldPhotos = _asMap(old['photos']);
+      final Map<String, int> legacyPinNumbers = <String, int>{
+        for (final Map<String, dynamic> pin in legacyPins)
+          if (pin['id'] != null && pin['number'] is num)
+            pin['id'].toString(): (pin['number'] as num).toInt(),
+      };
       for (final MapEntry<String, dynamic> entry in oldPhotos.entries) {
         for (final dynamic rawPhoto in _asList(entry.value)) {
           final Map<String, dynamic> photo = _asMap(rawPhoto);
@@ -340,7 +583,9 @@ class ProjectRepository {
           if (bytes == null || bytes.isEmpty) continue;
           await savePhoto(
             projectId: id,
+            projectName: name,
             pinId: entry.key,
+            pinNumber: legacyPinNumbers[entry.key] ?? 1,
             photoId: photo['id']?.toString() ??
                 '${entry.key}-${DateTime.now().microsecondsSinceEpoch}',
             fileName: photo['fileName']?.toString() ?? '001.jpg',
@@ -355,31 +600,62 @@ class ProjectRepository {
   }
 
   static Future<void> renameProject(String id, String name) async {
-    await touchProject(id: id, name: name);
+    await ProjectFileStore.renameProject(id, name);
+    if (ProjectFileStore.isAuthoritative) {
+      try {
+        await touchProject(id: id, name: name);
+      } catch (_) {
+        // The folder and its manifest already contain the new name.
+      }
+    } else {
+      await touchProject(id: id, name: name);
+    }
   }
 
   static Future<void> deleteProject(String id) async {
-    await (await _metaBox()).delete(id);
-    await (await _pdfBox()).delete(id);
-    await (await _pinsBox()).delete(id);
-    await (await _drawingsBox()).delete(id);
+    await ProjectFileStore.deleteProject(id);
+    Future<void> clearCache() async {
+      await (await _metaBox()).delete(id);
+      await (await _pdfBox()).delete(id);
+      await (await _pinsBox()).delete(id);
+      await (await _drawingsBox()).delete(id);
 
-    final Box<dynamic> photoMeta = await _photoMetaBox();
-    final Box<dynamic> photoBytes = await _photoBytesBox();
-    final Box<dynamic> thumbnails = await _thumbnailBox();
-    final List<dynamic> keys = <dynamic>[];
-    for (final dynamic key in photoMeta.keys) {
-      final Map<String, dynamic> meta = _asMap(photoMeta.get(key));
-      if (meta['projectId']?.toString() == id) keys.add(key);
+      final Box<dynamic> photoMeta = await _photoMetaBox();
+      final Box<dynamic> photoBytes = await _photoBytesBox();
+      final Box<dynamic> thumbnails = await _thumbnailBox();
+      final List<dynamic> keys = <dynamic>[];
+      for (final dynamic key in photoMeta.keys) {
+        final Map<String, dynamic> meta = _asMap(photoMeta.get(key));
+        if (meta['projectId']?.toString() == id) keys.add(key);
+      }
+      await photoMeta.deleteAll(keys);
+      await photoBytes.deleteAll(keys);
+      await thumbnails.deleteAll(keys);
+
+      // Remove legacy copy only after deletion was requested explicitly.
+      try {
+        final Box<dynamic> legacy = await Hive.openBox<dynamic>(_legacyBoxName);
+        await legacy.delete('project_$id');
+      } catch (_) {}
     }
-    await photoMeta.deleteAll(keys);
-    await photoBytes.deleteAll(keys);
-    await thumbnails.deleteAll(keys);
 
-    // Remove legacy copy only after v5 deletion was requested explicitly.
-    try {
-      final Box<dynamic> legacy = await Hive.openBox<dynamic>(_legacyBoxName);
-      await legacy.delete('project_$id');
-    } catch (_) {}
+    if (ProjectFileStore.isAuthoritative) {
+      try {
+        await clearCache();
+      } catch (_) {
+        // The user-visible project folder is already deleted.
+      }
+    } else {
+      await clearCache();
+    }
   }
+
+  static Future<String?> sourcePdfPath(String projectId) =>
+      ProjectFileStore.sourcePdfPath(projectId);
+
+  static Future<String?> outputPdfPath(String projectId) =>
+      ProjectFileStore.outputPdfPath(projectId);
+
+  static Future<Uint8List?> loadOutputPdf(String projectId) =>
+      ProjectFileStore.loadOutputPdf(projectId);
 }

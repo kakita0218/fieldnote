@@ -12,5 +12,10 @@ import UIKit
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    FieldNoteProjectPlugin.register(
+      with: engineBridge.pluginRegistry.registrar(
+        forPlugin: "FieldNoteProjectPlugin"
+      )
+    )
   }
 }

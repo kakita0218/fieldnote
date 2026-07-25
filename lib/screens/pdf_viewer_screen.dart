@@ -20,7 +20,7 @@ import '../models/pin_data.dart';
 import '../theme/app_colors.dart';
 import '../widgets/single_page_pdf_canvas.dart';
 import '../widgets/pin_side_panel.dart';
-import '../services/photo_storage.dart';
+import '../services/native_project_service.dart';
 import '../services/project_repository.dart';
 
 enum FieldTool {
@@ -55,7 +55,8 @@ class PdfViewerScreen extends StatefulWidget {
   State<PdfViewerScreen> createState() => _PdfViewerScreenState();
 }
 
-class _PdfViewerScreenState extends State<PdfViewerScreen> {
+class _PdfViewerScreenState extends State<PdfViewerScreen>
+    with WidgetsBindingObserver {
   pdfx.PdfDocument? _pdfDocument;
   Uint8List? _pageImageBytes;
   double _pageAspectRatio = 1;
@@ -64,7 +65,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       TransformationController();
 
   String? _pdfPath;
-  String? _pdfName;
   Uint8List? _pdfBytes;
   late String _projectName;
   Timer? _saveDebounce;
@@ -73,6 +73,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   bool _pinsDirty = false;
   bool _drawingsDirty = false;
   bool _metaDirty = false;
+  bool _pdfDirty = false;
   bool _isRestoring = false;
   String? _errorMessage;
 
@@ -103,6 +104,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _projectName = widget.projectName;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (widget.isNewProject) {
@@ -115,11 +117,25 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _noteController?.dispose();
     _pdfDocument?.close();
     _saveDebounce?.cancel();
     _transformationController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.inactive &&
+        state != AppLifecycleState.paused &&
+        state != AppLifecycleState.detached) {
+      return;
+    }
+    _endStroke();
+    _saveSelectedPinNote();
+    _saveDebounce?.cancel();
+    _enqueueSaveInBackground();
   }
 
   Future<void> _pickPdf() async {
@@ -176,7 +192,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         _pdfDocument = nextDocument;
         _pageImageBytes = null;
         _pdfPath = pdfIdentity;
-        _pdfName = selectedFile.name;
         _pdfBytes = persistentBytes;
 
         _currentPage = 1;
@@ -205,12 +220,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       await ProjectRepository.savePdfOnce(
         projectId: widget.projectId,
         projectName: _projectName,
-        pdfName: _pdfName ?? '図面.pdf',
         bytes: persistentBytes,
       );
       _pinsDirty = true;
       _drawingsDirty = true;
       _metaDirty = true;
+      _pdfDirty = true;
       await _saveProjectNow();
     } catch (error) {
       if (!mounted) {
@@ -232,6 +247,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   void _selectTool(FieldTool tool) {
     _endStroke();
 
+    if (tool == FieldTool.pen && NativeProjectService.isAvailable) {
+      unawaited(_openNativePencilEditor());
+      return;
+    }
+
     if (_selectedTool == tool) {
       if (tool == FieldTool.pin) {
         _showPinSettings();
@@ -244,6 +264,68 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     setState(() {
       _selectedTool = tool;
     });
+  }
+
+  Future<void> _openNativePencilEditor() async {
+    if (_pdfDocument == null || _saveInProgress) return;
+    _saveSelectedPinNote();
+    _saveDebounce?.cancel();
+
+    try {
+      await _enqueueSave();
+      final String? sourcePath =
+          await ProjectRepository.sourcePdfPath(widget.projectId);
+      if (sourcePath == null) {
+        throw StateError('編集用PDFが見つかりません。');
+      }
+      final bool saved = await NativeProjectService.openPencilEditor(
+        sourcePath: sourcePath,
+        title: _projectName,
+      );
+      if (!saved) return;
+      await _reloadSourcePdf();
+      _pdfDirty = true;
+      _metaDirty = true;
+      await _enqueueSave();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _errorMessage = '手書き画面を開けませんでした。\n$error';
+      });
+    }
+  }
+
+  Future<void> _reloadSourcePdf() async {
+    final Map<String, dynamic>? data =
+        await ProjectRepository.loadProject(widget.projectId);
+    if (data == null) throw StateError('案件データが見つかりません。');
+    final dynamic storedPdf = data['pdfBytes'];
+    final Uint8List bytes = storedPdf is Uint8List
+        ? Uint8List.fromList(storedPdf)
+        : storedPdf is List<int>
+            ? Uint8List.fromList(storedPdf)
+            : Uint8List(0);
+    if (bytes.isEmpty) throw StateError('編集用PDFが空です。');
+    final pdfx.PdfDocument document = await pdfx.PdfDocument.openData(
+      Uint8List.fromList(bytes),
+    );
+    final pdfx.PdfDocument? previous = _pdfDocument;
+    if (!mounted) {
+      await document.close();
+      return;
+    }
+    setState(() {
+      _pdfDocument = document;
+      _pdfBytes = bytes;
+      _pdfPath =
+          '${widget.projectId}-${bytes.length}-${DateTime.now().microsecondsSinceEpoch}';
+      _pageImageBytes = null;
+      _pageCount = document.pagesCount;
+      _currentPage = _currentPage.clamp(1, _pageCount);
+      _selectedTool = null;
+    });
+    await previous?.close();
+    await _renderPage(_currentPage);
   }
 
   void _addPin(Offset normalizedPosition) {
@@ -396,9 +478,19 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       return;
     }
 
+    // Finish any older snapshot before changing pin numbers. This guarantees
+    // the photo folder belonging to the deleted pin is removed before the
+    // remaining folders are renumbered.
+    _saveSelectedPinNote();
+    _saveDebounce?.cancel();
+    await _enqueueSave();
+    if (!mounted) return;
+    final int latestIndex = _pins.indexWhere((pin) => pin.id == selectedId);
+    if (latestIndex < 0) return;
+
     setState(() {
       _photosByPinId.remove(selectedId);
-      _pins.removeAt(index);
+      _pins.removeAt(latestIndex);
       _redoPins.clear();
 
       _renumberPins();
@@ -411,9 +503,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
     _noteController?.dispose();
     _noteController = null;
-    await ProjectRepository.deletePhotosForPin(
-      projectId: widget.projectId,
-      pinId: selectedId,
+    await _enqueueStorageOperation<void>(
+      () => ProjectRepository.deletePhotosForPin(
+        projectId: widget.projectId,
+        pinId: selectedId,
+      ),
     );
     _scheduleSave(pins: true, drawings: false, meta: true);
   }
@@ -689,55 +783,59 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   Future<PhotoData?> _saveCapturedPhoto(PinData pin, Uint8List bytes) async {
     final int pinIndex = _pins.indexWhere((item) => item.id == pin.id);
     if (pinIndex < 0) return null;
+    final int? backgroundTask =
+        await NativeProjectService.beginBackgroundSave('写真を保存');
 
-    final List<PhotoData> existing = List<PhotoData>.from(
-      _photosByPinId[pin.id] ?? const <PhotoData>[],
-    );
-    final PinData currentPin = _pins[pinIndex];
-    final int photoNumber = currentPin.photoCount + 1;
-    final String fileName = '${photoNumber.toString().padLeft(3, '0')}.jpg';
-    final String? savedPath = await savePinPhoto(
-      pinNumber: pin.number,
-      photoNumber: photoNumber,
-      bytes: bytes,
-    );
-    final String photoId =
-        '${pin.id}-$photoNumber-${DateTime.now().microsecondsSinceEpoch}';
-    final Uint8List thumbnailBytes = await _makePhotoThumbnail(bytes);
-    await ProjectRepository.savePhoto(
-      projectId: widget.projectId,
-      pinId: pin.id,
-      photoId: photoId,
-      fileName: fileName,
-      bytes: bytes,
-      thumbnailBytes: thumbnailBytes,
-    );
-    final PhotoData savedPhoto = PhotoData(
-      id: photoId,
-      fileName: fileName,
-      bytes: thumbnailBytes,
-      savedPath: savedPath,
-    );
-    existing.add(savedPhoto);
-
-    if (!mounted) return null;
-    final int latestPinIndex = _pins.indexWhere((item) => item.id == pin.id);
-    if (latestPinIndex < 0) return null;
-    setState(() {
-      _selectedPinId = pin.id;
-      _photosByPinId.clear();
-      _photosByPinId[pin.id] = existing;
-      final int nextCount = math.max(
-        _pins[latestPinIndex].photoCount + 1,
-        existing.length,
+    try {
+      final List<PhotoData> existing = List<PhotoData>.from(
+        _photosByPinId[pin.id] ?? const <PhotoData>[],
       );
-      _pins[latestPinIndex] =
-          _pins[latestPinIndex].copyWith(photoCount: nextCount);
-      _redoPins.clear();
-      _setNoteController(_pins[latestPinIndex].note);
-    });
-    _scheduleSave(pins: true, drawings: false, meta: true);
-    return savedPhoto;
+      final PinData currentPin = _pins[pinIndex];
+      final int photoNumber = currentPin.photoCount + 1;
+      final String fileName = '${photoNumber.toString().padLeft(3, '0')}.jpg';
+      final String photoId =
+          '${pin.id}-$photoNumber-${DateTime.now().microsecondsSinceEpoch}';
+      final Uint8List thumbnailBytes = await _makePhotoThumbnail(bytes);
+      await _enqueueStorageOperation<void>(
+        () => ProjectRepository.savePhoto(
+          projectId: widget.projectId,
+          projectName: _projectName,
+          pinId: pin.id,
+          pinNumber: pin.number,
+          photoId: photoId,
+          fileName: fileName,
+          bytes: bytes,
+          thumbnailBytes: thumbnailBytes,
+        ),
+      );
+      final PhotoData savedPhoto = PhotoData(
+        id: photoId,
+        fileName: fileName,
+        bytes: thumbnailBytes,
+      );
+      existing.add(savedPhoto);
+
+      if (!mounted) return null;
+      final int latestPinIndex = _pins.indexWhere((item) => item.id == pin.id);
+      if (latestPinIndex < 0) return null;
+      setState(() {
+        _selectedPinId = pin.id;
+        _photosByPinId.clear();
+        _photosByPinId[pin.id] = existing;
+        final int nextCount = math.max(
+          _pins[latestPinIndex].photoCount + 1,
+          existing.length,
+        );
+        _pins[latestPinIndex] =
+            _pins[latestPinIndex].copyWith(photoCount: nextCount);
+        _redoPins.clear();
+        _setNoteController(_pins[latestPinIndex].note);
+      });
+      _scheduleSave(pins: true, drawings: false, meta: true);
+      return savedPhoto;
+    } finally {
+      await NativeProjectService.endBackgroundSave(backgroundTask);
+    }
   }
 
   void _showAllPhotosForSelectedPin() {
@@ -916,6 +1014,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   }
 
   String _threeDigits(int value) => value.toString().padLeft(3, '0');
+
+  String _safeProjectFileName() {
+    final String sanitized = _projectName
+        .trim()
+        .replaceAll(RegExp(r'[\\/:*?"<>|\u0000-\u001F]'), '_')
+        .replaceAll(RegExp(r'[. ]+$'), '');
+    return sanitized.isEmpty ? '名称未設定' : sanitized;
+  }
 
   Future<ui.Image> _decodeUiImage(Uint8List bytes) async {
     final ui.Codec codec = await ui.instantiateImageCodec(bytes);
@@ -1103,10 +1209,23 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     });
 
     try {
-      final Uint8List pdfBytes = await _buildAnnotatedPdf();
+      _saveDebounce?.cancel();
+      await _enqueueSave();
+      final Uint8List pdfBytes;
+      if (NativeProjectService.isAvailable) {
+        final Uint8List? output =
+            await ProjectRepository.loadOutputPdf(widget.projectId);
+        if (output == null || output.isEmpty) {
+          throw StateError('書き出し用PDFが見つかりません。');
+        }
+        pdfBytes = output;
+      } else {
+        pdfBytes = await _buildAnnotatedPdf();
+      }
+      final String baseName = _safeProjectFileName();
       final Archive archive = Archive();
       archive.addFile(
-        ArchiveFile.bytes('現調図面.pdf', pdfBytes),
+        ArchiveFile.bytes('$baseName.pdf', pdfBytes),
       );
 
       final List<PinData> sortedPins = List<PinData>.from(_pins)
@@ -1126,22 +1245,23 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                 ))
             .toList(growable: false);
         if (photos.isEmpty) {
-          archive.addFile(ArchiveFile.directory('$folder/'));
+          archive.addFile(ArchiveFile.directory('写真/$folder/'));
           continue;
         }
         for (int index = 0; index < photos.length; index++) {
           final String photoName = _threeDigits(index + 1);
           archive.addFile(
-            ArchiveFile.bytes('$folder/$photoName.jpg', photos[index].bytes),
+            ArchiveFile.bytes(
+              '写真/$folder/$photoName.jpg',
+              photos[index].bytes,
+            ),
           );
         }
       }
 
       final Uint8List zipBytes = ZipEncoder().encodeBytes(archive);
-      final String baseName = (_pdfName ?? '現調メモ')
-          .replaceFirst(RegExp(r'\.pdf$', caseSensitive: false), '');
       await FileSaver.instance.saveFile(
-        name: '${baseName}_現調データ',
+        name: baseName,
         bytes: zipBytes,
         fileExtension: 'zip',
         mimeType: MimeType.zip,
@@ -1174,17 +1294,36 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     _pinsDirty = _pinsDirty || pins;
     _drawingsDirty = _drawingsDirty || drawings;
     _metaDirty = _metaDirty || meta;
+    _pdfDirty = _pdfDirty || pins || drawings;
     _saveDebounce?.cancel();
     // A short idle delay lets users write multi-stroke characters without a
     // database transaction being started after every single stroke.
     _saveDebounce = Timer(const Duration(milliseconds: 900), () {
-      _enqueueSave();
+      _enqueueSaveInBackground();
     });
   }
 
+  void _enqueueSaveInBackground() {
+    unawaited(
+      _enqueueSave().catchError((Object _, StackTrace __) {
+        // _saveProjectNow already restores dirty flags and shows the error.
+      }),
+    );
+  }
+
   Future<void> _enqueueSave() {
-    _saveTail = _saveTail.then((_) => _saveProjectNow());
+    _saveTail =
+        _saveTail.catchError((Object _) {}).then((_) => _saveProjectNow());
     return _saveTail;
+  }
+
+  Future<T> _enqueueStorageOperation<T>(
+    Future<T> Function() operation,
+  ) {
+    final Future<T> result =
+        _saveTail.catchError((Object _) {}).then((_) => operation());
+    _saveTail = result.then<void>((_) {}).catchError((Object _) {});
+    return result;
   }
 
   List<Map<String, dynamic>> _serializePins() => _pins
@@ -1224,41 +1363,51 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     final bool savePins = _pinsDirty;
     final bool saveDrawings = _drawingsDirty;
     final bool saveMeta = _metaDirty;
-    if (!savePins && !saveDrawings && !saveMeta) return;
+    final bool savePdf = _pdfDirty;
+    if (!savePins && !saveDrawings && !saveMeta && !savePdf) return;
 
     // Clear before awaiting. New edits made during the write set the flags again
     // and are handled by the next queued save.
     _pinsDirty = false;
     _drawingsDirty = false;
     _metaDirty = false;
+    _pdfDirty = false;
 
     if (mounted) setState(() => _saveInProgress = true);
+    final int? backgroundTask =
+        await NativeProjectService.beginBackgroundSave('案件を保存');
     try {
-      if (savePins) {
-        await ProjectRepository.savePins(
-          projectId: widget.projectId,
-          pins: _serializePins(),
-        );
-      }
-      if (saveDrawings) {
-        await ProjectRepository.saveDrawings(
-          projectId: widget.projectId,
-          strokes: _serializeStrokes(),
-        );
-      }
-      if (saveMeta) {
-        await ProjectRepository.touchProject(
-          id: widget.projectId,
-          name: _projectName,
-          values: <String, dynamic>{
-            'pdfName': _pdfName,
-            'pageCount': _pageCount,
-            'currentPage': _currentPage,
-            'nextPinNumber': _nextPinNumber,
-            'pinColor': _pinColor.toARGB32(),
-            'penColor': _penColor.toARGB32(),
-            'penWidth': _penWidth,
-          },
+      final List<Map<String, dynamic>> pins = _serializePins();
+      final List<Map<String, dynamic>> strokes = _serializeStrokes();
+      await ProjectRepository.saveProjectSnapshot(
+        projectId: widget.projectId,
+        projectName: _projectName,
+        metadata: <String, dynamic>{
+          'pdfName': '$_projectName.pdf',
+          'pageCount': _pageCount,
+          'currentPage': _currentPage,
+          'nextPinNumber': _nextPinNumber,
+          'pinColor': _pinColor.toARGB32(),
+          'penColor': _penColor.toARGB32(),
+          'penWidth': _penWidth,
+          'pendingDirectionPinId': _pendingDirectionPinId,
+        },
+        pins: pins,
+        strokes: strokes,
+      );
+      if (savePdf && NativeProjectService.isAvailable) {
+        final String? sourcePath =
+            await ProjectRepository.sourcePdfPath(widget.projectId);
+        final String? outputPath =
+            await ProjectRepository.outputPdfPath(widget.projectId);
+        if (sourcePath == null || outputPath == null) {
+          throw StateError('PDFの保存先が見つかりません。');
+        }
+        await NativeProjectService.writeAnnotatedPdf(
+          sourcePath: sourcePath,
+          outputPath: outputPath,
+          pins: pins,
+          strokes: strokes,
         );
       }
       if (mounted) setState(() => _errorMessage = null);
@@ -1267,6 +1416,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       _pinsDirty = _pinsDirty || savePins;
       _drawingsDirty = _drawingsDirty || saveDrawings;
       _metaDirty = _metaDirty || saveMeta;
+      _pdfDirty = _pdfDirty || savePdf;
       if (mounted) {
         setState(() {
           _errorMessage = '案件の保存に失敗しました。再試行します。\n$error';
@@ -1274,13 +1424,24 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       }
       rethrow;
     } finally {
+      await NativeProjectService.endBackgroundSave(backgroundTask);
       if (mounted) setState(() => _saveInProgress = false);
     }
   }
 
   Future<void> _loadSavedProject() async {
     _isRestoring = true;
+    Object? pencilRecoveryError;
     try {
+      final String? sourcePath =
+          await ProjectRepository.sourcePdfPath(widget.projectId);
+      if (sourcePath != null) {
+        try {
+          await NativeProjectService.synchronizePencilDrawings(sourcePath);
+        } catch (error) {
+          pencilRecoveryError = error;
+        }
+      }
       final data = await ProjectRepository.loadProject(widget.projectId);
       if (data == null) {
         if (mounted) setState(() => _errorMessage = '案件データが見つかりません。');
@@ -1353,9 +1514,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       }
       if (!mounted) return;
       setState(() {
+        _projectName = data['projectName']?.toString() ?? widget.projectName;
         _pdfDocument = document;
         _pdfBytes = persistentBytes;
-        _pdfName = data['pdfName'] as String? ?? '図面.pdf';
         _pdfPath = '${widget.projectId}-${persistentBytes.length}';
         _pageCount = document.pagesCount;
         _pins
@@ -1373,10 +1534,34 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         _penWidth = (data['penWidth'] as num?)?.toDouble() ?? 3;
         _currentPage =
             ((data['currentPage'] as num?)?.toInt() ?? 1).clamp(1, _pageCount);
+        final String? pendingId = data['pendingDirectionPinId']?.toString();
+        _pendingDirectionPinId =
+            restoredPins.any((PinData pin) => pin.id == pendingId)
+                ? pendingId
+                : null;
       });
       await _renderPage(_currentPage);
-      if (widget.exportOnOpen && mounted) {
-        WidgetsBinding.instance.addPostFrameCallback((_) => _exportProject());
+      if (pencilRecoveryError != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '自動保存した手書きの復元に失敗しました。'
+              'PDF本体は開いています。\n$pencilRecoveryError',
+            ),
+          ),
+        );
+      }
+      if (mounted) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          _metaDirty = true;
+          _pdfDirty = NativeProjectService.isAvailable;
+          if (widget.exportOnOpen) {
+            unawaited(_exportProject());
+          } else {
+            _enqueueSaveInBackground();
+          }
+        });
       }
     } catch (error) {
       if (mounted) setState(() => _errorMessage = '案件を開けませんでした。\n$error');

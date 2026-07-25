@@ -1,8 +1,10 @@
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'models/project_summary.dart';
 import 'painters/blueprint_background.dart';
@@ -17,7 +19,12 @@ Future<void> main() async {
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
   ]);
-  await Hive.initFlutter();
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+    final supportDirectory = await getApplicationSupportDirectory();
+    Hive.init('${supportDirectory.path}/FieldNoteDatabase');
+  } else {
+    await Hive.initFlutter();
+  }
   runApp(const FieldNoteApp());
 }
 
@@ -88,6 +95,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final String? name = await _askName();
     if (name == null || !mounted) return;
     final String id = DateTime.now().microsecondsSinceEpoch.toString();
+    await ProjectRepository.createProject(id: id, name: name);
+    if (!mounted) return;
     await Navigator.push(
       context,
       MaterialPageRoute<void>(
@@ -762,8 +771,8 @@ class _NewProjectMarkPainter extends CustomPainter {
     final double dashRadius = radius * 1.24;
     for (int i = 0; i < 3; i++) {
       final double angle = math.pi * (0.28 + i * 0.055);
-      final Offset from = center +
-          Offset(math.cos(angle), math.sin(angle)) * dashRadius;
+      final Offset from =
+          center + Offset(math.cos(angle), math.sin(angle)) * dashRadius;
       final Offset to = center +
           Offset(math.cos(angle), math.sin(angle)) *
               (dashRadius + side * 0.035);
