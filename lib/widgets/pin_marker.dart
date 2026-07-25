@@ -1,0 +1,225 @@
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+
+import '../models/pin_data.dart';
+
+class PinMarker extends StatelessWidget {
+  const PinMarker({
+    super.key,
+    required this.pin,
+    required this.selected,
+    required this.awaitingDirection,
+    required this.onTap,
+    required this.onDirectionChanged,
+  });
+
+  /// The visual is roughly half the previous marker size. The transparent
+  /// canvas keeps the anchor stable, while hit testing is limited to the
+  /// visible circular badge itself.
+  static const double markerWidth = 48;
+  static const double markerHeight = 56;
+  static const double markerCenterY = 24;
+  static const double normalCircleSize = 24;
+  static const double selectedCircleSize = 36;
+
+  final PinData pin;
+  final bool selected;
+  final bool awaitingDirection;
+  final VoidCallback onTap;
+  final ValueChanged<double> onDirectionChanged;
+
+  double get _circleSize => selected || awaitingDirection
+      ? selectedCircleSize
+      : normalCircleSize;
+
+  double _directionFromCirclePosition(Offset localPosition) {
+    final double half = _circleSize / 2;
+    final Offset vector = localPosition - Offset(half, half);
+    final double radians = math.atan2(vector.dx, -vector.dy);
+    return (radians * 180 / math.pi + 360) % 360;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final double circleSize = _circleSize;
+
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: 'ピン ${pin.number}',
+      child: SizedBox(
+        width: markerWidth,
+        height: markerHeight,
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: <Widget>[
+            Positioned.fill(
+              child: IgnorePointer(
+                child: CustomPaint(
+                  painter: _PinMarkerPainter(
+                    number: pin.number,
+                    directionDegrees: pin.directionDegrees,
+                    color: Color(pin.colorValue),
+                    selected: selected,
+                    awaitingDirection: awaitingDirection,
+                    hasPhoto: pin.photoCount > 0,
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              left: (markerWidth - circleSize) / 2,
+              top: markerCenterY - circleSize / 2,
+              width: circleSize,
+              height: circleSize,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: onTap,
+                onPanStart: (DragStartDetails details) {
+                  onDirectionChanged(
+                    _directionFromCirclePosition(details.localPosition),
+                  );
+                },
+                onPanUpdate: (DragUpdateDetails details) {
+                  onDirectionChanged(
+                    _directionFromCirclePosition(details.localPosition),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PinMarkerPainter extends CustomPainter {
+  const _PinMarkerPainter({
+    required this.number,
+    required this.directionDegrees,
+    required this.color,
+    required this.selected,
+    required this.awaitingDirection,
+    required this.hasPhoto,
+  });
+
+  final int number;
+  final double directionDegrees;
+  final Color color;
+  final bool selected;
+  final bool awaitingDirection;
+  final bool hasPhoto;
+
+  bool get _isYellow => color.computeLuminance() > 0.62;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final bool emphasized = selected || awaitingDirection;
+    final double diameter = emphasized
+        ? PinMarker.selectedCircleSize
+        : PinMarker.normalCircleSize;
+    final double radius = diameter / 2;
+    final Offset center = Offset(size.width / 2, PinMarker.markerCenterY);
+    final Color textColor = _isYellow ? const Color(0xFF10151C) : Colors.white;
+    final Color edgeColor = _isYellow
+        ? const Color(0xFF3B3420)
+        : Colors.white.withValues(alpha: 0.96);
+
+    if (emphasized) {
+      canvas.drawCircle(
+        center,
+        radius + 7,
+        Paint()
+          ..color = const Color(0xFF42A5FF).withValues(
+            alpha: awaitingDirection ? 0.38 : 0.26,
+          )
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 7),
+      );
+    }
+
+    if (hasPhoto) {
+      canvas.drawCircle(
+        center,
+        radius + 3.5,
+        Paint()
+          ..color = const Color(0xFF49B7FF)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.2,
+      );
+    }
+
+    final double angle = directionDegrees * math.pi / 180;
+    final double arrowDistance = radius + 5;
+    final Offset arrowCenter = center +
+        Offset(math.sin(angle), -math.cos(angle)) * arrowDistance;
+    final Offset forward = Offset(math.sin(angle), -math.cos(angle));
+    final Offset side = Offset(math.cos(angle), math.sin(angle));
+    final double arrowLength = emphasized ? 8 : 6;
+    final double arrowHalfWidth = emphasized ? 4.5 : 3.5;
+    final Offset tip = arrowCenter + forward * (arrowLength / 2);
+    final Offset baseCenter = arrowCenter - forward * (arrowLength / 2);
+    final Path arrow = Path()
+      ..moveTo(tip.dx, tip.dy)
+      ..lineTo(
+        baseCenter.dx + side.dx * arrowHalfWidth,
+        baseCenter.dy + side.dy * arrowHalfWidth,
+      )
+      ..lineTo(
+        baseCenter.dx - side.dx * arrowHalfWidth,
+        baseCenter.dy - side.dy * arrowHalfWidth,
+      )
+      ..close();
+    canvas.drawPath(
+      arrow,
+      Paint()
+        ..color = edgeColor
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.6
+        ..strokeJoin = StrokeJoin.round,
+    );
+    canvas.drawPath(arrow, Paint()..color = color);
+
+    canvas.drawCircle(center, radius, Paint()..color = color);
+    canvas.drawCircle(
+      center,
+      radius,
+      Paint()
+        ..color = edgeColor
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = emphasized ? 2.1 : 1.6,
+    );
+
+    final String label = number.toString();
+    final double baseFontSize = emphasized ? 16 : 11;
+    final double fontSize = label.length >= 3 ? baseFontSize - 2 : baseFontSize;
+    final TextPainter textPainter = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: TextStyle(
+          color: textColor,
+          fontSize: fontSize,
+          fontWeight: FontWeight.w800,
+          height: 1,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+      textAlign: TextAlign.center,
+    )..layout(maxWidth: diameter - 4);
+    textPainter.paint(
+      canvas,
+      center - Offset(textPainter.width / 2, textPainter.height / 2),
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _PinMarkerPainter oldDelegate) {
+    return oldDelegate.number != number ||
+        oldDelegate.directionDegrees != directionDegrees ||
+        oldDelegate.color != color ||
+        oldDelegate.selected != selected ||
+        oldDelegate.awaitingDirection != awaitingDirection ||
+        oldDelegate.hasPhoto != hasPhoto;
+  }
+}
