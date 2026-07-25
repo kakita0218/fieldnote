@@ -1,0 +1,55 @@
+name: Build FieldNote iOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.6"
+          channel: stable
+          cache: true
+
+      - name: Show tool versions
+        run: |
+          flutter --version
+          xcodebuild -version
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze --no-pub
+
+      - name: Build unsigned iOS app
+        run: flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p build/ios/unsigned/Payload
+          ditto \
+            build/ios/iphoneos/Runner.app \
+            build/ios/unsigned/Payload/Runner.app
+          cd build/ios/unsigned
+          /usr/bin/zip -qry FieldNote-unsigned.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: FieldNote-iOS
+          path: build/ios/unsigned/FieldNote-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
