@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -64,8 +65,9 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   bool _takingPicture = false;
   bool _closing = false;
   bool _allowPop = false;
+  bool _changingFlash = false;
   String? _error;
-  FlashMode _flashMode = FlashMode.off;
+  FlashMode _flashMode = FlashMode.auto;
   double _zoom = 1;
   double _minZoom = 1;
   double _maxZoom = 1;
@@ -74,6 +76,10 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   String? _emphasizedThumbnailId;
   Future<void> _saveTail = Future<void>.value();
   Future<void>? _activeCapture;
+  Timer? _focusIndicatorTimer;
+  Offset? _focusPoint;
+  bool _focusIndicatorVisible = false;
+  int _focusIndicatorRevision = 0;
 
   @override
   void initState() {
@@ -98,13 +104,19 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         throw CameraException('no-camera', '利用できるカメラがありません。');
       }
 
-      CameraDescription selected = cameras.first;
+      CameraDescription? firstBackCamera;
+      CameraDescription? wideBackCamera;
       for (final camera in cameras) {
         if (camera.lensDirection == CameraLensDirection.back) {
-          selected = camera;
-          break;
+          firstBackCamera ??= camera;
+          if (camera.lensType == CameraLensType.wide) {
+            wideBackCamera = camera;
+            break;
+          }
         }
       }
+      final CameraDescription selected =
+          wideBackCamera ?? firstBackCamera ?? cameras.first;
 
       final controller = CameraController(
         selected,
@@ -113,6 +125,18 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         imageFormatGroup: ImageFormatGroup.jpeg,
       );
       await controller.initialize();
+
+      FlashMode initialFlashMode = FlashMode.auto;
+      try {
+        await controller.setFlashMode(FlashMode.auto);
+      } catch (_) {
+        initialFlashMode = FlashMode.off;
+        try {
+          await controller.setFlashMode(FlashMode.off);
+        } catch (_) {
+          // Cameras without flash hardware can still be used normally.
+        }
+      }
 
       double minZoom = 1;
       double maxZoom = 1;
@@ -133,6 +157,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         _minZoom = minZoom;
         _maxZoom = maxZoom < minZoom ? minZoom : maxZoom;
         _zoom = minZoom;
+        _flashMode = initialFlashMode;
         _initializing = false;
       });
     } catch (error) {
@@ -146,6 +171,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
 
   @override
   void dispose() {
+    _focusIndicatorTimer?.cancel();
     _controller?.dispose();
     super.dispose();
   }
@@ -177,9 +203,12 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     try {
       final XFile file = await controller.takePicture();
 
-      // Fixed shutter feedback: no setting is exposed in the app. Play it
-      // immediately after capture so storage work never delays the feedback.
-      unawaited(SystemSound.play(SystemSoundType.click));
+      // AVCapturePhotoOutput already plays the system shutter sound on iOS.
+      // Adding a Flutter click there makes the feedback sound roughly twice as
+      // loud. Other platforms keep the explicit click as a fallback.
+      if (defaultTargetPlatform != TargetPlatform.iOS) {
+        unawaited(SystemSound.play(SystemSoundType.click));
+      }
       final Uint8List bytes = await file.readAsBytes();
 
       final String pendingId =
@@ -299,24 +328,41 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     }
   }
 
-  Future<void> _cycleFlash() async {
+  Future<void> _selectFlashMode(FlashMode requestedMode) async {
     final controller = _controller;
-    if (controller == null || _closing) return;
+    if (controller == null || _closing || _changingFlash) return;
 
-    final next = switch (_flashMode) {
-      FlashMode.off => FlashMode.auto,
-      FlashMode.auto => FlashMode.always,
-      _ => FlashMode.off,
-    };
+    final FlashMode selectedMode =
+        _flashMode == FlashMode.torch ? FlashMode.always : _flashMode;
+    if (selectedMode == requestedMode) return;
 
+    setState(() => _changingFlash = true);
     try {
-      await controller.setFlashMode(next);
-      if (mounted) setState(() => _flashMode = next);
+      FlashMode appliedMode = requestedMode;
+      if (requestedMode == FlashMode.always) {
+        try {
+          await controller.setFlashMode(FlashMode.always);
+        } catch (_) {
+          // A few devices expose the LED only as a continuous torch.
+          await controller.setFlashMode(FlashMode.torch);
+          appliedMode = FlashMode.torch;
+        }
+      } else {
+        await controller.setFlashMode(requestedMode);
+      }
+
+      if (mounted) setState(() => _flashMode = appliedMode);
     } catch (_) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('この端末ではフラッシュ切替を利用できません。')),
+        SnackBar(
+          content: Text(
+            'この端末ではフラッシュ${_flashLabelFor(requestedMode)}を利用できません。',
+          ),
+        ),
       );
+    } finally {
+      if (mounted) setState(() => _changingFlash = false);
     }
   }
 
@@ -333,27 +379,190 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     }
   }
 
-  Future<void> _focusAt(
-      TapDownDetails details, BoxConstraints constraints) async {
+  Future<void> _focusAt(Offset localPosition, Size previewSize) async {
     final controller = _controller;
-    if (controller == null || _closing) return;
-    final point = Offset(
-      (details.localPosition.dx / constraints.maxWidth).clamp(0.0, 1.0),
-      (details.localPosition.dy / constraints.maxHeight).clamp(0.0, 1.0),
+    if (controller == null ||
+        _closing ||
+        previewSize.width <= 0 ||
+        previewSize.height <= 0) {
+      return;
+    }
+
+    final Offset point = Offset(
+      (localPosition.dx / previewSize.width).clamp(0.0, 1.0),
+      (localPosition.dy / previewSize.height).clamp(0.0, 1.0),
     );
-    try {
-      await controller.setFocusPoint(point);
-      await controller.setExposurePoint(point);
-    } catch (_) {
-      // Some camera backends do not support tap focus.
+
+    _focusIndicatorTimer?.cancel();
+    if (mounted) {
+      setState(() {
+        _focusPoint = point;
+        _focusIndicatorVisible = true;
+        _focusIndicatorRevision += 1;
+      });
+      _focusIndicatorTimer = Timer(const Duration(milliseconds: 1200), () {
+        if (mounted) setState(() => _focusIndicatorVisible = false);
+      });
+    }
+
+    bool adjusted = false;
+    if (controller.value.focusPointSupported) {
+      try {
+        await controller.setFocusPoint(point);
+        adjusted = true;
+      } catch (_) {
+        // Exposure may still support selecting a point.
+      }
+    }
+    if (controller.value.exposurePointSupported) {
+      try {
+        await controller.setExposurePoint(point);
+        adjusted = true;
+      } catch (_) {
+        // Focus may already have succeeded.
+      }
+    }
+
+    if (!adjusted && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('この端末ではタップによるピント調整を利用できません。')),
+      );
     }
   }
 
-  String get _flashLabel => switch (_flashMode) {
+  Widget _buildCameraPreview(CameraController controller) {
+    return Center(
+      child: CameraPreview(
+        controller,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final Size previewSize = constraints.biggest;
+            final Offset? focusPoint = _focusPoint;
+            final double maxIndicatorLeft =
+                previewSize.width > 60 ? previewSize.width - 60 : 0;
+            final double maxIndicatorTop =
+                previewSize.height > 60 ? previewSize.height - 60 : 0;
+            return GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTapDown: (details) => unawaited(
+                _focusAt(details.localPosition, previewSize),
+              ),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  if (focusPoint != null)
+                    Positioned(
+                      left: (focusPoint.dx * previewSize.width - 30)
+                          .clamp(0.0, maxIndicatorLeft),
+                      top: (focusPoint.dy * previewSize.height - 30)
+                          .clamp(0.0, maxIndicatorTop),
+                      child: IgnorePointer(
+                        child: AnimatedOpacity(
+                          duration: const Duration(milliseconds: 180),
+                          opacity: _focusIndicatorVisible ? 1 : 0,
+                          child: TweenAnimationBuilder<double>(
+                            key: ValueKey(_focusIndicatorRevision),
+                            duration: const Duration(milliseconds: 240),
+                            tween: Tween<double>(begin: 1.3, end: 1),
+                            builder: (context, scale, child) =>
+                                Transform.scale(scale: scale, child: child),
+                            child: Container(
+                              width: 60,
+                              height: 60,
+                              decoration: BoxDecoration(
+                                border: Border.all(
+                                  color: const Color(0xFFFFD54F),
+                                  width: 2.2,
+                                ),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Center(
+                                child: Container(
+                                  width: 5,
+                                  height: 5,
+                                  decoration: const BoxDecoration(
+                                    color: Color(0xFFFFD54F),
+                                    shape: BoxShape.circle,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  String _flashLabelFor(FlashMode mode) => switch (mode) {
         FlashMode.auto => 'AUTO',
-        FlashMode.always => 'ON',
+        FlashMode.always || FlashMode.torch => 'ON',
         _ => 'OFF',
       };
+
+  String get _flashLabel => _flashLabelFor(_flashMode);
+
+  FlashMode get _selectedFlashMenuMode =>
+      _flashMode == FlashMode.torch ? FlashMode.always : _flashMode;
+
+  IconData get _flashIcon => switch (_selectedFlashMenuMode) {
+        FlashMode.auto => Icons.flash_auto_rounded,
+        FlashMode.off => Icons.flash_off_rounded,
+        _ => Icons.flash_on_rounded,
+      };
+
+  Widget _buildFlashSelector() {
+    return PopupMenuButton<FlashMode>(
+      enabled: !_closing && !_changingFlash,
+      tooltip: 'フラッシュ設定',
+      initialValue: _selectedFlashMenuMode,
+      onSelected: (mode) => unawaited(_selectFlashMode(mode)),
+      itemBuilder: (context) => [
+        CheckedPopupMenuItem<FlashMode>(
+          value: FlashMode.auto,
+          checked: _selectedFlashMenuMode == FlashMode.auto,
+          child: const Text('AUTO（自動）'),
+        ),
+        CheckedPopupMenuItem<FlashMode>(
+          value: FlashMode.always,
+          checked: _selectedFlashMenuMode == FlashMode.always,
+          child: const Text('ON（常時発光）'),
+        ),
+        CheckedPopupMenuItem<FlashMode>(
+          value: FlashMode.off,
+          checked: _selectedFlashMenuMode == FlashMode.off,
+          child: const Text('OFF'),
+        ),
+      ],
+      child: AnimatedOpacity(
+        duration: const Duration(milliseconds: 120),
+        opacity: _changingFlash ? 0.55 : 1,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 12),
+          decoration: BoxDecoration(
+            color: Colors.black54,
+            borderRadius: BorderRadius.circular(24),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(_flashIcon),
+              const SizedBox(width: 8),
+              Text(_flashLabel),
+              const SizedBox(width: 3),
+              const Icon(Icons.arrow_drop_down_rounded),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 
   Widget _buildTopBar() {
     return Row(
@@ -372,16 +581,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
               : const Icon(Icons.arrow_back_rounded, size: 30),
         ),
         const Spacer(),
-        FilledButton.tonalIcon(
-          style: FilledButton.styleFrom(
-            foregroundColor: Colors.white,
-            backgroundColor: Colors.black54,
-            padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 12),
-          ),
-          onPressed: _closing ? null : _cycleFlash,
-          icon: const Icon(Icons.flash_on_rounded),
-          label: Text(_flashLabel),
-        ),
+        _buildFlashSelector(),
         const SizedBox(width: 12),
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -502,16 +702,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
               return Stack(
                 fit: StackFit.expand,
                 children: [
-                  GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTapDown: (details) => _focusAt(details, constraints),
-                    child: Center(
-                      child: AspectRatio(
-                        aspectRatio: _controller!.value.aspectRatio,
-                        child: CameraPreview(_controller!),
-                      ),
-                    ),
-                  ),
+                  _buildCameraPreview(_controller!),
                   Positioned(
                     left: 18,
                     top: 16,

@@ -4,7 +4,7 @@ import PencilKit
 import UIKit
 
 final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
-  private weak var viewController: UIViewController?
+  private var viewControllerProvider: () -> UIViewController? = { nil }
   private var backgroundTasks: [Int: UIBackgroundTaskIdentifier] = [:]
   private var nextBackgroundTaskToken = 1
 
@@ -14,7 +14,13 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
       binaryMessenger: registrar.messenger()
     )
     let instance = FieldNoteProjectPlugin()
-    instance.viewController = registrar.viewController
+    // With Flutter's UIScene/implicit-engine lifecycle, registration can happen
+    // before the Flutter view controller has been attached to the engine. Read
+    // the registrar dynamically when a UI operation is requested instead of
+    // permanently caching the initial (often nil) value.
+    instance.viewControllerProvider = { [weak registrar] in
+      registrar?.viewController
+    }
     registrar.addMethodCallDelegate(instance, channel: channel)
   }
 
@@ -156,7 +162,7 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
     guard let arguments = arguments(call, result: result) else { return }
     guard
       let sourcePath = arguments["sourcePath"] as? String,
-      let presenter = topViewController(from: viewController)
+      let presenter = pencilEditorPresenter()
     else {
       result(
         FlutterError(
@@ -237,16 +243,60 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
   }
 
   private func topViewController(from root: UIViewController?) -> UIViewController? {
+    if let presented = root?.presentedViewController,
+       !presented.isBeingDismissed
+    {
+      return topViewController(from: presented)
+    }
     if let navigation = root as? UINavigationController {
       return topViewController(from: navigation.visibleViewController)
     }
     if let tab = root as? UITabBarController {
       return topViewController(from: tab.selectedViewController)
     }
-    if let presented = root?.presentedViewController {
-      return topViewController(from: presented)
+    if let split = root as? UISplitViewController {
+      return topViewController(from: split.viewControllers.last)
     }
     return root
+  }
+
+  private func pencilEditorPresenter() -> UIViewController? {
+    // The registrar is the most precise source because it belongs to the
+    // Flutter engine that received this method call. Its view controller is
+    // resolved lazily; it may have been nil during plugin registration.
+    if let presenter = topViewController(from: viewControllerProvider()) {
+      return presenter
+    }
+
+    // Keep a UIScene-aware fallback for lifecycle transitions and restored
+    // scenes where the engine has not yet exposed its view controller.
+    let windowScenes = UIApplication.shared.connectedScenes.compactMap {
+      $0 as? UIWindowScene
+    }
+    let activationStates: [UIScene.ActivationState] = [
+      .foregroundActive,
+      .foregroundInactive,
+      .background,
+      .unattached,
+    ]
+    for state in activationStates {
+      for scene in windowScenes where scene.activationState == state {
+        if
+          let keyWindow = scene.windows.first(where: { $0.isKeyWindow }),
+          let presenter = topViewController(
+            from: keyWindow.rootViewController
+          )
+        {
+          return presenter
+        }
+        for window in scene.windows where !window.isHidden && window.alpha > 0 {
+          if let presenter = topViewController(from: window.rootViewController) {
+            return presenter
+          }
+        }
+      }
+    }
+    return nil
   }
 }
 
@@ -386,6 +436,66 @@ private enum FieldNotePdfWriter {
         height: radius * 2
       )
 
+      if (number(pin["photoCount"])?.intValue ?? 0) > 0 {
+        let photoRingRadius = radius + 3.5
+        let photoRing = PDFAnnotation(
+          bounds: CGRect(
+            x: center.x - photoRingRadius,
+            y: center.y - photoRingRadius,
+            width: photoRingRadius * 2,
+            height: photoRingRadius * 2
+          ),
+          forType: .circle,
+          withProperties: nil
+        )
+        photoRing.color = UIColor(
+          red: CGFloat(0x49) / 255,
+          green: CGFloat(0xb7) / 255,
+          blue: CGFloat(0xff) / 255,
+          alpha: 1
+        )
+        photoRing.interiorColor = .clear
+        let photoRingBorder = PDFBorder()
+        photoRingBorder.lineWidth = 2.2
+        photoRing.border = photoRingBorder
+        setName("\(exportPrefix)pin-photo-ring:\(pinId)", on: photoRing)
+        page.addAnnotation(photoRing)
+      }
+
+      let direction =
+        CGFloat(number(pin["directionDegrees"])?.doubleValue ?? 0) * .pi / 180
+      let forward = CGPoint(x: sin(direction), y: cos(direction))
+      let side = CGPoint(x: cos(direction), y: -sin(direction))
+      let arrowCenter = CGPoint(
+        x: center.x + forward.x * (radius + 5),
+        y: center.y + forward.y * (radius + 5)
+      )
+      let arrowLength: CGFloat = 6
+      let arrowHalfWidth: CGFloat = 3.5
+      let tip = CGPoint(
+        x: arrowCenter.x + forward.x * (arrowLength / 2),
+        y: arrowCenter.y + forward.y * (arrowLength / 2)
+      )
+      let baseCenter = CGPoint(
+        x: arrowCenter.x - forward.x * (arrowLength / 2),
+        y: arrowCenter.y - forward.y * (arrowLength / 2)
+      )
+      let directionMarker = FieldNotePinDirectionAnnotation(
+        tip: tip,
+        firstBase: CGPoint(
+          x: baseCenter.x + side.x * arrowHalfWidth,
+          y: baseCenter.y + side.y * arrowHalfWidth
+        ),
+        secondBase: CGPoint(
+          x: baseCenter.x - side.x * arrowHalfWidth,
+          y: baseCenter.y - side.y * arrowHalfWidth
+        ),
+        fillColor: pinColor,
+        edgeColor: edgeColor
+      )
+      setName("\(exportPrefix)pin-direction:\(pinId)", on: directionMarker)
+      page.addAnnotation(directionMarker)
+
       let circle = PDFAnnotation(
         bounds: circleBounds,
         forType: .circle,
@@ -394,7 +504,7 @@ private enum FieldNotePdfWriter {
       circle.color = edgeColor
       circle.interiorColor = pinColor
       let circleBorder = PDFBorder()
-      circleBorder.lineWidth = 1.8
+      circleBorder.lineWidth = 1.6
       circle.border = circleBorder
       setName("\(exportPrefix)pin-circle:\(pinId)", on: circle)
       page.addAnnotation(circle)
@@ -414,51 +524,6 @@ private enum FieldNotePdfWriter {
       label.border = labelBorder
       setName("\(exportPrefix)pin-label:\(pinId)", on: label)
       page.addAnnotation(label)
-
-      let direction =
-        CGFloat(number(pin["directionDegrees"])?.doubleValue ?? 0) * .pi / 180
-      let forward = CGPoint(x: sin(direction), y: cos(direction))
-      let side = CGPoint(x: cos(direction), y: -sin(direction))
-      let shaftStart = CGPoint(
-        x: center.x + forward.x * (radius + 2),
-        y: center.y + forward.y * (radius + 2)
-      )
-      let shaftEnd = CGPoint(
-        x: center.x + forward.x * (radius + 11),
-        y: center.y + forward.y * (radius + 11)
-      )
-      let arrowPath = UIBezierPath()
-      arrowPath.move(to: shaftStart)
-      arrowPath.addLine(to: shaftEnd)
-      let arrowBack = CGPoint(
-        x: shaftEnd.x - forward.x * 5,
-        y: shaftEnd.y - forward.y * 5
-      )
-      arrowPath.move(
-        to: CGPoint(
-          x: arrowBack.x + side.x * 3,
-          y: arrowBack.y + side.y * 3
-        )
-      )
-      arrowPath.addLine(to: shaftEnd)
-      arrowPath.addLine(
-        to: CGPoint(
-          x: arrowBack.x - side.x * 3,
-          y: arrowBack.y - side.y * 3
-        )
-      )
-      let arrow = PDFAnnotation(
-        bounds: CGRect(origin: .zero, size: pageBounds.size),
-        forType: .ink,
-        withProperties: nil
-      )
-      arrow.add(arrowPath)
-      arrow.color = pinColor
-      let arrowBorder = PDFBorder()
-      arrowBorder.lineWidth = max(1.2, radius * 0.16)
-      arrow.border = arrowBorder
-      setName("\(exportPrefix)pin-direction:\(pinId)", on: arrow)
-      page.addAnnotation(arrow)
     }
   }
 
@@ -485,23 +550,107 @@ private enum FieldNotePdfWriter {
   }
 
   private static func readableTextColor(for color: UIColor) -> UIColor {
-    var red: CGFloat = 0
-    var green: CGFloat = 0
-    var blue: CGFloat = 0
-    color.getRed(&red, green: &green, blue: &blue, alpha: nil)
-    let luminance = 0.299 * red + 0.587 * green + 0.114 * blue
-    return luminance > 0.62 ? .black : .white
+    return isLightColor(color)
+      ? UIColor(
+        red: CGFloat(0x10) / 255,
+        green: CGFloat(0x15) / 255,
+        blue: CGFloat(0x1c) / 255,
+        alpha: 1
+      )
+      : .white
   }
 
   private static func readableEdgeColor(for color: UIColor) -> UIColor {
+    return isLightColor(color)
+      ? UIColor(
+        red: CGFloat(0x3b) / 255,
+        green: CGFloat(0x34) / 255,
+        blue: CGFloat(0x20) / 255,
+        alpha: 1
+      )
+      : UIColor.white.withAlphaComponent(0.96)
+  }
+
+  private static func isLightColor(_ color: UIColor) -> Bool {
     var red: CGFloat = 0
     var green: CGFloat = 0
     var blue: CGFloat = 0
     color.getRed(&red, green: &green, blue: &blue, alpha: nil)
-    let luminance = 0.299 * red + 0.587 * green + 0.114 * blue
+    let linearRed = linearizedColorComponent(red)
+    let linearGreen = linearizedColorComponent(green)
+    let linearBlue = linearizedColorComponent(blue)
+    let luminance =
+      0.2126 * linearRed + 0.7152 * linearGreen + 0.0722 * linearBlue
     return luminance > 0.62
-      ? UIColor(red: 0.23, green: 0.20, blue: 0.13, alpha: 1)
-      : .white
+  }
+
+  private static func linearizedColorComponent(_ component: CGFloat) -> CGFloat {
+    if component <= 0.03928 {
+      return component / 12.92
+    }
+    return pow((component + 0.055) / 1.055, 2.4)
+  }
+}
+
+private final class FieldNotePinDirectionAnnotation: PDFAnnotation {
+  private let tip: CGPoint
+  private let firstBase: CGPoint
+  private let secondBase: CGPoint
+  private let fillColor: UIColor
+  private let edgeColor: UIColor
+
+  init(
+    tip: CGPoint,
+    firstBase: CGPoint,
+    secondBase: CGPoint,
+    fillColor: UIColor,
+    edgeColor: UIColor
+  ) {
+    self.tip = tip
+    self.firstBase = firstBase
+    self.secondBase = secondBase
+    self.fillColor = fillColor
+    self.edgeColor = edgeColor
+    let points = [tip, firstBase, secondBase]
+    let inset: CGFloat = 2
+    let minX = points.map(\.x).min() ?? 0
+    let maxX = points.map(\.x).max() ?? 0
+    let minY = points.map(\.y).min() ?? 0
+    let maxY = points.map(\.y).max() ?? 0
+    super.init(
+      bounds: CGRect(
+        x: minX - inset,
+        y: minY - inset,
+        width: maxX - minX + inset * 2,
+        height: maxY - minY + inset * 2
+      ),
+      forType: .stamp,
+      withProperties: nil
+    )
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func draw(with box: PDFDisplayBox, in context: CGContext) {
+    let arrow = UIBezierPath()
+    arrow.move(to: tip)
+    arrow.addLine(to: firstBase)
+    arrow.addLine(to: secondBase)
+    arrow.close()
+    arrow.lineJoinStyle = .round
+
+    UIGraphicsPushContext(context)
+    context.saveGState()
+    edgeColor.setStroke()
+    arrow.lineWidth = 2.6
+    arrow.stroke()
+    fillColor.setFill()
+    arrow.fill()
+    context.restoreGState()
+    UIGraphicsPopContext()
   }
 }
 

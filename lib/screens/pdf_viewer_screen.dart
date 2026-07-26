@@ -1041,15 +1041,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   ) {
     final Color pinColor = Color(pin.colorValue);
     final bool lightColor = pinColor.computeLuminance() > 0.62;
-    final Color edgeColor = lightColor ? const Color(0xFF3B3420) : Colors.white;
+    final Color edgeColor = lightColor
+        ? const Color(0xFF3B3420)
+        : Colors.white.withValues(alpha: 0.96);
     final Color textColor = lightColor ? const Color(0xFF10151C) : Colors.white;
     final double radius = 12 * exportScale;
     final double angle = pin.directionDegrees * math.pi / 180;
     final Offset forward = Offset(math.sin(angle), -math.cos(angle));
     final Offset side = Offset(math.cos(angle), math.sin(angle));
     final Offset arrowCenter = center + forward * (radius + 5 * exportScale);
-    final double arrowLength = 7 * exportScale;
-    final double arrowHalfWidth = 4 * exportScale;
+    final double arrowLength = 6 * exportScale;
+    final double arrowHalfWidth = 3.5 * exportScale;
     final Offset tip = arrowCenter + forward * (arrowLength / 2);
     final Offset baseCenter = arrowCenter - forward * (arrowLength / 2);
     final Path arrow = Path()
@@ -1064,12 +1066,22 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       )
       ..close();
 
+    if (pin.photoCount > 0) {
+      canvas.drawCircle(
+        center,
+        radius + 3.5 * exportScale,
+        Paint()
+          ..color = const Color(0xFF49B7FF)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.2 * exportScale,
+      );
+    }
     canvas.drawPath(
       arrow,
       Paint()
         ..color = edgeColor
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.4 * exportScale
+        ..strokeWidth = 2.6 * exportScale
         ..strokeJoin = StrokeJoin.round,
     );
     canvas.drawPath(arrow, Paint()..color = pinColor);
@@ -1080,7 +1092,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       Paint()
         ..color = edgeColor
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.8 * exportScale,
+        ..strokeWidth = 1.6 * exportScale,
     );
 
     final String label = pin.number.toString();
