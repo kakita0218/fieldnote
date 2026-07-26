@@ -247,11 +247,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   void _selectTool(FieldTool tool) {
     _endStroke();
 
-    if (tool == FieldTool.pen && NativeProjectService.isAvailable) {
-      unawaited(_openNativePencilEditor());
-      return;
-    }
-
     if (_selectedTool == tool) {
       if (tool == FieldTool.pin) {
         _showPinSettings();
@@ -264,68 +259,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     setState(() {
       _selectedTool = tool;
     });
-  }
-
-  Future<void> _openNativePencilEditor() async {
-    if (_pdfDocument == null || _saveInProgress) return;
-    _saveSelectedPinNote();
-    _saveDebounce?.cancel();
-
-    try {
-      await _enqueueSave();
-      final String? sourcePath =
-          await ProjectRepository.sourcePdfPath(widget.projectId);
-      if (sourcePath == null) {
-        throw StateError('編集用PDFが見つかりません。');
-      }
-      final bool saved = await NativeProjectService.openPencilEditor(
-        sourcePath: sourcePath,
-        title: _projectName,
-      );
-      if (!saved) return;
-      await _reloadSourcePdf();
-      _pdfDirty = true;
-      _metaDirty = true;
-      await _enqueueSave();
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _errorMessage = '手書き画面を開けませんでした。\n$error';
-      });
-    }
-  }
-
-  Future<void> _reloadSourcePdf() async {
-    final Map<String, dynamic>? data =
-        await ProjectRepository.loadProject(widget.projectId);
-    if (data == null) throw StateError('案件データが見つかりません。');
-    final dynamic storedPdf = data['pdfBytes'];
-    final Uint8List bytes = storedPdf is Uint8List
-        ? Uint8List.fromList(storedPdf)
-        : storedPdf is List<int>
-            ? Uint8List.fromList(storedPdf)
-            : Uint8List(0);
-    if (bytes.isEmpty) throw StateError('編集用PDFが空です。');
-    final pdfx.PdfDocument document = await pdfx.PdfDocument.openData(
-      Uint8List.fromList(bytes),
-    );
-    final pdfx.PdfDocument? previous = _pdfDocument;
-    if (!mounted) {
-      await document.close();
-      return;
-    }
-    setState(() {
-      _pdfDocument = document;
-      _pdfBytes = bytes;
-      _pdfPath =
-          '${widget.projectId}-${bytes.length}-${DateTime.now().microsecondsSinceEpoch}';
-      _pageImageBytes = null;
-      _pageCount = document.pagesCount;
-      _currentPage = _currentPage.clamp(1, _pageCount);
-      _selectedTool = null;
-    });
-    await previous?.close();
-    await _renderPage(_currentPage);
   }
 
   void _addPin(Offset normalizedPosition) {

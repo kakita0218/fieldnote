@@ -41,21 +41,26 @@ class SinglePagePdfCanvas extends StatefulWidget {
   final String? pendingDirectionPinId;
   final ValueChanged<Offset> onAddPin;
   final ValueChanged<PinData> onPinTap;
-  final void Function(PinData pin, double directionDegrees)
-      onDirectionChanged;
-  final void Function(Offset normalizedPosition, double pressure)
-      onStrokeStart;
+  final void Function(PinData pin, double directionDegrees) onDirectionChanged;
+  final void Function(Offset normalizedPosition, double pressure) onStrokeStart;
   final void Function(Offset normalizedPosition, double pressure)
       onStrokeUpdate;
   final VoidCallback onStrokeEnd;
 
   @override
   State<SinglePagePdfCanvas> createState() => _SinglePagePdfCanvasState();
-
 }
 
 class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
   int? _activeStylusPointer;
+
+  @override
+  void didUpdateWidget(covariant SinglePagePdfCanvas oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.penModeEnabled && !widget.penModeEnabled) {
+      _activeStylusPointer = null;
+    }
+  }
 
   double _directionFromPoints(Offset from, Offset to) {
     final Offset vector = to - from;
@@ -111,6 +116,7 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
 
         return TouchInteractiveViewer(
           transformationController: widget.transformationController,
+          interactionEnabled: _activeStylusPointer == null,
           minScale: 1,
           maxScale: 10,
           child: Center(
@@ -128,9 +134,12 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                         // Ignore duplicate/overlapping pointer sequences. This
                         // prevents fast successive strokes from being joined.
                         if (_activeStylusPointer != null) return;
-                        _activeStylusPointer = event.pointer;
+                        setState(() {
+                          _activeStylusPointer = event.pointer;
+                        });
                         widget.onStrokeStart(
-                          _normalize(event.localPosition, pageWidth, pageHeight),
+                          _normalize(
+                              event.localPosition, pageWidth, pageHeight),
                           _pressure(event),
                         );
                       }
@@ -139,7 +148,8 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                     ? (event) {
                         if (event.pointer != _activeStylusPointer) return;
                         widget.onStrokeUpdate(
-                          _normalize(event.localPosition, pageWidth, pageHeight),
+                          _normalize(
+                              event.localPosition, pageWidth, pageHeight),
                           _pressure(event),
                         );
                       }
@@ -147,14 +157,18 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                 onPointerUp: widget.penModeEnabled
                     ? (event) {
                         if (event.pointer != _activeStylusPointer) return;
-                        _activeStylusPointer = null;
+                        setState(() {
+                          _activeStylusPointer = null;
+                        });
                         widget.onStrokeEnd();
                       }
                     : null,
                 onPointerCancel: widget.penModeEnabled
                     ? (event) {
                         if (event.pointer != _activeStylusPointer) return;
-                        _activeStylusPointer = null;
+                        setState(() {
+                          _activeStylusPointer = null;
+                        });
                         widget.onStrokeEnd();
                       }
                     : null,
@@ -182,38 +196,38 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                         }
                       : null,
                   child: Stack(
-                  clipBehavior: Clip.none,
-                  children: [
-                    Positioned.fill(
-                      child: Image.memory(
-                        widget.imageBytes,
-                        fit: BoxFit.fill,
-                        gaplessPlayback: true,
-                        filterQuality: FilterQuality.high,
-                      ),
-                    ),
-                    Positioned.fill(
-                      child: HandwritingLayer(strokes: widget.strokes),
-                    ),
-                    for (final PinData pin in widget.pins)
-                      Positioned(
-                        left: pin.xRatio * pageWidth -
-                            PinMarker.markerWidth / 2,
-                        top: pin.yRatio * pageHeight -
-                            PinMarker.markerCenterY,
-                        child: PinMarker(
-                          key: ValueKey<String>(pin.id),
-                          pin: pin,
-                          selected: pin.id == widget.selectedPinId,
-                          awaitingDirection:
-                              pin.id == widget.pendingDirectionPinId,
-                          onTap: () => widget.onPinTap(pin),
-                          onDirectionChanged: (direction) {
-                            widget.onDirectionChanged(pin, direction);
-                          },
+                    clipBehavior: Clip.none,
+                    children: [
+                      Positioned.fill(
+                        child: Image.memory(
+                          widget.imageBytes,
+                          fit: BoxFit.fill,
+                          gaplessPlayback: true,
+                          filterQuality: FilterQuality.high,
                         ),
                       ),
-                  ],
+                      Positioned.fill(
+                        child: HandwritingLayer(strokes: widget.strokes),
+                      ),
+                      for (final PinData pin in widget.pins)
+                        Positioned(
+                          left: pin.xRatio * pageWidth -
+                              PinMarker.markerWidth / 2,
+                          top:
+                              pin.yRatio * pageHeight - PinMarker.markerCenterY,
+                          child: PinMarker(
+                            key: ValueKey<String>(pin.id),
+                            pin: pin,
+                            selected: pin.id == widget.selectedPinId,
+                            awaitingDirection:
+                                pin.id == widget.pendingDirectionPinId,
+                            onTap: () => widget.onPinTap(pin),
+                            onDirectionChanged: (direction) {
+                              widget.onDirectionChanged(pin, direction);
+                            },
+                          ),
+                        ),
+                    ],
                   ),
                 ),
               ),

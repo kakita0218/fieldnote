@@ -66,8 +66,9 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   bool _closing = false;
   bool _allowPop = false;
   bool _changingFlash = false;
+  bool _flashAvailable = false;
   String? _error;
-  FlashMode _flashMode = FlashMode.auto;
+  FlashMode _flashMode = FlashMode.off;
   double _zoom = 1;
   double _minZoom = 1;
   double _maxZoom = 1;
@@ -126,15 +127,22 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
       );
       await controller.initialize();
 
-      FlashMode initialFlashMode = FlashMode.auto;
+      bool flashAvailable = false;
+      FlashMode initialFlashMode = FlashMode.off;
       try {
         await controller.setFlashMode(FlashMode.auto);
-      } catch (_) {
-        initialFlashMode = FlashMode.off;
+        flashAvailable = true;
+        initialFlashMode = FlashMode.auto;
+      } catch (autoError) {
         try {
           await controller.setFlashMode(FlashMode.off);
-        } catch (_) {
+          flashAvailable = true;
+        } catch (offError) {
           // Cameras without flash hardware can still be used normally.
+          debugPrint(
+            'Flash unavailable for ${selected.lensType}: '
+            'AUTO=$autoError, OFF=$offError',
+          );
         }
       }
 
@@ -157,6 +165,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         _minZoom = minZoom;
         _maxZoom = maxZoom < minZoom ? minZoom : maxZoom;
         _zoom = minZoom;
+        _flashAvailable = flashAvailable;
         _flashMode = initialFlashMode;
         _initializing = false;
       });
@@ -330,7 +339,9 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
 
   Future<void> _selectFlashMode(FlashMode requestedMode) async {
     final controller = _controller;
-    if (controller == null || _closing || _changingFlash) return;
+    if (controller == null || !_flashAvailable || _closing || _changingFlash) {
+      return;
+    }
 
     final FlashMode selectedMode =
         _flashMode == FlashMode.torch ? FlashMode.always : _flashMode;
@@ -519,8 +530,8 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
 
   Widget _buildFlashSelector() {
     return PopupMenuButton<FlashMode>(
-      enabled: !_closing && !_changingFlash,
-      tooltip: 'フラッシュ設定',
+      enabled: _flashAvailable && !_closing && !_changingFlash,
+      tooltip: _flashAvailable ? 'フラッシュ設定' : 'このカメラではフラッシュを利用できません',
       initialValue: _selectedFlashMenuMode,
       onSelected: (mode) => unawaited(_selectFlashMode(mode)),
       itemBuilder: (context) => [
@@ -542,7 +553,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
       ],
       child: AnimatedOpacity(
         duration: const Duration(milliseconds: 120),
-        opacity: _changingFlash ? 0.55 : 1,
+        opacity: (_changingFlash || !_flashAvailable) ? 0.55 : 1,
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 12),
           decoration: BoxDecoration(
@@ -552,11 +563,13 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(_flashIcon),
+              Icon(_flashAvailable ? _flashIcon : Icons.flash_off_rounded),
               const SizedBox(width: 8),
-              Text(_flashLabel),
-              const SizedBox(width: 3),
-              const Icon(Icons.arrow_drop_down_rounded),
+              Text(_flashAvailable ? _flashLabel : 'フラッシュなし'),
+              if (_flashAvailable) ...[
+                const SizedBox(width: 3),
+                const Icon(Icons.arrow_drop_down_rounded),
+              ],
             ],
           ),
         ),
