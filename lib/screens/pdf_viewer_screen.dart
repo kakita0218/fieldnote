@@ -37,6 +37,26 @@ const List<Color> _fieldPaletteColors = <Color>[
   Color(0xFF111111), // 黒
 ];
 
+class _IndexedDrawingStroke {
+  const _IndexedDrawingStroke({
+    required this.stroke,
+    required this.index,
+  });
+
+  final DrawingStroke stroke;
+  final int index;
+}
+
+class _DrawingEdit {
+  const _DrawingEdit({
+    required this.removedStrokes,
+    required this.addedStrokes,
+  });
+
+  final List<_IndexedDrawingStroke> removedStrokes;
+  final List<_IndexedDrawingStroke> addedStrokes;
+}
+
 class PdfViewerScreen extends StatefulWidget {
   const PdfViewerScreen({
     super.key,
@@ -93,8 +113,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   final List<PinData> _pins = [];
   final List<PinData> _redoPins = [];
   final Map<int, List<DrawingStroke>> _strokesByPage = {};
-  final Map<int, List<DrawingStroke>> _redoStrokesByPage = {};
+  final Map<int, List<_DrawingEdit>> _undoDrawingEditsByPage = {};
+  final Map<int, List<_DrawingEdit>> _redoDrawingEditsByPage = {};
   DrawingStroke? _activeStroke;
+  int? _activeStrokeIndex;
+  int? _activeEraserPage;
+  Offset? _lastEraserPosition;
+  List<DrawingStroke>? _activeEraserBeforeStrokes;
+  Map<String, String>? _activeEraserSourceIds;
+  Set<String>? _activeEraserTouchedSourceIds;
+  String? _activeEraserEditId;
+  int _eraserFragmentSequence = 0;
   final Map<String, List<PhotoData>> _photosByPinId = {};
 
   String? _selectedPinId;
@@ -203,8 +232,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _redoPins.clear();
         _photosByPinId.clear();
         _strokesByPage.clear();
-        _redoStrokesByPage.clear();
+        _undoDrawingEditsByPage.clear();
+        _redoDrawingEditsByPage.clear();
         _activeStroke = null;
+        _activeStrokeIndex = null;
+        _activeEraserPage = null;
+        _lastEraserPosition = null;
+        _activeEraserBeforeStrokes = null;
+        _activeEraserSourceIds = null;
+        _activeEraserTouchedSourceIds = null;
+        _activeEraserEditId = null;
 
         _nextPinNumber = 1;
         _selectedPinId = null;
@@ -448,6 +485,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   void _startStroke(Offset normalizedPosition, double pressure) {
     if (_selectedTool != FieldTool.pen) return;
     if (_eraserEnabled) {
+      _activeEraserPage = _currentPage;
+      _lastEraserPosition = null;
+      final List<DrawingStroke> strokes =
+          _strokesByPage[_currentPage] ?? const <DrawingStroke>[];
+      _activeEraserBeforeStrokes = List<DrawingStroke>.of(strokes);
+      _activeEraserSourceIds = <String, String>{
+        for (final DrawingStroke stroke in strokes) stroke.id: stroke.id,
+      };
+      _activeEraserTouchedSourceIds = <String>{};
+      _activeEraserEditId = DateTime.now().microsecondsSinceEpoch.toString();
+      _eraserFragmentSequence = 0;
       _eraseAt(normalizedPosition);
       return;
     }
@@ -469,14 +517,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       _activeStroke = stroke;
       final List<DrawingStroke> pageStrokes =
           _strokesByPage.putIfAbsent(_currentPage, () => <DrawingStroke>[]);
+      _activeStrokeIndex = pageStrokes.length;
       pageStrokes.add(stroke);
-      _redoStrokesByPage[_currentPage]?.clear();
+      _redoDrawingEditsByPage[_currentPage]?.clear();
     });
   }
 
   void _updateStroke(Offset normalizedPosition, double pressure) {
     if (_eraserEnabled) {
-      _eraseAt(normalizedPosition);
+      if (_activeEraserPage != null) {
+        _eraseAt(normalizedPosition);
+      }
       return;
     }
     final DrawingStroke? active = _activeStroke;
@@ -504,11 +555,75 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   void _endStroke() {
-    if (_activeStroke == null) {
+    final int? eraserPage = _activeEraserPage;
+    if (eraserPage != null) {
+      final List<DrawingStroke> before =
+          _activeEraserBeforeStrokes ?? const <DrawingStroke>[];
+      final Map<String, String> sourceIds =
+          _activeEraserSourceIds ?? const <String, String>{};
+      final Set<String> touchedSourceIds =
+          _activeEraserTouchedSourceIds ?? const <String>{};
+      final List<DrawingStroke> after =
+          _strokesByPage[eraserPage] ?? const <DrawingStroke>[];
+      final List<_IndexedDrawingStroke> removedStrokes =
+          <_IndexedDrawingStroke>[
+        for (int index = 0; index < before.length; index++)
+          if (touchedSourceIds.contains(before[index].id))
+            _IndexedDrawingStroke(stroke: before[index], index: index),
+      ];
+      final List<_IndexedDrawingStroke> addedStrokes = <_IndexedDrawingStroke>[
+        for (int index = 0; index < after.length; index++)
+          if (touchedSourceIds.contains(sourceIds[after[index].id]))
+            _IndexedDrawingStroke(stroke: after[index], index: index),
+      ];
+      final bool changed = removedStrokes.isNotEmpty;
+      if (changed) {
+        setState(() {
+          _undoDrawingEditsByPage
+              .putIfAbsent(eraserPage, () => <_DrawingEdit>[])
+              .add(
+                _DrawingEdit(
+                  removedStrokes:
+                      List<_IndexedDrawingStroke>.unmodifiable(removedStrokes),
+                  addedStrokes:
+                      List<_IndexedDrawingStroke>.unmodifiable(addedStrokes),
+                ),
+              );
+        });
+      }
+      _activeEraserPage = null;
+      _lastEraserPosition = null;
+      _activeEraserBeforeStrokes = null;
+      _activeEraserSourceIds = null;
+      _activeEraserTouchedSourceIds = null;
+      _activeEraserEditId = null;
+      if (changed) {
+        _scheduleSave(pins: false, drawings: true, meta: true);
+      }
       return;
     }
+
+    final DrawingStroke? completedStroke = _activeStroke;
+    if (completedStroke == null) return;
+    final int strokePage = completedStroke.pageNumber;
+    final int strokeIndex = _activeStrokeIndex ??
+        (_strokesByPage[strokePage]?.indexOf(completedStroke) ?? 0);
     setState(() {
       _activeStroke = null;
+      _activeStrokeIndex = null;
+      _undoDrawingEditsByPage
+          .putIfAbsent(strokePage, () => <_DrawingEdit>[])
+          .add(
+            _DrawingEdit(
+              removedStrokes: const <_IndexedDrawingStroke>[],
+              addedStrokes: <_IndexedDrawingStroke>[
+                _IndexedDrawingStroke(
+                  stroke: completedStroke,
+                  index: strokeIndex,
+                ),
+              ],
+            ),
+          );
     });
     _scheduleSave(pins: false, drawings: true, meta: true);
   }
@@ -519,10 +634,45 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     );
   }
 
+  void _applyDrawingEdit(
+    int pageNumber,
+    _DrawingEdit edit, {
+    required bool undo,
+  }) {
+    final List<_IndexedDrawingStroke> strokesToRemove =
+        undo ? edit.addedStrokes : edit.removedStrokes;
+    final List<_IndexedDrawingStroke> strokesToRestore =
+        undo ? edit.removedStrokes : edit.addedStrokes;
+    final Set<String> strokeIds =
+        strokesToRemove.map((indexedStroke) => indexedStroke.stroke.id).toSet();
+    _strokesByPage[pageNumber]?.removeWhere(
+      (DrawingStroke stroke) => strokeIds.contains(stroke.id),
+    );
+
+    final List<DrawingStroke> pageStrokes =
+        _strokesByPage.putIfAbsent(pageNumber, () => <DrawingStroke>[]);
+    final List<_IndexedDrawingStroke> ordered =
+        List<_IndexedDrawingStroke>.of(strokesToRestore)
+          ..sort((a, b) => a.index.compareTo(b.index));
+    for (final _IndexedDrawingStroke indexedStroke in ordered) {
+      if (pageStrokes.any(
+        (DrawingStroke stroke) => stroke.id == indexedStroke.stroke.id,
+      )) {
+        continue;
+      }
+      final int insertionIndex = math.min(
+        math.max(indexedStroke.index, 0),
+        pageStrokes.length,
+      );
+      pageStrokes.insert(insertionIndex, indexedStroke.stroke);
+    }
+  }
+
   bool get _canUndoCurrentTool {
     if (_selectedTool == null) return false;
     if (_selectedTool == FieldTool.pen) {
-      return (_strokesByPage[_currentPage]?.isNotEmpty ?? false);
+      return (_undoDrawingEditsByPage[_currentPage]?.isNotEmpty ?? false) ||
+          (_strokesByPage[_currentPage]?.isNotEmpty ?? false);
     }
     return _pins.isNotEmpty;
   }
@@ -530,25 +680,44 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   bool get _canRedoCurrentTool {
     if (_selectedTool == null) return false;
     if (_selectedTool == FieldTool.pen) {
-      return (_redoStrokesByPage[_currentPage]?.isNotEmpty ?? false);
+      return (_redoDrawingEditsByPage[_currentPage]?.isNotEmpty ?? false);
     }
     return _redoPins.isNotEmpty;
   }
 
   void _undo() {
     if (_selectedTool == FieldTool.pen) {
+      _endStroke();
       final List<DrawingStroke>? pageStrokes = _strokesByPage[_currentPage];
-      if (pageStrokes == null || pageStrokes.isEmpty) {
-        return;
-      }
+      final List<_DrawingEdit> undo =
+          _undoDrawingEditsByPage[_currentPage] ?? <_DrawingEdit>[];
+      _DrawingEdit? edit;
+
       setState(() {
-        final DrawingStroke removed = pageStrokes.removeLast();
-        _redoStrokesByPage
-            .putIfAbsent(_currentPage, () => <DrawingStroke>[])
-            .add(removed);
+        if (undo.isNotEmpty) {
+          edit = undo.removeLast();
+          _applyDrawingEdit(_currentPage, edit!, undo: true);
+        } else if (pageStrokes != null && pageStrokes.isNotEmpty) {
+          final int index = pageStrokes.length - 1;
+          final DrawingStroke removed = pageStrokes.removeLast();
+          edit = _DrawingEdit(
+            removedStrokes: const <_IndexedDrawingStroke>[],
+            addedStrokes: <_IndexedDrawingStroke>[
+              _IndexedDrawingStroke(stroke: removed, index: index),
+            ],
+          );
+        }
+        if (edit != null) {
+          _redoDrawingEditsByPage
+              .putIfAbsent(_currentPage, () => <_DrawingEdit>[])
+              .add(edit!);
+        }
         _activeStroke = null;
+        _activeStrokeIndex = null;
       });
-      _scheduleSave();
+      if (edit != null) {
+        _scheduleSave();
+      }
       return;
     }
 
@@ -579,15 +748,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   void _redo() {
     if (_selectedTool == FieldTool.pen) {
-      final List<DrawingStroke>? redo = _redoStrokesByPage[_currentPage];
+      _endStroke();
+      final List<_DrawingEdit>? redo = _redoDrawingEditsByPage[_currentPage];
       if (redo == null || redo.isEmpty) {
         return;
       }
       setState(() {
-        final DrawingStroke restored = redo.removeLast();
-        _strokesByPage
-            .putIfAbsent(_currentPage, () => <DrawingStroke>[])
-            .add(restored);
+        final _DrawingEdit edit = redo.removeLast();
+        _applyDrawingEdit(_currentPage, edit, undo: false);
+        _undoDrawingEditsByPage
+            .putIfAbsent(_currentPage, () => <_DrawingEdit>[])
+            .add(edit);
       });
       _scheduleSave();
       return;
@@ -1470,6 +1641,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _strokesByPage
           ..clear()
           ..addAll(restoredStrokes);
+        _undoDrawingEditsByPage.clear();
+        _redoDrawingEditsByPage.clear();
+        _activeStroke = null;
+        _activeStrokeIndex = null;
+        _activeEraserPage = null;
+        _lastEraserPosition = null;
+        _activeEraserBeforeStrokes = null;
+        _activeEraserSourceIds = null;
+        _activeEraserTouchedSourceIds = null;
+        _activeEraserEditId = null;
         _photosByPinId.clear();
         _nextPinNumber =
             (data['nextPinNumber'] as num?)?.toInt() ?? (_pins.length + 1);
@@ -1515,16 +1696,184 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     }
   }
 
+  static const double _eraserRadius = 0.025;
+  static const double _eraserSampleSpacing = _eraserRadius / 3;
+
   void _eraseAt(Offset position) {
-    final strokes = _strokesByPage[_currentPage];
+    final int? pageNumber = _activeEraserPage;
+    if (pageNumber == null) return;
+
+    final Offset pathStart = _lastEraserPosition ?? position;
+    _lastEraserPosition = position;
+
+    final List<DrawingStroke>? strokes = _strokesByPage[pageNumber];
     if (strokes == null || strokes.isEmpty) return;
-    final before = strokes.length;
-    strokes.removeWhere((stroke) =>
-        stroke.points.any((p) => (p.position - position).distance < 0.025));
-    if (strokes.length != before) {
-      setState(() {});
-      _scheduleSave();
+
+    final Map<String, String>? sourceIds = _activeEraserSourceIds;
+    final Set<String>? touchedSourceIds = _activeEraserTouchedSourceIds;
+    if (sourceIds == null || touchedSourceIds == null) return;
+
+    bool changed = false;
+    final List<DrawingStroke> updatedStrokes = <DrawingStroke>[];
+    for (final DrawingStroke stroke in strokes) {
+      final String sourceId = sourceIds[stroke.id] ?? stroke.id;
+      final List<DrawingStroke>? fragments = _splitStrokeOutsideEraser(
+        stroke,
+        pathStart,
+        position,
+        sourceId,
+      );
+      if (fragments == null) {
+        updatedStrokes.add(stroke);
+        continue;
+      }
+
+      changed = true;
+      sourceIds.remove(stroke.id);
+      touchedSourceIds.add(sourceId);
+      for (final DrawingStroke fragment in fragments) {
+        sourceIds[fragment.id] = sourceId;
+        updatedStrokes.add(fragment);
+      }
     }
+    if (!changed) return;
+
+    setState(() {
+      strokes
+        ..clear()
+        ..addAll(updatedStrokes);
+      _redoDrawingEditsByPage[pageNumber]?.clear();
+    });
+  }
+
+  List<DrawingStroke>? _splitStrokeOutsideEraser(
+    DrawingStroke stroke,
+    Offset pathStart,
+    Offset pathEnd,
+    String sourceId,
+  ) {
+    if (stroke.points.isEmpty) return null;
+    if (!_eraserBoundsOverlapStroke(stroke, pathStart, pathEnd)) return null;
+    final List<DrawingPoint> sampledPoints =
+        _densifyDrawingPoints(stroke.points);
+    final double radiusSquared = _eraserRadius * _eraserRadius;
+    bool erasedAnyPoint = false;
+    final List<List<DrawingPoint>> outsideRuns = <List<DrawingPoint>>[];
+    List<DrawingPoint> currentRun = <DrawingPoint>[];
+
+    for (final DrawingPoint point in sampledPoints) {
+      final bool erased = _pointToSegmentDistanceSquared(
+            point.position,
+            pathStart,
+            pathEnd,
+          ) <=
+          radiusSquared;
+      if (erased) {
+        erasedAnyPoint = true;
+        if (currentRun.isNotEmpty) {
+          outsideRuns.add(currentRun);
+          currentRun = <DrawingPoint>[];
+        }
+      } else {
+        currentRun.add(point);
+      }
+    }
+    if (!erasedAnyPoint) return null;
+    if (currentRun.isNotEmpty) {
+      outsideRuns.add(currentRun);
+    }
+
+    return outsideRuns
+        .map(
+          (List<DrawingPoint> points) => DrawingStroke(
+            id: '$sourceId-erase-${_activeEraserEditId ?? 'edit'}'
+                '-${_eraserFragmentSequence++}',
+            pageNumber: stroke.pageNumber,
+            points: points,
+            width: stroke.width,
+            color: stroke.color,
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  bool _eraserBoundsOverlapStroke(
+    DrawingStroke stroke,
+    Offset pathStart,
+    Offset pathEnd,
+  ) {
+    double strokeMinX = stroke.points.first.position.dx;
+    double strokeMaxX = strokeMinX;
+    double strokeMinY = stroke.points.first.position.dy;
+    double strokeMaxY = strokeMinY;
+    for (int index = 1; index < stroke.points.length; index++) {
+      final Offset position = stroke.points[index].position;
+      strokeMinX = math.min(strokeMinX, position.dx);
+      strokeMaxX = math.max(strokeMaxX, position.dx);
+      strokeMinY = math.min(strokeMinY, position.dy);
+      strokeMaxY = math.max(strokeMaxY, position.dy);
+    }
+
+    final double eraserMinX =
+        math.min(pathStart.dx, pathEnd.dx) - _eraserRadius;
+    final double eraserMaxX =
+        math.max(pathStart.dx, pathEnd.dx) + _eraserRadius;
+    final double eraserMinY =
+        math.min(pathStart.dy, pathEnd.dy) - _eraserRadius;
+    final double eraserMaxY =
+        math.max(pathStart.dy, pathEnd.dy) + _eraserRadius;
+    return strokeMaxX >= eraserMinX &&
+        strokeMinX <= eraserMaxX &&
+        strokeMaxY >= eraserMinY &&
+        strokeMinY <= eraserMaxY;
+  }
+
+  List<DrawingPoint> _densifyDrawingPoints(List<DrawingPoint> points) {
+    if (points.length < 2) {
+      return List<DrawingPoint>.of(points);
+    }
+
+    final List<DrawingPoint> sampled = <DrawingPoint>[points.first];
+    for (int index = 1; index < points.length; index++) {
+      final DrawingPoint start = points[index - 1];
+      final DrawingPoint end = points[index];
+      final double distance = (end.position - start.position).distance;
+      final int steps = math.max(
+        1,
+        (distance / _eraserSampleSpacing).ceil(),
+      );
+      for (int step = 1; step <= steps; step++) {
+        final double t = step / steps;
+        sampled.add(
+          DrawingPoint(
+            position: Offset.lerp(start.position, end.position, t)!,
+            pressure: start.pressure + (end.pressure - start.pressure) * t,
+          ),
+        );
+      }
+    }
+    return sampled;
+  }
+
+  double _pointToSegmentDistanceSquared(
+    Offset point,
+    Offset segmentStart,
+    Offset segmentEnd,
+  ) {
+    final Offset segment = segmentEnd - segmentStart;
+    final double segmentLengthSquared =
+        segment.dx * segment.dx + segment.dy * segment.dy;
+    if (segmentLengthSquared <= 1e-12) {
+      return (point - segmentStart).distanceSquared;
+    }
+
+    final Offset fromStart = point - segmentStart;
+    final double projection =
+        (fromStart.dx * segment.dx + fromStart.dy * segment.dy) /
+            segmentLengthSquared;
+    final double clampedProjection = projection.clamp(0.0, 1.0);
+    final Offset closestPoint = segmentStart + segment * clampedProjection;
+    return (point - closestPoint).distanceSquared;
   }
 
   Future<void> _showPinSettings() async {

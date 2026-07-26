@@ -594,8 +594,10 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
               : const Icon(Icons.arrow_back_rounded, size: 30),
         ),
         const Spacer(),
-        _buildFlashSelector(),
-        const SizedBox(width: 12),
+        if (_flashAvailable) ...[
+          _buildFlashSelector(),
+          const SizedBox(width: 12),
+        ],
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           decoration: BoxDecoration(
