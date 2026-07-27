@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 
 import '../models/photo_data.dart';
 import '../models/photo_board.dart';
+import '../models/photo_board_layout.dart';
 import '../services/native_project_service.dart';
 
 class CameraCaptureScreen extends StatefulWidget {
@@ -89,6 +90,9 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   Offset? _focusPoint;
   bool _focusIndicatorVisible = false;
   int _focusIndicatorRevision = 0;
+  final GlobalKey _cameraPreviewOverlayKey =
+      GlobalKey(debugLabel: 'camera-preview-overlay');
+  Offset? _lastBoardDragGlobalPosition;
 
   @override
   void initState() {
@@ -219,6 +223,11 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
 
     setState(() => _takingPicture = true);
     try {
+      final PhotoBoardConfig captureBoard = _boardConfig;
+      final Rect normalizedBoardRect = _normalizedBoardRectForCapture(
+        controller,
+        captureBoard.position,
+      );
       final XFile file = await controller.takePicture();
 
       // AVCapturePhotoOutput already plays the system shutter sound on iOS.
@@ -228,7 +237,6 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         unawaited(SystemSound.play(SystemSoundType.click));
       }
       final Uint8List originalBytes = await file.readAsBytes();
-      final PhotoBoardConfig captureBoard = _boardConfig;
       final Uint8List bytes = captureBoard.enabled
           ? await NativeProjectService.composePhotoBoard(
               jpegBytes: originalBytes,
@@ -238,6 +246,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
               shootingLocation: captureBoard.shootingLocation,
               workStatus: captureBoard.stepLabel,
               position: captureBoard.position.id,
+              normalizedBoardRect: normalizedBoardRect,
             )
           : originalBytes;
 
@@ -287,6 +296,24 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     } finally {
       if (mounted) setState(() => _takingPicture = false);
     }
+  }
+
+  Rect _normalizedBoardRectForCapture(
+    CameraController controller,
+    PhotoBoardPosition position,
+  ) {
+    final RenderObject? renderObject =
+        _cameraPreviewOverlayKey.currentContext?.findRenderObject();
+    if (renderObject is RenderBox &&
+        renderObject.hasSize &&
+        renderObject.size.width > 0 &&
+        renderObject.size.height > 0) {
+      return PhotoBoardLayout.normalizedRectFor(renderObject.size, position);
+    }
+    return PhotoBoardLayout.normalizedRectForAspectRatio(
+      controller.value.aspectRatio,
+      position,
+    );
   }
 
   Future<void> _queueOriginalSave(
@@ -736,6 +763,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
             final double maxIndicatorTop =
                 previewSize.height > 60 ? previewSize.height - 60 : 0;
             return GestureDetector(
+              key: _cameraPreviewOverlayKey,
               behavior: HitTestBehavior.opaque,
               onTapDown: (details) => unawaited(
                 _focusAt(details.localPosition, previewSize),
@@ -783,6 +811,10 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                           ),
                         ),
                       ),
+                    ),
+                  if (_boardConfig.enabled)
+                    Positioned.fill(
+                      child: _buildBoardOverlay(previewSize),
                     ),
                 ],
               ),
@@ -889,108 +921,125 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     );
   }
 
-  Widget _buildBoardPreview(double availableWidth) {
-    final double boardWidth =
-        math.min(430, math.max(300, availableWidth * 0.37));
-    final Widget board = SizedBox(
-      width: boardWidth,
+  Widget _buildDraggableBoard(Size boardSize) {
+    final Widget board = SizedBox.fromSize(
+      size: boardSize,
       child: _PhotoBoardPreview(
         config: _boardConfig,
         shootingDate: _formatBoardDate(DateTime.now()),
       ),
     );
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.end,
-      children: [
-        LongPressDraggable<PhotoBoardPosition>(
-          data: _boardConfig.position,
-          maxSimultaneousDrags: (_takingPicture || _closing) ? 0 : 1,
-          hapticFeedbackOnStart: true,
-          feedback: Material(
-            color: Colors.transparent,
-            child: SizedBox(
-              width: boardWidth,
-              child: _PhotoBoardPreview(
-                config: _boardConfig,
-                shootingDate: _formatBoardDate(DateTime.now()),
-              ),
-            ),
-          ),
-          childWhenDragging: Opacity(opacity: 0.24, child: board),
-          onDragEnd: (DraggableDetails details) {
-            final Size screen = MediaQuery.sizeOf(context);
-            final Offset boardCenter =
-                details.offset + Offset(boardWidth / 2, boardWidth * 0.64 / 2);
-            final bool left = boardCenter.dx < screen.width / 2;
-            final bool top = boardCenter.dy < screen.height / 2;
-            final PhotoBoardPosition position;
-            if (top) {
-              position = left
-                  ? PhotoBoardPosition.topLeft
-                  : PhotoBoardPosition.topRight;
-            } else {
-              position = left
-                  ? PhotoBoardPosition.bottomLeft
-                  : PhotoBoardPosition.bottomRight;
-            }
-            _applyBoardConfig(_boardConfig.copyWith(position: position));
-          },
-          child: Tooltip(
-            message: '長押しして別の角へ移動',
-            child: board,
+    return Draggable<PhotoBoardPosition>(
+      data: _boardConfig.position,
+      maxSimultaneousDrags: (_takingPicture || _closing) ? 0 : 1,
+      feedback: Material(
+        color: Colors.transparent,
+        child: SizedBox.fromSize(
+          size: boardSize,
+          child: _PhotoBoardPreview(
+            config: _boardConfig,
+            shootingDate: _formatBoardDate(DateTime.now()),
           ),
         ),
-        const SizedBox(width: 8),
-        Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            _BoardStepButton(
-              tooltip: '前の内容',
-              onPressed: _boardConfig.stepIndex > 0
-                  ? () => _changeBoardStep(-1)
-                  : null,
-              icon: Icons.keyboard_arrow_up_rounded,
+      ),
+      childWhenDragging: Opacity(opacity: 0.24, child: board),
+      onDragStarted: () => _lastBoardDragGlobalPosition = null,
+      onDragUpdate: (DragUpdateDetails details) {
+        _lastBoardDragGlobalPosition = details.globalPosition;
+      },
+      onDragEnd: (DraggableDetails details) {
+        final Offset globalPosition = _lastBoardDragGlobalPosition ??
+            details.offset + Offset(boardSize.width / 2, boardSize.height / 2);
+        _lastBoardDragGlobalPosition = null;
+        final RenderObject? renderObject =
+            _cameraPreviewOverlayKey.currentContext?.findRenderObject();
+        if (renderObject is! RenderBox || !renderObject.hasSize || !mounted) {
+          return;
+        }
+        final Offset localPosition = renderObject.globalToLocal(globalPosition);
+        final PhotoBoardPosition position = PhotoBoardLayout.positionNearestTo(
+          renderObject.size,
+          localPosition,
+        );
+        if (position != _boardConfig.position) {
+          _applyBoardConfig(_boardConfig.copyWith(position: position));
+        }
+      },
+      child: Semantics(
+        label: '電子看板。ドラッグして四隅へ移動',
+        child: board,
+      ),
+    );
+  }
+
+  Widget _buildBoardStepControls() {
+    final bool canInteract = !_takingPicture && !_closing;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _BoardStepButton(
+          tooltip: '前の内容',
+          onPressed: canInteract && _boardConfig.stepIndex > 0
+              ? () => _changeBoardStep(-1)
+              : null,
+          icon: Icons.keyboard_arrow_up_rounded,
+        ),
+        const SizedBox(height: 6),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+          decoration: BoxDecoration(
+            color: Colors.black54,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Text(
+            '${_boardConfig.stepIndex + 1}/'
+            '${_boardConfig.template.steps.length}',
+            style: const TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w800,
             ),
-            const SizedBox(height: 6),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-              decoration: BoxDecoration(
-                color: Colors.black54,
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Text(
-                '${_boardConfig.stepIndex + 1}/'
-                '${_boardConfig.template.steps.length}',
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ),
-            const SizedBox(height: 6),
-            _BoardStepButton(
-              tooltip: '次の内容',
-              onPressed: _boardConfig.stepIndex <
+          ),
+        ),
+        const SizedBox(height: 6),
+        _BoardStepButton(
+          tooltip: '次の内容',
+          onPressed: canInteract &&
+                  _boardConfig.stepIndex <
                       _boardConfig.template.steps.length - 1
-                  ? () => _changeBoardStep(1)
-                  : null,
-              icon: Icons.keyboard_arrow_down_rounded,
-            ),
-          ],
+              ? () => _changeBoardStep(1)
+              : null,
+          icon: Icons.keyboard_arrow_down_rounded,
         ),
       ],
     );
   }
 
-  Widget _buildPositionedBoard(BoxConstraints constraints) {
+  Widget _buildBoardOverlay(Size previewSize) {
+    final Rect boardRect = PhotoBoardLayout.rectFor(
+      previewSize,
+      _boardConfig.position,
+    );
     final bool left = _boardConfig.position.isLeft;
-    final bool top = _boardConfig.position.isTop;
-    return Positioned(
-      left: left ? 22 : null,
-      right: left ? null : 150,
-      top: top ? 82 : null,
-      bottom: top ? null : 122,
-      child: _buildBoardPreview(constraints.maxWidth),
+    const double controlsWidth = 48;
+    const double controlsHeight = 138;
+    final double controlsTop = (boardRect.center.dy - controlsHeight / 2)
+        .clamp(0.0, math.max(0, previewSize.height - controlsHeight));
+
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Positioned.fromRect(
+          rect: boardRect,
+          child: _buildDraggableBoard(boardRect.size),
+        ),
+        Positioned(
+          left: left ? boardRect.right + 8 : null,
+          right: left ? null : previewSize.width - boardRect.left + 8,
+          top: controlsTop,
+          width: controlsWidth,
+          child: _buildBoardStepControls(),
+        ),
+      ],
     );
   }
 
@@ -1216,7 +1265,6 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                       ),
                     ),
                   ),
-                  if (_boardConfig.enabled) _buildPositionedBoard(constraints),
                   Positioned(
                     left: 22,
                     bottom: 20,

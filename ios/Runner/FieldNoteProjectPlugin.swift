@@ -77,6 +77,7 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
     let shootingLocation = arguments["shootingLocation"] as? String ?? ""
     let workStatus = arguments["workStatus"] as? String ?? ""
     let position = arguments["position"] as? String ?? "bottomLeft"
+    let normalizedBoardRect = Self.readNormalizedBoardRect(arguments)
 
     let format = UIGraphicsImageRendererFormat.default()
     format.scale = sourceImage.scale
@@ -97,7 +98,8 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
         shootingDate: shootingDate,
         shootingLocation: shootingLocation,
         workStatus: workStatus,
-        position: position
+        position: position,
+        normalizedBoardRect: normalizedBoardRect
       )
     }
 
@@ -114,6 +116,30 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
     result(FlutterStandardTypedData(bytes: jpeg))
   }
 
+  private static func readNormalizedBoardRect(
+    _ arguments: [String: Any]
+  ) -> CGRect? {
+    guard
+      let left = (arguments["boardLeft"] as? NSNumber)?.doubleValue,
+      let top = (arguments["boardTop"] as? NSNumber)?.doubleValue,
+      let width = (arguments["boardWidth"] as? NSNumber)?.doubleValue,
+      let height = (arguments["boardHeight"] as? NSNumber)?.doubleValue,
+      left.isFinite,
+      top.isFinite,
+      width.isFinite,
+      height.isFinite,
+      left >= 0,
+      top >= 0,
+      width > 0,
+      height > 0,
+      left + width <= 1.000_001,
+      top + height <= 1.000_001
+    else {
+      return nil
+    }
+    return CGRect(x: left, y: top, width: width, height: height)
+  }
+
   private static func drawPhotoBoard(
     in context: CGContext,
     canvasSize: CGSize,
@@ -122,7 +148,8 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
     shootingDate: String,
     shootingLocation: String,
     workStatus: String,
-    position: String
+    position: String,
+    normalizedBoardRect: CGRect?
   ) {
     let landscape = canvasSize.width >= canvasSize.height
     let boardWidth = landscape
@@ -132,12 +159,20 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
     let margin = min(canvasSize.width, canvasSize.height) * 0.035
     let placeOnRight = position == "topRight" || position == "bottomRight"
     let placeOnTop = position == "topLeft" || position == "topRight"
-    let board = CGRect(
+    let fallbackBoard = CGRect(
       x: placeOnRight ? canvasSize.width - boardWidth - margin : margin,
       y: placeOnTop ? margin : canvasSize.height - boardHeight - margin,
       width: boardWidth,
       height: boardHeight
     )
+    let board = normalizedBoardRect.map {
+      CGRect(
+        x: $0.origin.x * canvasSize.width,
+        y: $0.origin.y * canvasSize.height,
+        width: $0.size.width * canvasSize.width,
+        height: $0.size.height * canvasSize.height
+      )
+    } ?? fallbackBoard
     let lineWidth = max(2, boardWidth * 0.0048)
     let white = UIColor.white
     let boardGreen = UIColor(

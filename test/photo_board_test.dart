@@ -1,4 +1,6 @@
 import 'package:fieldnote/models/photo_board.dart';
+import 'package:fieldnote/models/photo_board_layout.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -64,6 +66,47 @@ void main() {
     expect(
       chipping.copyWith(position: PhotoBoardPosition.topRight).position,
       PhotoBoardPosition.topRight,
+    );
+  });
+
+  test('横向き写真の看板矩形は保存画像と同じ比率になる', () {
+    const Size canvas = Size(1200, 900);
+
+    final Rect topLeft = PhotoBoardLayout.rectFor(
+      canvas,
+      PhotoBoardPosition.topLeft,
+    );
+    final Rect bottomRight = PhotoBoardLayout.rectFor(
+      canvas,
+      PhotoBoardPosition.bottomRight,
+    );
+
+    expect(topLeft.left, closeTo(31.5, 0.001));
+    expect(topLeft.top, closeTo(31.5, 0.001));
+    expect(topLeft.width, closeTo(468, 0.001));
+    expect(topLeft.height, closeTo(299.52, 0.001));
+    expect(bottomRight.right, closeTo(1168.5, 0.001));
+    expect(bottomRight.bottom, closeTo(868.5, 0.001));
+  });
+
+  test('ドラッグ終了位置は最寄りの4隅へ分類される', () {
+    const Size preview = Size(1000, 800);
+
+    expect(
+      PhotoBoardLayout.positionNearestTo(preview, const Offset(100, 100)),
+      PhotoBoardPosition.topLeft,
+    );
+    expect(
+      PhotoBoardLayout.positionNearestTo(preview, const Offset(900, 100)),
+      PhotoBoardPosition.topRight,
+    );
+    expect(
+      PhotoBoardLayout.positionNearestTo(preview, const Offset(100, 700)),
+      PhotoBoardPosition.bottomLeft,
+    );
+    expect(
+      PhotoBoardLayout.positionNearestTo(preview, const Offset(900, 700)),
+      PhotoBoardPosition.bottomRight,
     );
   });
 }
