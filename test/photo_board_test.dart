@@ -50,6 +50,7 @@ void main() {
         PhotoBoardTemplate.chipping: 4,
         PhotoBoardTemplate.asbestos: 1,
       },
+      position: PhotoBoardPosition.bottomLeft,
     );
 
     expect(initial.stepLabel, 'コア採取状況');
@@ -59,6 +60,10 @@ void main() {
     expect(
       chipping.withSelectedStep(5).templateSteps[PhotoBoardTemplate.core],
       2,
+    );
+    expect(
+      chipping.copyWith(position: PhotoBoardPosition.topRight).position,
+      PhotoBoardPosition.topRight,
     );
   });
 }

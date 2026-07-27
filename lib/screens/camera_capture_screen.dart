@@ -237,6 +237,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
               shootingDate: _formatBoardDate(DateTime.now()),
               shootingLocation: captureBoard.shootingLocation,
               workStatus: captureBoard.stepLabel,
+              position: captureBoard.position.id,
             )
           : originalBytes;
 
@@ -520,6 +521,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     );
     bool enabled = _boardConfig.enabled;
     PhotoBoardTemplate selectedTemplate = _boardConfig.template;
+    PhotoBoardPosition selectedPosition = _boardConfig.position;
     final Map<PhotoBoardTemplate, int> steps =
         Map<PhotoBoardTemplate, int>.from(_boardConfig.templateSteps);
 
@@ -600,6 +602,13 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                           if (value != null) {
                             setDialogState(() => selectedTemplate = value);
                           }
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      _BoardPositionPicker(
+                        selected: selectedPosition,
+                        onChanged: (PhotoBoardPosition value) {
+                          setDialogState(() => selectedPosition = value);
                         },
                       ),
                       const SizedBox(height: 12),
@@ -696,6 +705,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                       shootingLocation: locationController.text.trim(),
                       template: selectedTemplate,
                       templateSteps: Map<PhotoBoardTemplate, int>.from(steps),
+                      position: selectedPosition,
                     );
                     _applyBoardConfig(next);
                     Navigator.of(dialogContext).pop();
@@ -868,6 +878,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
               Text(
                 _boardConfig.enabled
                     ? '看板 ON・${_boardConfig.template.label}'
+                        '・${_boardConfig.position.label}'
                     : '看板 OFF',
                 style: const TextStyle(fontWeight: FontWeight.w800),
               ),
@@ -881,14 +892,52 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   Widget _buildBoardPreview(double availableWidth) {
     final double boardWidth =
         math.min(430, math.max(300, availableWidth * 0.37));
+    final Widget board = SizedBox(
+      width: boardWidth,
+      child: _PhotoBoardPreview(
+        config: _boardConfig,
+        shootingDate: _formatBoardDate(DateTime.now()),
+      ),
+    );
     return Row(
       crossAxisAlignment: CrossAxisAlignment.end,
       children: [
-        SizedBox(
-          width: boardWidth,
-          child: _PhotoBoardPreview(
-            config: _boardConfig,
-            shootingDate: _formatBoardDate(DateTime.now()),
+        LongPressDraggable<PhotoBoardPosition>(
+          data: _boardConfig.position,
+          maxSimultaneousDrags: (_takingPicture || _closing) ? 0 : 1,
+          hapticFeedbackOnStart: true,
+          feedback: Material(
+            color: Colors.transparent,
+            child: SizedBox(
+              width: boardWidth,
+              child: _PhotoBoardPreview(
+                config: _boardConfig,
+                shootingDate: _formatBoardDate(DateTime.now()),
+              ),
+            ),
+          ),
+          childWhenDragging: Opacity(opacity: 0.24, child: board),
+          onDragEnd: (DraggableDetails details) {
+            final Size screen = MediaQuery.sizeOf(context);
+            final Offset boardCenter =
+                details.offset + Offset(boardWidth / 2, boardWidth * 0.64 / 2);
+            final bool left = boardCenter.dx < screen.width / 2;
+            final bool top = boardCenter.dy < screen.height / 2;
+            final PhotoBoardPosition position;
+            if (top) {
+              position = left
+                  ? PhotoBoardPosition.topLeft
+                  : PhotoBoardPosition.topRight;
+            } else {
+              position = left
+                  ? PhotoBoardPosition.bottomLeft
+                  : PhotoBoardPosition.bottomRight;
+            }
+            _applyBoardConfig(_boardConfig.copyWith(position: position));
+          },
+          child: Tooltip(
+            message: '長押しして別の角へ移動',
+            child: board,
           ),
         ),
         const SizedBox(width: 8),
@@ -930,6 +979,18 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
           ],
         ),
       ],
+    );
+  }
+
+  Widget _buildPositionedBoard(BoxConstraints constraints) {
+    final bool left = _boardConfig.position.isLeft;
+    final bool top = _boardConfig.position.isTop;
+    return Positioned(
+      left: left ? 22 : null,
+      right: left ? null : 150,
+      top: top ? 82 : null,
+      bottom: top ? null : 122,
+      child: _buildBoardPreview(constraints.maxWidth),
     );
   }
 
@@ -1155,12 +1216,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                       ),
                     ),
                   ),
-                  if (_boardConfig.enabled)
-                    Positioned(
-                      left: 22,
-                      bottom: 122,
-                      child: _buildBoardPreview(constraints.maxWidth),
-                    ),
+                  if (_boardConfig.enabled) _buildPositionedBoard(constraints),
                   Positioned(
                     left: 22,
                     bottom: 20,
@@ -1270,6 +1326,71 @@ class _CameraThumbnailCard extends StatelessWidget {
               ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _BoardPositionPicker extends StatelessWidget {
+  const _BoardPositionPicker({
+    required this.selected,
+    required this.onChanged,
+  });
+
+  final PhotoBoardPosition selected;
+  final ValueChanged<PhotoBoardPosition> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return InputDecorator(
+      decoration: const InputDecoration(
+        labelText: '看板の位置（このピンに保存）',
+        border: OutlineInputBorder(),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              '${selected.label}に配置',
+              style: const TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 150,
+            child: GridView.count(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              crossAxisCount: 2,
+              mainAxisSpacing: 6,
+              crossAxisSpacing: 6,
+              childAspectRatio: 1.8,
+              children: PhotoBoardPosition.values.map((position) {
+                final bool isSelected = position == selected;
+                return Tooltip(
+                  message: position.label,
+                  child: Material(
+                    color: isSelected
+                        ? const Color(0xFF0E5B3B)
+                        : Colors.grey.shade200,
+                    borderRadius: BorderRadius.circular(7),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(7),
+                      onTap: () => onChanged(position),
+                      child: Icon(
+                        Icons.dashboard_rounded,
+                        size: 20,
+                        color: isSelected ? Colors.white : Colors.grey.shade700,
+                      ),
+                    ),
+                  ),
+                );
+              }).toList(growable: false),
+            ),
+          ),
+        ],
       ),
     );
   }

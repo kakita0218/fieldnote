@@ -25,6 +25,10 @@ class SinglePagePdfCanvas extends StatefulWidget {
     required this.onAddPin,
     required this.onPinTap,
     required this.onDirectionChanged,
+    required this.onPinMoveStart,
+    required this.onPinMoveUpdate,
+    required this.onPinMoveEnd,
+    required this.onPinMoveCancel,
     required this.onStrokeStart,
     required this.onStrokeUpdate,
     required this.onStrokeEnd,
@@ -42,6 +46,10 @@ class SinglePagePdfCanvas extends StatefulWidget {
   final ValueChanged<Offset> onAddPin;
   final ValueChanged<PinData> onPinTap;
   final void Function(PinData pin, double directionDegrees) onDirectionChanged;
+  final ValueChanged<PinData> onPinMoveStart;
+  final void Function(PinData pin, Offset normalizedPosition) onPinMoveUpdate;
+  final void Function(PinData pin, Offset normalizedPosition) onPinMoveEnd;
+  final ValueChanged<PinData> onPinMoveCancel;
   final void Function(Offset normalizedPosition, double pressure) onStrokeStart;
   final void Function(Offset normalizedPosition, double pressure)
       onStrokeUpdate;
@@ -52,7 +60,9 @@ class SinglePagePdfCanvas extends StatefulWidget {
 }
 
 class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
+  final GlobalKey _pageKey = GlobalKey();
   int? _activeStylusPointer;
+  String? _movingPinId;
 
   @override
   void didUpdateWidget(covariant SinglePagePdfCanvas oldWidget) {
@@ -83,6 +93,42 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
     return ((event.pressure - event.pressureMin) / range)
         .clamp(0.0, 1.0)
         .toDouble();
+  }
+
+  Offset? _normalizedFromGlobal(Offset globalPosition) {
+    final BuildContext? pageContext = _pageKey.currentContext;
+    final RenderObject? renderObject = pageContext?.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) return null;
+    final Offset local = renderObject.globalToLocal(globalPosition);
+    return _normalize(local, renderObject.size.width, renderObject.size.height);
+  }
+
+  void _startMovingPin(PinData pin) {
+    setState(() => _movingPinId = pin.id);
+    widget.onPinMoveStart(pin);
+  }
+
+  void _updateMovingPin(PinData pin, Offset globalPosition) {
+    if (_movingPinId != pin.id) return;
+    final Offset? normalized = _normalizedFromGlobal(globalPosition);
+    if (normalized != null) widget.onPinMoveUpdate(pin, normalized);
+  }
+
+  void _finishMovingPin(PinData pin, Offset globalPosition) {
+    if (_movingPinId != pin.id) return;
+    final Offset? normalized = _normalizedFromGlobal(globalPosition);
+    setState(() => _movingPinId = null);
+    if (normalized == null) {
+      widget.onPinMoveCancel(pin);
+    } else {
+      widget.onPinMoveEnd(pin, normalized);
+    }
+  }
+
+  void _cancelMovingPin(PinData pin) {
+    if (_movingPinId != pin.id) return;
+    setState(() => _movingPinId = null);
+    widget.onPinMoveCancel(pin);
   }
 
   @override
@@ -116,11 +162,13 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
 
         return TouchInteractiveViewer(
           transformationController: widget.transformationController,
-          interactionEnabled: _activeStylusPointer == null,
+          interactionEnabled:
+              _activeStylusPointer == null && _movingPinId == null,
           minScale: 1,
           maxScale: 10,
           child: Center(
             child: SizedBox(
+              key: _pageKey,
               width: pageWidth,
               height: pageHeight,
               child: Listener(
@@ -225,6 +273,24 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                             onDirectionChanged: (direction) {
                               widget.onDirectionChanged(pin, direction);
                             },
+                            onMoveStart:
+                                widget.pinModeEnabled && pendingPin == null
+                                    ? (_) => _startMovingPin(pin)
+                                    : null,
+                            onMoveUpdate:
+                                widget.pinModeEnabled && pendingPin == null
+                                    ? (globalPosition) =>
+                                        _updateMovingPin(pin, globalPosition)
+                                    : null,
+                            onMoveEnd:
+                                widget.pinModeEnabled && pendingPin == null
+                                    ? (globalPosition) =>
+                                        _finishMovingPin(pin, globalPosition)
+                                    : null,
+                            onMoveCancel:
+                                widget.pinModeEnabled && pendingPin == null
+                                    ? () => _cancelMovingPin(pin)
+                                    : null,
                           ),
                         ),
                     ],

@@ -83,6 +83,7 @@ class NativeProjectService {
     required String shootingDate,
     required String shootingLocation,
     required String workStatus,
+    required String position,
   }) async {
     if (!isAvailable) return jpegBytes;
     final Uint8List? result = await _channel.invokeMethod<Uint8List>(
@@ -94,6 +95,7 @@ class NativeProjectService {
         'shootingDate': shootingDate,
         'shootingLocation': shootingLocation,
         'workStatus': workStatus,
+        'position': position,
       },
     );
     if (result == null || result.isEmpty) {

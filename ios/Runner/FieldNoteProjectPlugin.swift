@@ -76,6 +76,7 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
     let shootingDate = arguments["shootingDate"] as? String ?? ""
     let shootingLocation = arguments["shootingLocation"] as? String ?? ""
     let workStatus = arguments["workStatus"] as? String ?? ""
+    let position = arguments["position"] as? String ?? "bottomLeft"
 
     let format = UIGraphicsImageRendererFormat.default()
     format.scale = sourceImage.scale
@@ -95,7 +96,8 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
         facilityName: facilityName,
         shootingDate: shootingDate,
         shootingLocation: shootingLocation,
-        workStatus: workStatus
+        workStatus: workStatus,
+        position: position
       )
     }
 
@@ -119,7 +121,8 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
     facilityName: String,
     shootingDate: String,
     shootingLocation: String,
-    workStatus: String
+    workStatus: String,
+    position: String
   ) {
     let landscape = canvasSize.width >= canvasSize.height
     let boardWidth = landscape
@@ -127,9 +130,11 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
       : canvasSize.width * 0.82
     let boardHeight = boardWidth * 0.64
     let margin = min(canvasSize.width, canvasSize.height) * 0.035
+    let placeOnRight = position == "topRight" || position == "bottomRight"
+    let placeOnTop = position == "topLeft" || position == "topRight"
     let board = CGRect(
-      x: margin,
-      y: canvasSize.height - boardHeight - margin,
+      x: placeOnRight ? canvasSize.width - boardWidth - margin : margin,
+      y: placeOnTop ? margin : canvasSize.height - boardHeight - margin,
       width: boardWidth,
       height: boardHeight
     )

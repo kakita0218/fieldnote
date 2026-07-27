@@ -38,6 +38,32 @@ enum PhotoBoardTemplate {
   }
 }
 
+enum PhotoBoardPosition {
+  topLeft('topLeft', '左上'),
+  topRight('topRight', '右上'),
+  bottomLeft('bottomLeft', '左下'),
+  bottomRight('bottomRight', '右下');
+
+  const PhotoBoardPosition(this.id, this.label);
+
+  final String id;
+  final String label;
+
+  bool get isLeft =>
+      this == PhotoBoardPosition.topLeft ||
+      this == PhotoBoardPosition.bottomLeft;
+
+  bool get isTop =>
+      this == PhotoBoardPosition.topLeft || this == PhotoBoardPosition.topRight;
+
+  static PhotoBoardPosition fromId(String? id) {
+    return PhotoBoardPosition.values.firstWhere(
+      (PhotoBoardPosition value) => value.id == id,
+      orElse: () => PhotoBoardPosition.bottomLeft,
+    );
+  }
+}
+
 class PhotoBoardConfig {
   const PhotoBoardConfig({
     required this.enabled,
@@ -46,6 +72,7 @@ class PhotoBoardConfig {
     required this.shootingLocation,
     required this.template,
     required this.templateSteps,
+    required this.position,
   });
 
   final bool enabled;
@@ -54,6 +81,7 @@ class PhotoBoardConfig {
   final String shootingLocation;
   final PhotoBoardTemplate template;
   final Map<PhotoBoardTemplate, int> templateSteps;
+  final PhotoBoardPosition position;
 
   int get stepIndex {
     final int value = templateSteps[template] ?? 0;
@@ -69,6 +97,7 @@ class PhotoBoardConfig {
     String? shootingLocation,
     PhotoBoardTemplate? template,
     Map<PhotoBoardTemplate, int>? templateSteps,
+    PhotoBoardPosition? position,
   }) {
     return PhotoBoardConfig(
       enabled: enabled ?? this.enabled,
@@ -79,6 +108,7 @@ class PhotoBoardConfig {
       templateSteps: Map<PhotoBoardTemplate, int>.from(
         templateSteps ?? this.templateSteps,
       ),
+      position: position ?? this.position,
     );
   }
 

@@ -128,6 +128,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   String? _activeEraserEditId;
   int _eraserFragmentSequence = 0;
   final Map<String, List<PhotoData>> _photosByPinId = {};
+  PinData? _movingPinOriginal;
 
   String? _selectedPinId;
   String? _pendingDirectionPinId;
@@ -362,6 +363,48 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         }
       });
     }
+  }
+
+  void _startPinMove(PinData pin) {
+    final int index = _pins.indexWhere((PinData item) => item.id == pin.id);
+    if (index < 0) return;
+    final PinData current = _pins[index];
+
+    setState(() {
+      _movingPinOriginal = current;
+      _selectedPinId = current.id;
+      _pinColor = Color(current.colorValue);
+      _redoPins.clear();
+      _setNoteController(current.note);
+    });
+    unawaited(_ensurePhotosLoadedForPin(current));
+  }
+
+  void _updatePinPosition(PinData pin, Offset normalizedPosition) {
+    final int index = _pins.indexWhere((PinData item) => item.id == pin.id);
+    if (index < 0) return;
+    setState(() {
+      _pins[index] = _pins[index].copyWith(
+        xRatio: normalizedPosition.dx.clamp(0.0, 1.0),
+        yRatio: normalizedPosition.dy.clamp(0.0, 1.0),
+      );
+    });
+  }
+
+  void _finishPinMove(PinData pin, Offset normalizedPosition) {
+    _updatePinPosition(pin, normalizedPosition);
+    _movingPinOriginal = null;
+    _scheduleSave(pins: true, drawings: false, meta: true);
+  }
+
+  void _cancelPinMove(PinData pin) {
+    final PinData? original = _movingPinOriginal;
+    _movingPinOriginal = null;
+    if (original == null || original.id != pin.id) return;
+    final int index =
+        _pins.indexWhere((PinData item) => item.id == original.id);
+    if (index < 0) return;
+    setState(() => _pins[index] = original);
   }
 
   Future<void> _selectPin(PinData pin) async {
@@ -848,6 +891,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         PhotoBoardTemplate.chipping: pin.boardChippingStep,
         PhotoBoardTemplate.asbestos: pin.boardAsbestosStep,
       },
+      position: PhotoBoardPosition.fromId(pin.boardPositionId),
     );
   }
 
@@ -868,6 +912,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             config.templateSteps[PhotoBoardTemplate.chipping]?.clamp(0, 5) ?? 0,
         boardAsbestosStep:
             config.templateSteps[PhotoBoardTemplate.asbestos]?.clamp(0, 5) ?? 0,
+        boardPositionId: config.position.id,
       );
     });
     _scheduleSave(pins: true, drawings: false, meta: true);
@@ -1504,6 +1549,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             'boardCoreStep': p.boardCoreStep,
             'boardChippingStep': p.boardChippingStep,
             'boardAsbestosStep': p.boardAsbestosStep,
+            'boardPositionId': p.boardPositionId,
           })
       .toList(growable: false);
 
@@ -1652,6 +1698,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
               ((m['boardChippingStep'] as num?)?.toInt() ?? 0).clamp(0, 5),
           boardAsbestosStep:
               ((m['boardAsbestosStep'] as num?)?.toInt() ?? 0).clamp(0, 5),
+          boardPositionId: m['boardPositionId']?.toString() ?? 'bottomLeft',
         );
       }).toList();
       final restoredStrokes = <int, List<DrawingStroke>>{};
@@ -2408,11 +2455,47 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   onAddPin: _addPin,
                   onPinTap: _selectPin,
                   onDirectionChanged: _changePinDirection,
+                  onPinMoveStart: _startPinMove,
+                  onPinMoveUpdate: _updatePinPosition,
+                  onPinMoveEnd: _finishPinMove,
+                  onPinMoveCancel: _cancelPinMove,
                   onStrokeStart: _startStroke,
                   onStrokeUpdate: _updateStroke,
                   onStrokeEnd: _endStroke,
                 ),
         ),
+        if (_selectedTool == FieldTool.pin &&
+            _currentPagePins.isNotEmpty &&
+            _pendingDirectionPinId == null)
+          Positioned(
+            left: 16,
+            top: 16,
+            child: IgnorePointer(
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: AppColors.panel.withValues(alpha: 0.88),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: Colors.white24),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.open_with_rounded, size: 18),
+                    SizedBox(width: 6),
+                    Text(
+                      '既存のピンは長押しして移動',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
         if (_isRenderingPage)
           const Positioned.fill(
             child: ColoredBox(

@@ -15,6 +15,7 @@ class PinData {
     this.boardCoreStep = 0,
     this.boardChippingStep = 0,
     this.boardAsbestosStep = 0,
+    this.boardPositionId = 'bottomLeft',
   });
 
   final String id;
@@ -31,6 +32,7 @@ class PinData {
   final int boardCoreStep;
   final int boardChippingStep;
   final int boardAsbestosStep;
+  final String boardPositionId;
 
   /// ARGB value of the pin color. Kept as an int so the model stays
   /// independent from Flutter UI classes and remains easy to serialize.
@@ -52,6 +54,7 @@ class PinData {
     int? boardCoreStep,
     int? boardChippingStep,
     int? boardAsbestosStep,
+    String? boardPositionId,
   }) {
     return PinData(
       id: id ?? this.id,
@@ -70,6 +73,7 @@ class PinData {
       boardCoreStep: boardCoreStep ?? this.boardCoreStep,
       boardChippingStep: boardChippingStep ?? this.boardChippingStep,
       boardAsbestosStep: boardAsbestosStep ?? this.boardAsbestosStep,
+      boardPositionId: boardPositionId ?? this.boardPositionId,
     );
   }
 }

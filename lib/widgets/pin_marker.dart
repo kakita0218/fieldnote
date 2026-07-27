@@ -12,6 +12,10 @@ class PinMarker extends StatelessWidget {
     required this.awaitingDirection,
     required this.onTap,
     required this.onDirectionChanged,
+    this.onMoveStart,
+    this.onMoveUpdate,
+    this.onMoveEnd,
+    this.onMoveCancel,
   });
 
   /// The visual is roughly half the previous marker size. The transparent
@@ -28,13 +32,19 @@ class PinMarker extends StatelessWidget {
   final bool awaitingDirection;
   final VoidCallback onTap;
   final ValueChanged<double> onDirectionChanged;
+  final ValueChanged<Offset>? onMoveStart;
+  final ValueChanged<Offset>? onMoveUpdate;
+  final ValueChanged<Offset>? onMoveEnd;
+  final VoidCallback? onMoveCancel;
 
-  double get _circleSize => selected || awaitingDirection
-      ? selectedCircleSize
-      : normalCircleSize;
+  double get _circleSize =>
+      selected || awaitingDirection ? selectedCircleSize : normalCircleSize;
 
-  double _directionFromCirclePosition(Offset localPosition) {
-    final double half = _circleSize / 2;
+  double _directionFromCirclePosition(
+    Offset localPosition,
+    double gestureSize,
+  ) {
+    final double half = gestureSize / 2;
     final Offset vector = localPosition - Offset(half, half);
     final double radians = math.atan2(vector.dx, -vector.dy);
     return (radians * 180 / math.pi + 360) % 360;
@@ -43,6 +53,7 @@ class PinMarker extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final double circleSize = _circleSize;
+    final double gestureSize = math.max(circleSize, 44);
 
     return Semantics(
       button: true,
@@ -69,23 +80,45 @@ class PinMarker extends StatelessWidget {
               ),
             ),
             Positioned(
-              left: (markerWidth - circleSize) / 2,
-              top: markerCenterY - circleSize / 2,
-              width: circleSize,
-              height: circleSize,
+              left: (markerWidth - gestureSize) / 2,
+              top: markerCenterY - gestureSize / 2,
+              width: gestureSize,
+              height: gestureSize,
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTap: onTap,
                 onPanStart: (DragStartDetails details) {
                   onDirectionChanged(
-                    _directionFromCirclePosition(details.localPosition),
+                    _directionFromCirclePosition(
+                      details.localPosition,
+                      gestureSize,
+                    ),
                   );
                 },
                 onPanUpdate: (DragUpdateDetails details) {
                   onDirectionChanged(
-                    _directionFromCirclePosition(details.localPosition),
+                    _directionFromCirclePosition(
+                      details.localPosition,
+                      gestureSize,
+                    ),
                   );
                 },
+                onLongPressStart: onMoveStart == null
+                    ? null
+                    : (LongPressStartDetails details) {
+                        onMoveStart!(details.globalPosition);
+                      },
+                onLongPressMoveUpdate: onMoveUpdate == null
+                    ? null
+                    : (LongPressMoveUpdateDetails details) {
+                        onMoveUpdate!(details.globalPosition);
+                      },
+                onLongPressEnd: onMoveEnd == null
+                    ? null
+                    : (LongPressEndDetails details) {
+                        onMoveEnd!(details.globalPosition);
+                      },
+                onLongPressCancel: onMoveCancel,
               ),
             ),
           ],
@@ -117,9 +150,8 @@ class _PinMarkerPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final bool emphasized = selected || awaitingDirection;
-    final double diameter = emphasized
-        ? PinMarker.selectedCircleSize
-        : PinMarker.normalCircleSize;
+    final double diameter =
+        emphasized ? PinMarker.selectedCircleSize : PinMarker.normalCircleSize;
     final double radius = diameter / 2;
     final Offset center = Offset(size.width / 2, PinMarker.markerCenterY);
     final Color textColor = _isYellow ? const Color(0xFF10151C) : Colors.white;
@@ -152,8 +184,8 @@ class _PinMarkerPainter extends CustomPainter {
 
     final double angle = directionDegrees * math.pi / 180;
     final double arrowDistance = radius + 5;
-    final Offset arrowCenter = center +
-        Offset(math.sin(angle), -math.cos(angle)) * arrowDistance;
+    final Offset arrowCenter =
+        center + Offset(math.sin(angle), -math.cos(angle)) * arrowDistance;
     final Offset forward = Offset(math.sin(angle), -math.cos(angle));
     final Offset side = Offset(math.cos(angle), math.sin(angle));
     final double arrowLength = emphasized ? 8 : 6;
