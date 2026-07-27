@@ -488,6 +488,7 @@ class ProjectRepository {
           'boardBusinessName',
           'boardFacilityName',
           'pendingDirectionPinId',
+          'captureAfterDirectionPinId',
         ])
           if (project.containsKey(key)) key: project[key],
       },

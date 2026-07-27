@@ -132,6 +132,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   String? _selectedPinId;
   String? _pendingDirectionPinId;
+  String? _captureAfterDirectionPinId;
   TextEditingController? _noteController;
 
   @override
@@ -251,6 +252,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _nextPinNumber = 1;
         _selectedPinId = null;
         _pendingDirectionPinId = null;
+        _captureAfterDirectionPinId = null;
 
         _errorMessage = null;
       });
@@ -300,7 +302,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     setState(() {
       _selectedTool = tool;
+      if (tool != FieldTool.pin) {
+        _pendingDirectionPinId = null;
+        _captureAfterDirectionPinId = null;
+      }
     });
+    _scheduleSave(pins: false, drawings: false, meta: true);
   }
 
   void _addPin(Offset normalizedPosition) {
@@ -324,6 +331,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       _nextPinNumber++;
       _selectedPinId = pin.id;
       _pendingDirectionPinId = pin.id;
+      _captureAfterDirectionPinId = pin.id;
 
       _setNoteController(pin.note);
     });
@@ -342,7 +350,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return;
     }
 
-    final bool shouldOpenCamera = _pendingDirectionPinId == pin.id;
+    final bool shouldOpenCamera = _captureAfterDirectionPinId == pin.id;
     final PinData updatedPin = _pins[index].copyWith(
       directionDegrees: directionDegrees,
     );
@@ -350,6 +358,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     setState(() {
       _pins[index] = updatedPin;
       _pendingDirectionPinId = null;
+      _captureAfterDirectionPinId = null;
       _selectedPinId = updatedPin.id;
       _redoPins.clear();
     });
@@ -363,6 +372,23 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         }
       });
     }
+  }
+
+  void _toggleSelectedPinDirectionEditing() {
+    final String? selectedId = _selectedPinId;
+    if (selectedId == null) return;
+
+    setState(() {
+      if (_pendingDirectionPinId == selectedId) {
+        _pendingDirectionPinId = null;
+        _captureAfterDirectionPinId = null;
+      } else {
+        _selectedTool = FieldTool.pin;
+        _pendingDirectionPinId = selectedId;
+        _captureAfterDirectionPinId = null;
+      }
+    });
+    _scheduleSave(pins: false, drawings: false, meta: true);
   }
 
   void _startPinMove(PinData pin) {
@@ -409,6 +435,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   Future<void> _selectPin(PinData pin) async {
     setState(() {
+      if (_pendingDirectionPinId != pin.id) {
+        _pendingDirectionPinId = null;
+        _captureAfterDirectionPinId = null;
+      }
       _selectedPinId = pin.id;
       _pinColor = Color(pin.colorValue);
       _setNoteController(pin.note);
@@ -447,6 +477,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     setState(() {
       _selectedPinId = null;
       _pendingDirectionPinId = null;
+      _captureAfterDirectionPinId = null;
     });
 
     _noteController?.dispose();
@@ -515,6 +546,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       _selectedPinId = null;
       if (_pendingDirectionPinId == selectedId) {
         _pendingDirectionPinId = null;
+      }
+      if (_captureAfterDirectionPinId == selectedId) {
+        _captureAfterDirectionPinId = null;
       }
     });
 
@@ -780,6 +814,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
       if (_pendingDirectionPinId == removedPin.id) {
         _pendingDirectionPinId = null;
+      }
+      if (_captureAfterDirectionPinId == removedPin.id) {
+        _captureAfterDirectionPinId = null;
       }
 
       if (_selectedPinId == removedPin.id) {
@@ -1201,6 +1238,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       _currentPage = pageNumber;
       _selectedPinId = null;
       _pendingDirectionPinId = null;
+      _captureAfterDirectionPinId = null;
     });
 
     _scheduleSave();
@@ -1606,6 +1644,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           'boardBusinessName': _boardBusinessName,
           'boardFacilityName': _boardFacilityName,
           'pendingDirectionPinId': _pendingDirectionPinId,
+          'captureAfterDirectionPinId': _captureAfterDirectionPinId,
         },
         pins: pins,
         strokes: strokes,
@@ -1776,6 +1815,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _pendingDirectionPinId =
             restoredPins.any((PinData pin) => pin.id == pendingId)
                 ? pendingId
+                : null;
+        final String? captureAfterId =
+            data['captureAfterDirectionPinId']?.toString();
+        _captureAfterDirectionPinId =
+            restoredPins.any((PinData pin) => pin.id == captureAfterId)
+                ? captureAfterId
                 : null;
       });
       await _renderPage(_currentPage);
@@ -2376,6 +2421,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                             onDelete: _deleteSelectedPin,
                             onAddPhotos: _addPhotosToSelectedPin,
                             onShowAllPhotos: _showAllPhotosForSelectedPin,
+                            directionEditing:
+                                _pendingDirectionPinId == selectedPin.id,
+                            onChangeDirection:
+                                _toggleSelectedPinDirectionEditing,
                             onNoteChanged: (_) {
                               _saveSelectedPinNote();
                             },
@@ -2464,6 +2513,36 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   onStrokeEnd: _endStroke,
                 ),
         ),
+        if (_selectedTool == FieldTool.pin && _pendingDirectionPinId != null)
+          Positioned(
+            left: 16,
+            top: 16,
+            child: IgnorePointer(
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xE61B6FA8),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: Colors.white38),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.touch_app_rounded, size: 20),
+                    SizedBox(width: 7),
+                    Text(
+                      '図面上の、矢印を向けたい場所をタップ',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
         if (_selectedTool == FieldTool.pin &&
             _currentPagePins.isNotEmpty &&
             _pendingDirectionPinId == null)

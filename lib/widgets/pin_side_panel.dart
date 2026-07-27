@@ -15,6 +15,8 @@ class PinSidePanel extends StatelessWidget {
     required this.onNoteChanged,
     required this.onAddPhotos,
     required this.onShowAllPhotos,
+    required this.directionEditing,
+    required this.onChangeDirection,
   });
 
   final PinData pin;
@@ -25,6 +27,8 @@ class PinSidePanel extends StatelessWidget {
   final ValueChanged<String> onNoteChanged;
   final VoidCallback onAddPhotos;
   final VoidCallback onShowAllPhotos;
+  final bool directionEditing;
+  final VoidCallback onChangeDirection;
 
   @override
   Widget build(BuildContext context) {
@@ -77,6 +81,33 @@ class PinSidePanel extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
+                  FilledButton.tonalIcon(
+                    onPressed: onChangeDirection,
+                    icon: Icon(
+                      directionEditing
+                          ? Icons.close_rounded
+                          : Icons.navigation_rounded,
+                    ),
+                    label: Text(
+                      directionEditing ? '方向変更をキャンセル' : 'ピンの方向を変更',
+                    ),
+                    style: FilledButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 13),
+                    ),
+                  ),
+                  if (directionEditing) ...[
+                    const SizedBox(height: 8),
+                    const Text(
+                      '図面上の、矢印を向けたい場所をタップしてください。',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: AppColors.accent,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 20),
                   Row(
                     children: [
                       Expanded(
