@@ -485,6 +485,8 @@ class ProjectRepository {
           'pinColor',
           'penColor',
           'penWidth',
+          'boardBusinessName',
+          'boardFacilityName',
           'pendingDirectionPinId',
         ])
           if (project.containsKey(key)) key: project[key],

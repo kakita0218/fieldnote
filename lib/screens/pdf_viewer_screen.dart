@@ -15,6 +15,7 @@ import 'package:pdfx/pdfx.dart' as pdfx;
 
 import '../models/drawing_stroke.dart';
 import 'camera_capture_screen.dart';
+import '../models/photo_board.dart';
 import '../models/photo_data.dart';
 import '../models/pin_data.dart';
 import '../theme/app_colors.dart';
@@ -109,6 +110,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   Color _penColor = const Color(0xFFE53935);
   double _penWidth = 3.0;
   bool _eraserEnabled = false;
+  late String _boardBusinessName;
+  String _boardFacilityName = '';
 
   final List<PinData> _pins = [];
   final List<PinData> _redoPins = [];
@@ -135,6 +138,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _projectName = widget.projectName;
+    _boardBusinessName = widget.projectName;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (widget.isNewProject) {
         await _pickPdf();
@@ -822,10 +826,51 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           pinNumber: currentPin.number,
           initialPhotoCount: currentPin.photoCount,
           initialPhotos: _photosForPin(currentPin.id),
+          initialBoardConfig: _photoBoardConfigFor(currentPin),
+          onBoardConfigChanged: (PhotoBoardConfig config) {
+            _updatePhotoBoardConfig(currentPin.id, config);
+          },
           onCaptured: (bytes) => _saveCapturedPhoto(currentPin, bytes),
         ),
       ),
     );
+  }
+
+  PhotoBoardConfig _photoBoardConfigFor(PinData pin) {
+    return PhotoBoardConfig(
+      enabled: pin.boardEnabled,
+      businessName: _boardBusinessName,
+      facilityName: _boardFacilityName,
+      shootingLocation: pin.boardShootingLocation,
+      template: PhotoBoardTemplate.fromId(pin.boardTemplateId),
+      templateSteps: <PhotoBoardTemplate, int>{
+        PhotoBoardTemplate.core: pin.boardCoreStep,
+        PhotoBoardTemplate.chipping: pin.boardChippingStep,
+        PhotoBoardTemplate.asbestos: pin.boardAsbestosStep,
+      },
+    );
+  }
+
+  void _updatePhotoBoardConfig(String pinId, PhotoBoardConfig config) {
+    final int pinIndex = _pins.indexWhere((PinData pin) => pin.id == pinId);
+    if (pinIndex < 0 || !mounted) return;
+
+    setState(() {
+      _boardBusinessName = config.businessName;
+      _boardFacilityName = config.facilityName;
+      _pins[pinIndex] = _pins[pinIndex].copyWith(
+        boardEnabled: config.enabled,
+        boardTemplateId: config.template.id,
+        boardShootingLocation: config.shootingLocation,
+        boardCoreStep:
+            config.templateSteps[PhotoBoardTemplate.core]?.clamp(0, 5) ?? 0,
+        boardChippingStep:
+            config.templateSteps[PhotoBoardTemplate.chipping]?.clamp(0, 5) ?? 0,
+        boardAsbestosStep:
+            config.templateSteps[PhotoBoardTemplate.asbestos]?.clamp(0, 5) ?? 0,
+      );
+    });
+    _scheduleSave(pins: true, drawings: false, meta: true);
   }
 
   Future<void> _ensurePhotosLoadedForPin(PinData pin) async {
@@ -1453,6 +1498,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             'photoCount': p.photoCount,
             'note': p.note,
             'colorValue': p.colorValue,
+            'boardEnabled': p.boardEnabled,
+            'boardTemplateId': p.boardTemplateId,
+            'boardShootingLocation': p.boardShootingLocation,
+            'boardCoreStep': p.boardCoreStep,
+            'boardChippingStep': p.boardChippingStep,
+            'boardAsbestosStep': p.boardAsbestosStep,
           })
       .toList(growable: false);
 
@@ -1506,6 +1557,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           'pinColor': _pinColor.toARGB32(),
           'penColor': _penColor.toARGB32(),
           'penWidth': _penWidth,
+          'boardBusinessName': _boardBusinessName,
+          'boardFacilityName': _boardFacilityName,
           'pendingDirectionPinId': _pendingDirectionPinId,
         },
         pins: pins,
@@ -1590,6 +1643,15 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           photoCount: (m['photoCount'] as num?)?.toInt() ?? 0,
           note: m['note'] as String? ?? '',
           colorValue: (m['colorValue'] as num?)?.toInt() ?? 0xFF1976D2,
+          boardEnabled: m['boardEnabled'] == true,
+          boardTemplateId: m['boardTemplateId']?.toString() ?? 'core',
+          boardShootingLocation: m['boardShootingLocation']?.toString() ?? '',
+          boardCoreStep:
+              ((m['boardCoreStep'] as num?)?.toInt() ?? 0).clamp(0, 5),
+          boardChippingStep:
+              ((m['boardChippingStep'] as num?)?.toInt() ?? 0).clamp(0, 5),
+          boardAsbestosStep:
+              ((m['boardAsbestosStep'] as num?)?.toInt() ?? 0).clamp(0, 5),
         );
       }).toList();
       final restoredStrokes = <int, List<DrawingStroke>>{};
@@ -1656,6 +1718,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             (data['nextPinNumber'] as num?)?.toInt() ?? (_pins.length + 1);
         _pinColor = Color((data['pinColor'] as num?)?.toInt() ?? 0xFF1976D2);
         _penColor = Color((data['penColor'] as num?)?.toInt() ?? 0xFFE53935);
+        _boardBusinessName =
+            data['boardBusinessName']?.toString() ?? _projectName;
+        _boardFacilityName = data['boardFacilityName']?.toString() ?? '';
         _selectedTool = null;
         _penWidth = (data['penWidth'] as num?)?.toDouble() ?? 3;
         _currentPage =

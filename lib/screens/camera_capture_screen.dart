@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
@@ -6,6 +7,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../models/photo_data.dart';
+import '../models/photo_board.dart';
+import '../services/native_project_service.dart';
 
 class CameraCaptureScreen extends StatefulWidget {
   const CameraCaptureScreen({
@@ -13,12 +16,16 @@ class CameraCaptureScreen extends StatefulWidget {
     required this.pinNumber,
     required this.initialPhotoCount,
     required this.initialPhotos,
+    required this.initialBoardConfig,
+    required this.onBoardConfigChanged,
     required this.onCaptured,
   });
 
   final int pinNumber;
   final int initialPhotoCount;
   final List<PhotoData> initialPhotos;
+  final PhotoBoardConfig initialBoardConfig;
+  final ValueChanged<PhotoBoardConfig> onBoardConfigChanged;
 
   /// Saves the original JPEG and returns the separately generated thumbnail.
   ///
@@ -74,6 +81,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   double _maxZoom = 1;
   late int _photoCount;
   late List<_CameraThumbnail> _recentPhotos;
+  late PhotoBoardConfig _boardConfig;
   String? _emphasizedThumbnailId;
   Future<void> _saveTail = Future<void>.value();
   Future<void>? _activeCapture;
@@ -86,6 +94,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   void initState() {
     super.initState();
     _photoCount = widget.initialPhotoCount;
+    _boardConfig = widget.initialBoardConfig;
     _recentPhotos = widget.initialPhotos.reversed
         .take(3)
         .map(
@@ -218,7 +227,18 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
       if (defaultTargetPlatform != TargetPlatform.iOS) {
         unawaited(SystemSound.play(SystemSoundType.click));
       }
-      final Uint8List bytes = await file.readAsBytes();
+      final Uint8List originalBytes = await file.readAsBytes();
+      final PhotoBoardConfig captureBoard = _boardConfig;
+      final Uint8List bytes = captureBoard.enabled
+          ? await NativeProjectService.composePhotoBoard(
+              jpegBytes: originalBytes,
+              businessName: captureBoard.businessName,
+              facilityName: captureBoard.facilityName,
+              shootingDate: _formatBoardDate(DateTime.now()),
+              shootingLocation: captureBoard.shootingLocation,
+              workStatus: captureBoard.stepLabel,
+            )
+          : originalBytes;
 
       final String pendingId =
           'pending-${DateTime.now().microsecondsSinceEpoch}';
@@ -250,7 +270,13 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         );
       }
 
-      _queueOriginalSave(pendingId, bytes);
+      final Future<void> saveOperation =
+          _queueOriginalSave(pendingId, bytes, captureBoard);
+      if (captureBoard.enabled) {
+        // 看板の自動送り中は保存完了を待ち、連続タップで同じ工程名の
+        // 写真が複数作られないようにする。
+        await saveOperation;
+      }
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -262,7 +288,11 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     }
   }
 
-  void _queueOriginalSave(String pendingId, Uint8List bytes) {
+  Future<void> _queueOriginalSave(
+    String pendingId,
+    Uint8List bytes,
+    PhotoBoardConfig captureBoard,
+  ) {
     _saveTail = _saveTail.then((_) async {
       PhotoData? savedPhoto;
       Object? saveError;
@@ -296,6 +326,9 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
           _photoCount = (_photoCount - 1).clamp(0, 1 << 30).toInt();
         }
       });
+      if (result != null && captureBoard.enabled) {
+        _advanceBoardAfterSaved(captureBoard);
+      }
 
       if (saveError != null) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -317,6 +350,28 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         SnackBar(content: Text('写真を保存できませんでした：$error')),
       );
     });
+    return _saveTail;
+  }
+
+  void _advanceBoardAfterSaved(PhotoBoardConfig captured) {
+    final Map<PhotoBoardTemplate, int> steps =
+        Map<PhotoBoardTemplate, int>.from(_boardConfig.templateSteps);
+    steps[captured.template] = math.min(
+      captured.stepIndex + 1,
+      captured.template.steps.length - 1,
+    );
+    final PhotoBoardConfig next = _boardConfig.copyWith(templateSteps: steps);
+    setState(() => _boardConfig = next);
+    widget.onBoardConfigChanged(next);
+  }
+
+  String _formatBoardDate(DateTime date) {
+    if (date.year >= 2019) {
+      final int reiwa = date.year - 2018;
+      final String eraYear = reiwa == 1 ? '元' : '$reiwa';
+      return '令和$eraYear年${date.month}月${date.day}日';
+    }
+    return '${date.year}年${date.month}月${date.day}日';
   }
 
   Future<void> _closeCamera() async {
@@ -439,6 +494,223 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         const SnackBar(content: Text('この端末ではタップによるピント調整を利用できません。')),
       );
     }
+  }
+
+  void _applyBoardConfig(PhotoBoardConfig config) {
+    setState(() => _boardConfig = config);
+    widget.onBoardConfigChanged(config);
+  }
+
+  void _changeBoardStep(int delta) {
+    final int next = (_boardConfig.stepIndex + delta)
+        .clamp(0, _boardConfig.template.steps.length - 1);
+    if (next == _boardConfig.stepIndex) return;
+    _applyBoardConfig(_boardConfig.withSelectedStep(next));
+  }
+
+  Future<void> _showBoardSettings() async {
+    final TextEditingController businessController = TextEditingController(
+      text: _boardConfig.businessName,
+    );
+    final TextEditingController facilityController = TextEditingController(
+      text: _boardConfig.facilityName,
+    );
+    final TextEditingController locationController = TextEditingController(
+      text: _boardConfig.shootingLocation,
+    );
+    bool enabled = _boardConfig.enabled;
+    PhotoBoardTemplate selectedTemplate = _boardConfig.template;
+    final Map<PhotoBoardTemplate, int> steps =
+        Map<PhotoBoardTemplate, int>.from(_boardConfig.templateSteps);
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            final int selectedStep = (steps[selectedTemplate] ?? 0)
+                .clamp(0, selectedTemplate.steps.length - 1);
+            return AlertDialog(
+              title: const Row(
+                children: [
+                  Icon(Icons.dashboard_customize_rounded),
+                  SizedBox(width: 10),
+                  Text('電子看板の設定'),
+                ],
+              ),
+              content: SizedBox(
+                width: 680,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text(
+                          '写真に電子看板を入れる',
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                        subtitle: const Text('緑背景・白文字の看板を写真へ保存します'),
+                        value: enabled,
+                        onChanged: (bool value) {
+                          setDialogState(() => enabled = value);
+                        },
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: businessController,
+                        decoration: const InputDecoration(
+                          labelText: '業務名（案件内で保存）',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: facilityController,
+                        decoration: const InputDecoration(
+                          labelText: '施設名（案件内で保存）',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: locationController,
+                        decoration: const InputDecoration(
+                          labelText: '撮影箇所（このピンに保存）',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      DropdownButtonFormField<PhotoBoardTemplate>(
+                        initialValue: selectedTemplate,
+                        decoration: const InputDecoration(
+                          labelText: '看板テンプレート',
+                          border: OutlineInputBorder(),
+                        ),
+                        items: PhotoBoardTemplate.values
+                            .map(
+                              (PhotoBoardTemplate template) =>
+                                  DropdownMenuItem<PhotoBoardTemplate>(
+                                value: template,
+                                child: Text(template.label),
+                              ),
+                            )
+                            .toList(growable: false),
+                        onChanged: (PhotoBoardTemplate? value) {
+                          if (value != null) {
+                            setDialogState(() => selectedTemplate = value);
+                          }
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF0E4F36),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Row(
+                          children: [
+                            IconButton(
+                              tooltip: '前の内容',
+                              onPressed: selectedStep == 0
+                                  ? null
+                                  : () {
+                                      setDialogState(() {
+                                        steps[selectedTemplate] =
+                                            selectedStep - 1;
+                                      });
+                                    },
+                              color: Colors.white,
+                              disabledColor: Colors.white38,
+                              icon: const Icon(Icons.chevron_left_rounded),
+                            ),
+                            Expanded(
+                              child: Column(
+                                children: [
+                                  Text(
+                                    '${selectedStep + 1} / '
+                                    '${selectedTemplate.steps.length}',
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    selectedTemplate.steps[selectedStep],
+                                    textAlign: TextAlign.center,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 20,
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: '次の内容',
+                              onPressed: selectedStep ==
+                                      selectedTemplate.steps.length - 1
+                                  ? null
+                                  : () {
+                                      setDialogState(() {
+                                        steps[selectedTemplate] =
+                                            selectedStep + 1;
+                                      });
+                                    },
+                              color: Colors.white,
+                              disabledColor: Colors.white38,
+                              icon: const Icon(Icons.chevron_right_rounded),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          '撮影と保存に成功すると、次の内容へ自動で進みます。',
+                          style: TextStyle(color: Colors.black54),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('キャンセル'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final PhotoBoardConfig next = PhotoBoardConfig(
+                      enabled: enabled,
+                      businessName: businessController.text.trim(),
+                      facilityName: facilityController.text.trim(),
+                      shootingLocation: locationController.text.trim(),
+                      template: selectedTemplate,
+                      templateSteps: Map<PhotoBoardTemplate, int>.from(steps),
+                    );
+                    _applyBoardConfig(next);
+                    Navigator.of(dialogContext).pop();
+                  },
+                  child: const Text('保存'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    businessController.dispose();
+    facilityController.dispose();
+    locationController.dispose();
   }
 
   Widget _buildCameraPreview(CameraController controller) {
@@ -577,6 +849,90 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     );
   }
 
+  Widget _buildBoardSelector() {
+    return Material(
+      color: _boardConfig.enabled
+          ? const Color(0xDD0E5B3B)
+          : Colors.black.withValues(alpha: 0.62),
+      borderRadius: BorderRadius.circular(24),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(24),
+        onTap: (_closing || _takingPicture) ? null : _showBoardSettings,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 11),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.dashboard_customize_rounded, size: 22),
+              const SizedBox(width: 7),
+              Text(
+                _boardConfig.enabled
+                    ? '看板 ON・${_boardConfig.template.label}'
+                    : '看板 OFF',
+                style: const TextStyle(fontWeight: FontWeight.w800),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBoardPreview(double availableWidth) {
+    final double boardWidth =
+        math.min(430, math.max(300, availableWidth * 0.37));
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        SizedBox(
+          width: boardWidth,
+          child: _PhotoBoardPreview(
+            config: _boardConfig,
+            shootingDate: _formatBoardDate(DateTime.now()),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _BoardStepButton(
+              tooltip: '前の内容',
+              onPressed: _boardConfig.stepIndex > 0
+                  ? () => _changeBoardStep(-1)
+                  : null,
+              icon: Icons.keyboard_arrow_up_rounded,
+            ),
+            const SizedBox(height: 6),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+              decoration: BoxDecoration(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Text(
+                '${_boardConfig.stepIndex + 1}/'
+                '${_boardConfig.template.steps.length}',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
+            _BoardStepButton(
+              tooltip: '次の内容',
+              onPressed: _boardConfig.stepIndex <
+                      _boardConfig.template.steps.length - 1
+                  ? () => _changeBoardStep(1)
+                  : null,
+              icon: Icons.keyboard_arrow_down_rounded,
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
   Widget _buildTopBar() {
     return Row(
       children: [
@@ -594,6 +950,8 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
               : const Icon(Icons.arrow_back_rounded, size: 30),
         ),
         const Spacer(),
+        _buildBoardSelector(),
+        const SizedBox(width: 12),
         if (_flashAvailable) ...[
           _buildFlashSelector(),
           const SizedBox(width: 12),
@@ -797,6 +1155,12 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                       ),
                     ),
                   ),
+                  if (_boardConfig.enabled)
+                    Positioned(
+                      left: 22,
+                      bottom: 122,
+                      child: _buildBoardPreview(constraints.maxWidth),
+                    ),
                   Positioned(
                     left: 22,
                     bottom: 20,
@@ -905,6 +1269,194 @@ class _CameraThumbnailCard extends StatelessWidget {
                 ),
               ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PhotoBoardPreview extends StatelessWidget {
+  const _PhotoBoardPreview({
+    required this.config,
+    required this.shootingDate,
+  });
+
+  final PhotoBoardConfig config;
+  final String shootingDate;
+
+  @override
+  Widget build(BuildContext context) {
+    const Color lineColor = Colors.white;
+    return AspectRatio(
+      aspectRatio: 1 / 0.64,
+      child: Container(
+        decoration: BoxDecoration(
+          color: const Color(0xF20E4F36),
+          border: Border.all(color: lineColor, width: 2),
+          boxShadow: const [
+            BoxShadow(
+              color: Colors.black45,
+              blurRadius: 12,
+              offset: Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Column(
+          children: [
+            Expanded(
+              flex: 11,
+              child: _PhotoBoardRow(
+                label: '業務名',
+                value: config.businessName,
+              ),
+            ),
+            Expanded(
+              flex: 11,
+              child: _PhotoBoardRow(
+                label: '施設名',
+                value: config.facilityName,
+              ),
+            ),
+            Expanded(
+              flex: 11,
+              child: _PhotoBoardRow(
+                label: '撮影年月日',
+                value: shootingDate,
+              ),
+            ),
+            Expanded(
+              flex: 11,
+              child: _PhotoBoardRow(
+                label: '撮影箇所',
+                value: config.shootingLocation,
+              ),
+            ),
+            Expanded(
+              flex: 43,
+              child: Container(
+                width: double.infinity,
+                alignment: Alignment.center,
+                decoration: const BoxDecoration(
+                  border: Border(
+                    top: BorderSide(color: lineColor, width: 1.2),
+                  ),
+                ),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    config.stepLabel,
+                    maxLines: 1,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 29,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Expanded(
+              flex: 13,
+              child: Container(
+                width: double.infinity,
+                alignment: Alignment.center,
+                decoration: const BoxDecoration(
+                  border: Border(
+                    top: BorderSide(color: lineColor, width: 1.2),
+                  ),
+                ),
+                child: const Text(
+                  '（有）MasMas',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PhotoBoardRow extends StatelessWidget {
+  const _PhotoBoardRow({
+    required this.label,
+    required this.value,
+  });
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 108,
+          child: Center(
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+        ),
+        const VerticalDivider(
+          color: Colors.white,
+          width: 1.2,
+          thickness: 1.2,
+        ),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Text(
+              value,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _BoardStepButton extends StatelessWidget {
+  const _BoardStepButton({
+    required this.tooltip,
+    required this.onPressed,
+    required this.icon,
+  });
+
+  final String tooltip;
+  final VoidCallback? onPressed;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: Colors.black54,
+        shape: const CircleBorder(),
+        child: IconButton(
+          onPressed: onPressed,
+          color: Colors.white,
+          disabledColor: Colors.white38,
+          icon: Icon(icon),
         ),
       ),
     );

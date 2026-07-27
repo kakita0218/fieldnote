@@ -36,9 +36,262 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
       synchronizePencilDrawings(call, result: result)
     case "openPencilEditor":
       openPencilEditor(call, result: result)
+    case "composePhotoBoard":
+      composePhotoBoard(call, result: result)
     default:
       result(FlutterMethodNotImplemented)
     }
+  }
+
+  private func composePhotoBoard(
+    _ call: FlutterMethodCall,
+    result: @escaping FlutterResult
+  ) {
+    guard let arguments = call.arguments as? [String: Any] else {
+      result(
+        FlutterError(
+          code: "invalid_arguments",
+          message: "電子看板の設定を読み取れませんでした。",
+          details: nil
+        )
+      )
+      return
+    }
+    guard
+      let typedBytes = arguments["jpegBytes"] as? FlutterStandardTypedData,
+      let sourceImage = UIImage(data: typedBytes.data)
+    else {
+      result(
+        FlutterError(
+          code: "invalid_photo",
+          message: "撮影画像を読み取れませんでした。",
+          details: nil
+        )
+      )
+      return
+    }
+
+    let businessName = arguments["businessName"] as? String ?? ""
+    let facilityName = arguments["facilityName"] as? String ?? ""
+    let shootingDate = arguments["shootingDate"] as? String ?? ""
+    let shootingLocation = arguments["shootingLocation"] as? String ?? ""
+    let workStatus = arguments["workStatus"] as? String ?? ""
+
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = sourceImage.scale
+    format.opaque = true
+    let renderer = UIGraphicsImageRenderer(
+      size: sourceImage.size,
+      format: format
+    )
+    let composed = renderer.image { rendererContext in
+      sourceImage.draw(
+        in: CGRect(origin: .zero, size: sourceImage.size)
+      )
+      Self.drawPhotoBoard(
+        in: rendererContext.cgContext,
+        canvasSize: sourceImage.size,
+        businessName: businessName,
+        facilityName: facilityName,
+        shootingDate: shootingDate,
+        shootingLocation: shootingLocation,
+        workStatus: workStatus
+      )
+    }
+
+    guard let jpeg = composed.jpegData(compressionQuality: 0.94) else {
+      result(
+        FlutterError(
+          code: "photo_encode_failed",
+          message: "電子看板入り写真を保存形式に変換できませんでした。",
+          details: nil
+        )
+      )
+      return
+    }
+    result(FlutterStandardTypedData(bytes: jpeg))
+  }
+
+  private static func drawPhotoBoard(
+    in context: CGContext,
+    canvasSize: CGSize,
+    businessName: String,
+    facilityName: String,
+    shootingDate: String,
+    shootingLocation: String,
+    workStatus: String
+  ) {
+    let landscape = canvasSize.width >= canvasSize.height
+    let boardWidth = landscape
+      ? canvasSize.width * 0.39
+      : canvasSize.width * 0.82
+    let boardHeight = boardWidth * 0.64
+    let margin = min(canvasSize.width, canvasSize.height) * 0.035
+    let board = CGRect(
+      x: margin,
+      y: canvasSize.height - boardHeight - margin,
+      width: boardWidth,
+      height: boardHeight
+    )
+    let lineWidth = max(2, boardWidth * 0.0048)
+    let white = UIColor.white
+    let boardGreen = UIColor(
+      red: 0.055,
+      green: 0.29,
+      blue: 0.19,
+      alpha: 0.96
+    )
+
+    context.saveGState()
+    context.setFillColor(boardGreen.cgColor)
+    context.fill(board)
+    context.setStrokeColor(white.cgColor)
+    context.setLineWidth(lineWidth)
+    context.stroke(board.insetBy(dx: lineWidth / 2, dy: lineWidth / 2))
+
+    let detailHeight = board.height * 0.44
+    let statusHeight = board.height * 0.43
+    let rowHeight = detailHeight / 4
+    let labelWidth = board.width * 0.255
+    for index in 1...4 {
+      let y = board.minY + rowHeight * CGFloat(index)
+      context.move(to: CGPoint(x: board.minX, y: y))
+      context.addLine(to: CGPoint(x: board.maxX, y: y))
+    }
+    context.move(
+      to: CGPoint(x: board.minX + labelWidth, y: board.minY)
+    )
+    context.addLine(
+      to: CGPoint(
+        x: board.minX + labelWidth,
+        y: board.minY + detailHeight
+      )
+    )
+    let footerTop = board.minY + detailHeight + statusHeight
+    context.move(to: CGPoint(x: board.minX, y: footerTop))
+    context.addLine(to: CGPoint(x: board.maxX, y: footerTop))
+    context.strokePath()
+
+    let labels = ["業務名", "施設名", "撮影年月日", "撮影箇所"]
+    let values = [
+      businessName,
+      facilityName,
+      shootingDate,
+      shootingLocation,
+    ]
+    let cellPadding = board.width * 0.014
+    for index in 0..<labels.count {
+      let y = board.minY + CGFloat(index) * rowHeight
+      drawFittedBoardText(
+        labels[index],
+        in: CGRect(
+          x: board.minX + cellPadding,
+          y: y + rowHeight * 0.12,
+          width: labelWidth - cellPadding * 2,
+          height: rowHeight * 0.76
+        ),
+        color: white,
+        preferredSize: boardWidth * 0.035,
+        minimumSize: boardWidth * 0.018,
+        weight: .semibold,
+        alignment: .center
+      )
+      drawFittedBoardText(
+        values[index],
+        in: CGRect(
+          x: board.minX + labelWidth + cellPadding,
+          y: y + rowHeight * 0.12,
+          width: board.width - labelWidth - cellPadding * 2,
+          height: rowHeight * 0.76
+        ),
+        color: white,
+        preferredSize: boardWidth * 0.038,
+        minimumSize: boardWidth * 0.018,
+        weight: .medium,
+        alignment: .left
+      )
+    }
+
+    drawFittedBoardText(
+      workStatus,
+      in: CGRect(
+        x: board.minX + cellPadding,
+        y: board.minY + detailHeight + statusHeight * 0.12,
+        width: board.width - cellPadding * 2,
+        height: statusHeight * 0.76
+      ),
+      color: white,
+      preferredSize: boardWidth * 0.079,
+      minimumSize: boardWidth * 0.035,
+      weight: .bold,
+      alignment: .center
+    )
+    drawFittedBoardText(
+      "（有）MasMas",
+      in: CGRect(
+        x: board.minX + cellPadding,
+        y: footerTop + board.height * 0.018,
+        width: board.width - cellPadding * 2,
+        height: board.maxY - footerTop - board.height * 0.036
+      ),
+      color: white,
+      preferredSize: boardWidth * 0.031,
+      minimumSize: boardWidth * 0.018,
+      weight: .medium,
+      alignment: .center
+    )
+    context.restoreGState()
+  }
+
+  private static func drawFittedBoardText(
+    _ text: String,
+    in rect: CGRect,
+    color: UIColor,
+    preferredSize: CGFloat,
+    minimumSize: CGFloat,
+    weight: UIFont.Weight,
+    alignment: NSTextAlignment
+  ) {
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.alignment = alignment
+    paragraph.lineBreakMode = .byClipping
+    var size = preferredSize
+    var attributes: [NSAttributedString.Key: Any] = [:]
+    while true {
+      attributes = [
+        .font: UIFont.systemFont(ofSize: size, weight: weight),
+        .foregroundColor: color,
+        .paragraphStyle: paragraph,
+      ]
+      let measured = (text as NSString).boundingRect(
+        with: CGSize(width: .greatestFiniteMagnitude, height: rect.height),
+        options: [.usesLineFragmentOrigin, .usesFontLeading],
+        attributes: attributes,
+        context: nil
+      )
+      if measured.width <= rect.width || size <= minimumSize {
+        break
+      }
+      size -= max(1, preferredSize * 0.035)
+    }
+    let measured = (text as NSString).boundingRect(
+      with: rect.size,
+      options: [.usesLineFragmentOrigin, .usesFontLeading],
+      attributes: attributes,
+      context: nil
+    )
+    let drawRect = CGRect(
+      x: rect.minX,
+      y: rect.midY - min(measured.height, rect.height) / 2,
+      width: rect.width,
+      height: rect.height
+    )
+    (text as NSString).draw(
+      with: drawRect,
+      options: [.usesLineFragmentOrigin, .usesFontLeading],
+      attributes: attributes,
+      context: nil
+    )
   }
 
   private func arguments(

@@ -75,4 +75,30 @@ class NativeProjectService {
         ) ??
         false;
   }
+
+  static Future<Uint8List> composePhotoBoard({
+    required Uint8List jpegBytes,
+    required String businessName,
+    required String facilityName,
+    required String shootingDate,
+    required String shootingLocation,
+    required String workStatus,
+  }) async {
+    if (!isAvailable) return jpegBytes;
+    final Uint8List? result = await _channel.invokeMethod<Uint8List>(
+      'composePhotoBoard',
+      <String, dynamic>{
+        'jpegBytes': jpegBytes,
+        'businessName': businessName,
+        'facilityName': facilityName,
+        'shootingDate': shootingDate,
+        'shootingLocation': shootingLocation,
+        'workStatus': workStatus,
+      },
+    );
+    if (result == null || result.isEmpty) {
+      throw StateError('電子看板を写真へ合成できませんでした。');
+    }
+    return result;
+  }
 }
