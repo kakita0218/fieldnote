@@ -66,6 +66,8 @@ class ProjectFileStore {
 
   static Future<void> deleteProject(String projectId) async {}
 
+  static Future<bool> hasProject(String projectId) async => false;
+
   static Future<String?> sourcePdfPath(String projectId) async => null;
 
   static Future<String?> outputPdfPath(String projectId) async => null;

@@ -18,10 +18,12 @@ class ProjectRepository {
   static const String _photoMetaBoxName = 'fieldnote_photo_meta_v5';
   static const String _photoBytesBoxName = 'fieldnote_photo_bytes_v5';
   static const String _thumbnailBoxName = 'fieldnote_thumbnails_v5';
+  static const String _trashBoxName = 'fieldnote_project_trash_v1';
 
   // Read-only migration source used by v4.
   static const String _legacyBoxName = 'fieldnote_projects_v2';
   static const String _legacyIndexKey = '__project_index__';
+  static final Set<String> _deletionsInProgress = <String>{};
 
   static Future<Box<dynamic>> _metaBox() => Hive.openBox<dynamic>(_metaBoxName);
   static Future<Box<dynamic>> _pdfBox() => Hive.openBox<dynamic>(_pdfBoxName);
@@ -34,6 +36,8 @@ class ProjectRepository {
       Hive.openBox<dynamic>(_photoBytesBoxName);
   static Future<Box<dynamic>> _thumbnailBox() =>
       Hive.openBox<dynamic>(_thumbnailBoxName);
+  static Future<Box<dynamic>> _trashBox() =>
+      Hive.openBox<dynamic>(_trashBoxName);
 
   static String _photoKey(String projectId, String photoId) =>
       '$projectId::$photoId';
@@ -70,8 +74,18 @@ class ProjectRepository {
   static Future<List<ProjectSummary>> listProjects() async {
     final List<ProjectSummary> fileProjects =
         await ProjectFileStore.listProjects();
+    final Box<dynamic> trash = await _trashBox();
+    for (final ProjectSummary project in fileProjects) {
+      if (trash.containsKey(project.id) &&
+          !_deletionsInProgress.contains(project.id)) {
+        await trash.delete(project.id);
+      }
+    }
+    final Set<String> trashedProjectIds =
+        trash.keys.map((dynamic key) => key.toString()).toSet();
     final Map<String, ProjectSummary> projectsById = <String, ProjectSummary>{
-      for (final ProjectSummary project in fileProjects) project.id: project,
+      for (final ProjectSummary project in fileProjects)
+        if (!trashedProjectIds.contains(project.id)) project.id: project,
     };
     final Box<dynamic> meta = await _metaBox();
     final Box<dynamic> pinsBox = await _pinsBox();
@@ -88,6 +102,7 @@ class ProjectRepository {
 
     for (final dynamic key in meta.keys) {
       final String projectId = key.toString();
+      if (trashedProjectIds.contains(projectId)) continue;
       final Map<String, dynamic> record = _asMap(meta.get(key));
       if (record.isEmpty) continue;
       final DateTime updatedAt =
@@ -115,6 +130,7 @@ class ProjectRepository {
         final List<dynamic> oldList = jsonDecode(rawIndex) as List<dynamic>;
         for (final dynamic item in oldList) {
           final ProjectSummary old = ProjectSummary.fromJson(_asMap(item));
+          if (trashedProjectIds.contains(old.id)) continue;
           projectsById.putIfAbsent(old.id, () => old);
         }
       }
@@ -433,6 +449,9 @@ class ProjectRepository {
     if (meta.isEmpty) {
       final Map<String, dynamic>? migrated = await _migrateLegacyProject(id);
       if (migrated == null) return null;
+      final Map<String, dynamic>? migratedFileProject =
+          await ProjectFileStore.loadProject(id);
+      if (migratedFileProject != null) return migratedFileProject;
       meta = _asMap((await _metaBox()).get(id));
     }
 
@@ -553,13 +572,15 @@ class ProjectRepository {
       );
       final List<Map<String, dynamic>> legacyPins =
           _asList(old['pins']).map(_asMap).toList();
+      final List<Map<String, dynamic>> legacyStrokes =
+          _asList(old['strokes']).map(_asMap).toList();
       await savePins(
         projectId: id,
         pins: legacyPins,
       );
       await saveDrawings(
         projectId: id,
-        strokes: _asList(old['strokes']).map(_asMap).toList(),
+        strokes: legacyStrokes,
       );
       await touchProject(
         id: id,
@@ -596,7 +617,38 @@ class ProjectRepository {
           );
         }
       }
-      return old;
+      final List<Map<String, dynamic>> migratedPhotoMetadata =
+          await _loadHivePhotoMetadata(id);
+      await ProjectFileStore.saveSnapshot(
+        projectId: id,
+        projectName: name,
+        metadata: <String, dynamic>{
+          for (final String key in <String>[
+            'pageCount',
+            'currentPage',
+            'nextPinNumber',
+            'pinColor',
+            'penColor',
+            'penWidth',
+            'boardBusinessName',
+            'boardFacilityName',
+          ])
+            if (old.containsKey(key)) key: old[key],
+          'migratedFromV4': true,
+        },
+        pins: legacyPins,
+        strokes: legacyStrokes,
+        photos: migratedPhotoMetadata,
+      );
+      return <String, dynamic>{
+        ...old,
+        'projectId': id,
+        'projectName': name,
+        'pdfBytes': pdf,
+        'pins': legacyPins,
+        'strokes': legacyStrokes,
+        'photoMeta': migratedPhotoMetadata,
+      };
     } catch (_) {
       return null;
     }
@@ -616,40 +668,71 @@ class ProjectRepository {
   }
 
   static Future<void> deleteProject(String id) async {
-    await ProjectFileStore.deleteProject(id);
-    Future<void> clearCache() async {
-      await (await _metaBox()).delete(id);
-      await (await _pdfBox()).delete(id);
-      await (await _pinsBox()).delete(id);
-      await (await _drawingsBox()).delete(id);
-
-      final Box<dynamic> photoMeta = await _photoMetaBox();
-      final Box<dynamic> photoBytes = await _photoBytesBox();
-      final Box<dynamic> thumbnails = await _thumbnailBox();
-      final List<dynamic> keys = <dynamic>[];
-      for (final dynamic key in photoMeta.keys) {
-        final Map<String, dynamic> meta = _asMap(photoMeta.get(key));
-        if (meta['projectId']?.toString() == id) keys.add(key);
-      }
-      await photoMeta.deleteAll(keys);
-      await photoBytes.deleteAll(keys);
-      await thumbnails.deleteAll(keys);
-
-      // Remove legacy copy only after deletion was requested explicitly.
-      try {
-        final Box<dynamic> legacy = await Hive.openBox<dynamic>(_legacyBoxName);
-        await legacy.delete('project_$id');
-      } catch (_) {}
+    if (!_deletionsInProgress.add(id)) {
+      throw StateError('この案件は「最近削除した項目」へ移動中です。');
     }
-
-    if (ProjectFileStore.isAuthoritative) {
-      try {
-        await clearCache();
-      } catch (_) {
-        // The user-visible project folder is already deleted.
+    try {
+      if (ProjectFileStore.isAuthoritative &&
+          !await ProjectFileStore.hasProject(id)) {
+        final Map<String, dynamic>? migrated = await loadProject(id);
+        if (migrated == null || !await ProjectFileStore.hasProject(id)) {
+          throw StateError(
+            '案件ファイルを準備できなかったため、削除せずに処理を中止しました。',
+          );
+        }
       }
-    } else {
-      await clearCache();
+
+      final Box<dynamic> trash = await _trashBox();
+      await trash.put(
+        id,
+        <String, dynamic>{
+          'projectId': id,
+          'deletedAt': DateTime.now().toIso8601String(),
+        },
+      );
+      try {
+        await ProjectFileStore.deleteProject(id);
+      } catch (_) {
+        await trash.delete(id);
+        rethrow;
+      }
+      Future<void> clearCache() async {
+        await (await _metaBox()).delete(id);
+        await (await _pdfBox()).delete(id);
+        await (await _pinsBox()).delete(id);
+        await (await _drawingsBox()).delete(id);
+
+        final Box<dynamic> photoMeta = await _photoMetaBox();
+        final Box<dynamic> photoBytes = await _photoBytesBox();
+        final Box<dynamic> thumbnails = await _thumbnailBox();
+        final List<dynamic> keys = <dynamic>[];
+        for (final dynamic key in photoMeta.keys) {
+          final Map<String, dynamic> meta = _asMap(photoMeta.get(key));
+          if (meta['projectId']?.toString() == id) keys.add(key);
+        }
+        await photoMeta.deleteAll(keys);
+        await photoBytes.deleteAll(keys);
+        await thumbnails.deleteAll(keys);
+
+        // Remove legacy copy only after deletion was requested explicitly.
+        try {
+          final Box<dynamic> legacy =
+              await Hive.openBox<dynamic>(_legacyBoxName);
+          await legacy.delete('project_$id');
+        } catch (_) {}
+      }
+
+      if (ProjectFileStore.isAuthoritative) {
+        try {
+          await clearCache();
+        } catch (_) {
+          // The user-visible project folder is already deleted.
+        }
+      } else {
+        await clearCache();
+      }
+    } finally {
+      _deletionsInProgress.remove(id);
     }
   }
 

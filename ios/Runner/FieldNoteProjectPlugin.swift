@@ -36,10 +36,110 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
       synchronizePencilDrawings(call, result: result)
     case "openPencilEditor":
       openPencilEditor(call, result: result)
+    case "moveFileItemToTrash":
+      moveFileItemToTrash(call, result: result)
     case "composePhotoBoard":
       composePhotoBoard(call, result: result)
     default:
       result(FlutterMethodNotImplemented)
+    }
+  }
+
+  private func moveFileItemToTrash(
+    _ call: FlutterMethodCall,
+    result: @escaping FlutterResult
+  ) {
+    guard
+      let arguments = call.arguments as? [String: Any],
+      let path = arguments["path"] as? String,
+      !path.isEmpty
+    else {
+      result(
+        FlutterError(
+          code: "invalid_trash_path",
+          message: "削除する案件フォルダを確認できませんでした。",
+          details: nil
+        )
+      )
+      return
+    }
+
+    let fileManager = FileManager.default
+    guard
+      let documentsURL = fileManager.urls(
+        for: .documentDirectory,
+        in: .userDomainMask
+      ).first
+    else {
+      result(
+        FlutterError(
+          code: "documents_unavailable",
+          message: "FieldNoteの保存場所を確認できませんでした。",
+          details: nil
+        )
+      )
+      return
+    }
+
+    let requestedURL = URL(fileURLWithPath: path).standardizedFileURL
+    let requestedValues = try? requestedURL.resourceValues(
+      forKeys: [.isSymbolicLinkKey]
+    )
+    let targetURL = requestedURL
+      .standardizedFileURL
+      .resolvingSymlinksInPath()
+    let documentComponents = documentsURL
+      .standardizedFileURL
+      .resolvingSymlinksInPath()
+      .pathComponents
+    let targetComponents = targetURL.pathComponents
+    var isDirectory: ObjCBool = false
+    let projectEntries = try? fileManager.contentsOfDirectory(
+      at: targetURL,
+      includingPropertiesForKeys: nil,
+      options: [.skipsHiddenFiles]
+    )
+    let hasProjectManifest = projectEntries?.contains {
+      $0.lastPathComponent.hasSuffix("_案件情報.json")
+    } ?? false
+    guard
+      targetComponents.count == documentComponents.count + 1,
+      Array(targetComponents.prefix(documentComponents.count))
+        == documentComponents,
+      requestedValues?.isSymbolicLink == false,
+      !targetURL.lastPathComponent.hasPrefix("."),
+      fileManager.fileExists(
+        atPath: targetURL.path,
+        isDirectory: &isDirectory
+      ),
+      isDirectory.boolValue,
+      hasProjectManifest
+    else {
+      result(
+        FlutterError(
+          code: "unsafe_trash_path",
+          message: "案件フォルダの場所が正しくありません。",
+          details: nil
+        )
+      )
+      return
+    }
+
+    do {
+      var resultingURL: NSURL?
+      try fileManager.trashItem(
+        at: targetURL,
+        resultingItemURL: &resultingURL
+      )
+      result(true)
+    } catch {
+      result(
+        FlutterError(
+          code: "trash_failed",
+          message: "案件を「最近削除した項目」へ移動できませんでした。",
+          details: error.localizedDescription
+        )
+      )
     }
   }
 

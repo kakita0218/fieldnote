@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -61,15 +62,30 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<ProjectSummary> _projects = const <ProjectSummary>[];
+  final Set<String> _deletingProjectIds = <String>{};
   bool _loading = true;
   bool _showAllProjects = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _reload();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_reload());
+    }
   }
 
   Future<void> _reload() async {
@@ -135,6 +151,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _delete(ProjectSummary project) async {
+    if (_deletingProjectIds.contains(project.id)) return;
+    final bool usesRecentlyDeleted =
+        !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
     final bool? confirmed = await showDialog<bool>(
       context: context,
       builder: (BuildContext context) => AlertDialog(
@@ -146,8 +165,12 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         title: const Text('案件を削除'),
         content: Text(
-          '「${project.name}」を削除しますか？\n'
-          '書き出していない写真やメモも削除されます。',
+          usesRecentlyDeleted
+              ? '「${project.name}」をファイルアプリの\n'
+                  '「最近削除した項目」へ移動しますか？\n\n'
+                  '30日以内ならファイルアプリから復元できます。'
+              : '「${project.name}」を削除しますか？\n'
+                  '書き出していない写真やメモも削除されます。',
         ),
         actions: <Widget>[
           TextButton(
@@ -159,14 +182,43 @@ class _HomeScreenState extends State<HomeScreen> {
               backgroundColor: const Color(0xFFE53935),
             ),
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('削除'),
+            child: Text(usesRecentlyDeleted ? '移動' : '削除'),
           ),
         ],
       ),
     );
-    if (confirmed == true) {
+    if (confirmed != true || !mounted) return;
+    setState(() => _deletingProjectIds.add(project.id));
+    try {
       await ProjectRepository.deleteProject(project.id);
       await _reload();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            usesRecentlyDeleted
+                ? '「${project.name}」を「最近削除した項目」へ移動しました。'
+                : '「${project.name}」を削除しました。',
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            usesRecentlyDeleted
+                ? '「最近削除した項目」へ移動できませんでした。\n$error'
+                : '案件を削除できませんでした。\n$error',
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _deletingProjectIds.remove(project.id));
+      } else {
+        _deletingProjectIds.remove(project.id);
+      }
     }
   }
 
@@ -291,6 +343,7 @@ class _HomeScreenState extends State<HomeScreen> {
         final ProjectSummary project = _visibleProjects[index];
         return _ProjectCard(
           project: project,
+          isDeleting: _deletingProjectIds.contains(project.id),
           accent: _projectAccent(index),
           icon: _projectIcon(index),
           onOpen: () => _open(project),
@@ -506,6 +559,7 @@ class _NewProjectCard extends StatelessWidget {
 class _ProjectCard extends StatelessWidget {
   const _ProjectCard({
     required this.project,
+    required this.isDeleting,
     required this.accent,
     required this.icon,
     required this.onOpen,
@@ -515,6 +569,7 @@ class _ProjectCard extends StatelessWidget {
   });
 
   final ProjectSummary project;
+  final bool isDeleting;
   final Color accent;
   final IconData icon;
   final VoidCallback onOpen;
@@ -530,7 +585,7 @@ class _ProjectCard extends StatelessWidget {
         color: Colors.transparent,
         child: InkWell(
           borderRadius: BorderRadius.circular(12),
-          onTap: onOpen,
+          onTap: isDeleting ? null : onOpen,
           child: Ink(
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(12),
@@ -557,7 +612,16 @@ class _ProjectCard extends StatelessWidget {
                 children: <Widget>[
                   SizedBox(
                     width: 48,
-                    child: Icon(icon, color: accent, size: 33),
+                    child: isDeleting
+                        ? const Center(
+                            child: SizedBox.square(
+                              dimension: 25,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2.5,
+                              ),
+                            ),
+                          )
+                        : Icon(icon, color: accent, size: 33),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
@@ -607,6 +671,7 @@ class _ProjectCard extends StatelessWidget {
                     ),
                   ),
                   PopupMenuButton<String>(
+                    enabled: !isDeleting,
                     tooltip: '案件メニュー',
                     color: const Color(0xFF0A1D34),
                     icon: const Icon(

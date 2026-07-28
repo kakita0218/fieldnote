@@ -76,6 +76,19 @@ class NativeProjectService {
         false;
   }
 
+  static Future<void> moveFileItemToTrash(String path) async {
+    if (!isAvailable) {
+      throw UnsupportedError('この端末では「最近削除した項目」を利用できません。');
+    }
+    final bool? moved = await _channel.invokeMethod<bool>(
+      'moveFileItemToTrash',
+      <String, dynamic>{'path': path},
+    );
+    if (moved != true) {
+      throw StateError('案件を「最近削除した項目」へ移動できませんでした。');
+    }
+  }
+
   static Future<Uint8List> composePhotoBoard({
     required Uint8List jpegBytes,
     required String businessName,

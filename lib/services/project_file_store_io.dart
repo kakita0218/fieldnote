@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:path_provider/path_provider.dart';
 
 import '../models/project_summary.dart';
+import 'native_project_service.dart';
 
 /// Stores the user-visible project as ordinary files in the app's Documents
 /// directory. On iOS this directory is exposed as "On My iPad/FieldNote".
@@ -16,9 +17,16 @@ class ProjectFileStore {
   static const int _schemaVersion = 1;
   static const String _manifestSuffix = '_案件情報.json';
   static const String _photosDirectoryName = '写真';
+  static const String _recoveryDirectoryName = '.fieldnote-recovery';
+  static const String _recoverySourcePdfName = 'source.pdf';
+  static const List<String> _pencilKitSuffixes = <String>[
+    '.pencilkit',
+    '.pencilkit.pending',
+  ];
 
   static final Map<String, Directory> _projectDirectories =
       <String, Directory>{};
+  static final Set<String> _stagingRecoveryProjectIds = <String>{};
 
   static bool get isAuthoritative => true;
 
@@ -125,6 +133,31 @@ class ProjectFileStore {
         ),
       );
 
+  static Future<void> _copyFileAtomically(File source, File target) async {
+    await target.parent.create(recursive: true);
+    await _recoverAtomicFile(target);
+    final String nonce = DateTime.now().microsecondsSinceEpoch.toString();
+    final File temporary = File('${target.path}.tmp-$nonce');
+    final File backup = File('${target.path}.bak');
+
+    try {
+      await source.copy(temporary.path);
+      if (await target.exists()) {
+        if (await backup.exists()) await backup.delete();
+        await target.rename(backup.path);
+      }
+      await temporary.rename(target.path);
+      if (await backup.exists()) await backup.delete();
+    } catch (_) {
+      if (!await target.exists() && await backup.exists()) {
+        await backup.rename(target.path);
+      }
+      rethrow;
+    } finally {
+      if (await temporary.exists()) await temporary.delete();
+    }
+  }
+
   static Future<Map<String, dynamic>?> _readManifest(
     Directory directory,
   ) async {
@@ -158,7 +191,13 @@ class ProjectFileStore {
 
   static Future<Directory?> _findProjectDirectory(String projectId) async {
     final Directory? cached = _projectDirectories[projectId];
-    if (cached != null && await cached.exists()) return cached;
+    if (cached != null && await cached.exists()) {
+      await _cleanupStaleRecoveryStaging(
+        projectId: projectId,
+        projectDirectory: cached,
+      );
+      return cached;
+    }
 
     final Directory root = await _documentsDirectory();
     if (!await root.exists()) return null;
@@ -167,6 +206,10 @@ class ProjectFileStore {
       final Map<String, dynamic>? manifest = await _readManifest(entity);
       if (manifest?['projectId']?.toString() == projectId) {
         _projectDirectories[projectId] = entity;
+        await _cleanupStaleRecoveryStaging(
+          projectId: projectId,
+          projectDirectory: entity,
+        );
         return entity;
       }
     }
@@ -210,6 +253,108 @@ class ProjectFileStore {
     return source;
   }
 
+  static Directory _recoveryDirectory(Directory projectDirectory) => Directory(
+        '${projectDirectory.path}${Platform.pathSeparator}'
+        '$_recoveryDirectoryName',
+      );
+
+  static Future<void> _cleanupStaleRecoveryStaging({
+    required String projectId,
+    required Directory projectDirectory,
+  }) async {
+    if (_stagingRecoveryProjectIds.contains(projectId) ||
+        !await projectDirectory.exists()) {
+      return;
+    }
+    await for (final FileSystemEntity entity
+        in projectDirectory.list(followLinks: false)) {
+      if (entity is! Directory) continue;
+      final String name = entity.uri.pathSegments
+          .where((String segment) => segment.isNotEmpty)
+          .last;
+      if (!name.startsWith('$_recoveryDirectoryName.tmp-')) continue;
+      try {
+        await entity.delete(recursive: true);
+      } catch (_) {
+        // A later scan can retry after a transient Files operation finishes.
+      }
+    }
+  }
+
+  static Future<Directory?> _stageRecoveryFiles({
+    required String projectId,
+    required Directory projectDirectory,
+  }) async {
+    final File source = await _sourcePdfFile(projectId);
+    if (!await source.exists()) return null;
+    if (!_stagingRecoveryProjectIds.add(projectId)) {
+      throw StateError('案件を「最近削除した項目」へ移動中です。');
+    }
+
+    final Directory recovery = _recoveryDirectory(projectDirectory);
+    final Directory staging = Directory(
+      '${projectDirectory.path}${Platform.pathSeparator}'
+      '$_recoveryDirectoryName.tmp-'
+      '${DateTime.now().microsecondsSinceEpoch}',
+    );
+    try {
+      await staging.create(recursive: true);
+      await source.copy(
+        '${staging.path}${Platform.pathSeparator}$_recoverySourcePdfName',
+      );
+      for (final String suffix in _pencilKitSuffixes) {
+        final File sidecar = File('${source.path}$suffix');
+        if (await sidecar.exists()) {
+          await sidecar.copy(
+            '${staging.path}${Platform.pathSeparator}'
+            '$_recoverySourcePdfName$suffix',
+          );
+        }
+      }
+      if (await recovery.exists()) {
+        await recovery.delete(recursive: true);
+      }
+      return await staging.rename(recovery.path);
+    } catch (_) {
+      if (await staging.exists()) {
+        await staging.delete(recursive: true);
+      }
+      rethrow;
+    } finally {
+      _stagingRecoveryProjectIds.remove(projectId);
+    }
+  }
+
+  static Future<void> _restoreRecoveryFiles({
+    required String projectId,
+    required Directory projectDirectory,
+  }) async {
+    final Directory recovery = _recoveryDirectory(projectDirectory);
+    if (!await recovery.exists()) return;
+
+    final File recoveredSource = File(
+      '${recovery.path}${Platform.pathSeparator}$_recoverySourcePdfName',
+    );
+    final File source = await _sourcePdfFile(projectId);
+    if (await recoveredSource.exists() && !await source.exists()) {
+      await _copyFileAtomically(recoveredSource, source);
+    }
+    if (!await source.exists()) {
+      throw StateError('復元用の元PDFを確認できませんでした。');
+    }
+    for (final String suffix in _pencilKitSuffixes) {
+      final File recoveredSidecar = File(
+        '${recovery.path}${Platform.pathSeparator}'
+        '$_recoverySourcePdfName$suffix',
+      );
+      final File sidecar = File('${source.path}$suffix');
+      if (await recoveredSidecar.exists() && !await sidecar.exists()) {
+        await _copyFileAtomically(recoveredSidecar, sidecar);
+      }
+    }
+    await recovery.delete(recursive: true);
+  }
+
   static Future<File?> _outputPdfFile(String projectId) async {
     final Directory? directory = await _findProjectDirectory(projectId);
     if (directory == null) return null;
@@ -236,6 +381,10 @@ class ProjectFileStore {
       if (manifest == null) continue;
       final String id = manifest['projectId']?.toString() ?? '';
       if (id.isEmpty) continue;
+      await _cleanupStaleRecoveryStaging(
+        projectId: id,
+        projectDirectory: entity,
+      );
       _projectDirectories[id] = entity;
       projects.add(
         ProjectSummary(
@@ -292,6 +441,14 @@ class ProjectFileStore {
     final Map<String, dynamic>? manifest = await _readManifest(directory);
     if (manifest == null) return null;
 
+    try {
+      await _restoreRecoveryFiles(
+        projectId: projectId,
+        projectDirectory: directory,
+      );
+    } catch (_) {
+      // The visible PDF can still open even if an internal recovery copy fails.
+    }
     final File source = await _sourcePdfFile(projectId);
     final File? output = await _outputPdfFile(projectId);
     final File? readablePdf = await source.exists()
@@ -325,10 +482,7 @@ class ProjectFileStore {
     final File output = File(
       '${directory.path}${Platform.pathSeparator}${_pdfName(projectName)}',
     );
-    for (final String suffix in <String>[
-      '.pencilkit',
-      '.pencilkit.pending',
-    ]) {
+    for (final String suffix in _pencilKitSuffixes) {
       final File sidecar = File('${source.path}$suffix');
       if (await sidecar.exists()) await sidecar.delete();
     }
@@ -760,25 +914,65 @@ class ProjectFileStore {
 
   static Future<void> deleteProject(String projectId) async {
     final Directory? directory = await _findProjectDirectory(projectId);
+    if (NativeProjectService.isAvailable &&
+        (directory == null || !await directory.exists())) {
+      throw StateError(
+        '案件フォルダが見つからないため、「最近削除した項目」へ移動できませんでした。',
+      );
+    }
     if (directory != null && await directory.exists()) {
-      await directory.delete(recursive: true);
+      if (NativeProjectService.isAvailable) {
+        await _restoreRecoveryFiles(
+          projectId: projectId,
+          projectDirectory: directory,
+        );
+        final Directory? recovery = await _stageRecoveryFiles(
+          projectId: projectId,
+          projectDirectory: directory,
+        );
+        try {
+          await NativeProjectService.moveFileItemToTrash(directory.path);
+        } catch (_) {
+          if (recovery != null && await recovery.exists()) {
+            await recovery.delete(recursive: true);
+          }
+          rethrow;
+        }
+      } else {
+        await directory.delete(recursive: true);
+      }
     }
     final File source = await _sourcePdfFile(projectId);
-    if (await source.exists()) await source.delete();
-    for (final String suffix in <String>[
-      '.pencilkit',
-      '.pencilkit.pending',
-    ]) {
-      final File sidecar = File('${source.path}$suffix');
-      if (await sidecar.exists()) await sidecar.delete();
+    try {
+      if (await source.exists()) await source.delete();
+      for (final String suffix in _pencilKitSuffixes) {
+        final File sidecar = File('${source.path}$suffix');
+        if (await sidecar.exists()) await sidecar.delete();
+      }
+    } catch (_) {
+      // The user-visible folder is already safely in Recently Deleted.
     }
     _projectDirectories.remove(projectId);
   }
 
   static Future<String?> sourcePdfPath(String projectId) async {
+    final Directory? directory = await _findProjectDirectory(projectId);
+    if (directory != null) {
+      try {
+        await _restoreRecoveryFiles(
+          projectId: projectId,
+          projectDirectory: directory,
+        );
+      } catch (_) {
+        // Keep the recovery bundle in place so opening can be retried later.
+      }
+    }
     final File source = await _sourcePdfFile(projectId);
     return await source.exists() ? source.path : null;
   }
+
+  static Future<bool> hasProject(String projectId) async =>
+      await _findProjectDirectory(projectId) != null;
 
   static Future<String?> outputPdfPath(String projectId) async {
     final File? output = await _outputPdfFile(projectId);
