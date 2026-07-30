@@ -5,7 +5,6 @@ import 'dart:ui' as ui;
 
 import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:file_saver/file_saver.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
@@ -19,9 +18,11 @@ import '../models/photo_board.dart';
 import '../models/photo_data.dart';
 import '../models/pin_data.dart';
 import '../theme/app_colors.dart';
+import '../widgets/handwriting_layer.dart';
 import '../widgets/single_page_pdf_canvas.dart';
 import '../widgets/pin_side_panel.dart';
 import '../services/native_project_service.dart';
+import '../services/project_export_zip_sink.dart';
 import '../services/project_repository.dart';
 
 enum FieldTool {
@@ -37,6 +38,18 @@ const List<Color> _fieldPaletteColors = <Color>[
   Color(0xFF7E57C2), // 紫
   Color(0xFF111111), // 黒
 ];
+
+String _fieldColorName(Color color) {
+  return switch (color.toARGB32()) {
+    0xFF1976D2 => '青',
+    0xFFE53935 => '赤',
+    0xFFF4C20D => '黄',
+    0xFF2EAD62 => '緑',
+    0xFF7E57C2 => '紫',
+    0xFF111111 => '黒',
+    _ => 'カスタム色',
+  };
+}
 
 class _IndexedDrawingStroke {
   const _IndexedDrawingStroke({
@@ -56,6 +69,41 @@ class _DrawingEdit {
 
   final List<_IndexedDrawingStroke> removedStrokes;
   final List<_IndexedDrawingStroke> addedStrokes;
+}
+
+enum _PinEditKind {
+  add,
+  move,
+  direction,
+}
+
+class _PinEdit {
+  const _PinEdit({
+    required this.kind,
+    required this.pinId,
+    required this.index,
+    this.before,
+    this.after,
+  });
+
+  final _PinEditKind kind;
+  final String pinId;
+  final int index;
+  final PinData? before;
+  final PinData? after;
+
+  _PinEdit copyWith({
+    PinData? before,
+    PinData? after,
+  }) {
+    return _PinEdit(
+      kind: kind,
+      pinId: pinId,
+      index: index,
+      before: before ?? this.before,
+      after: after ?? this.after,
+    );
+  }
 }
 
 class PdfViewerScreen extends StatefulWidget {
@@ -78,10 +126,19 @@ class PdfViewerScreen extends StatefulWidget {
 
 class _PdfViewerScreenState extends State<PdfViewerScreen>
     with WidgetsBindingObserver {
+  static final Uint8List _unavailablePhotoPreviewBytes = base64Decode(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk'
+    '+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  );
+
   pdfx.PdfDocument? _pdfDocument;
   Uint8List? _pageImageBytes;
   double _pageAspectRatio = 1;
   bool _isRenderingPage = false;
+  int _renderRequestSequence = 0;
+  int? _failedRenderPage;
+  final Map<int, Future<Uint8List?>> _thumbnailFutures =
+      <int, Future<Uint8List?>>{};
   final TransformationController _transformationController =
       TransformationController();
 
@@ -89,8 +146,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   Uint8List? _pdfBytes;
   late String _projectName;
   Timer? _saveDebounce;
+  Timer? _saveRetryTimer;
   Future<void> _saveTail = Future<void>.value();
   bool _saveInProgress = false;
+  bool _isLeaving = false;
+  bool _allowPop = false;
+  int _saveRetryAttempt = 0;
+  String? _saveErrorMessage;
   bool _pinsDirty = false;
   bool _drawingsDirty = false;
   bool _metaDirty = false;
@@ -103,6 +165,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   int _nextPinNumber = 1;
 
   bool _isPickingFile = false;
+  int _pickOperationSequence = 0;
   bool _isExporting = false;
 
   FieldTool? _selectedTool;
@@ -114,7 +177,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   String _boardFacilityName = '';
 
   final List<PinData> _pins = [];
-  final List<PinData> _redoPins = [];
+  final List<_PinEdit> _undoPinEdits = <_PinEdit>[];
+  final List<_PinEdit> _redoPinEdits = <_PinEdit>[];
+  final Set<String> _pendingPhotoCleanupPinIds = <String>{};
   final Map<int, List<DrawingStroke>> _strokesByPage = {};
   final Map<int, List<_DrawingEdit>> _undoDrawingEditsByPage = {};
   final Map<int, List<_DrawingEdit>> _redoDrawingEditsByPage = {};
@@ -126,9 +191,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   Map<String, String>? _activeEraserSourceIds;
   Set<String>? _activeEraserTouchedSourceIds;
   String? _activeEraserEditId;
+  double? _activeEraserAspectRatio;
+  Map<String, Rect>? _activeEraserBoundsCache;
+  Map<String, List<DrawingPoint>>? _activeEraserSamplesCache;
   int _eraserFragmentSequence = 0;
   final Map<String, List<PhotoData>> _photosByPinId = {};
+  final Set<String> _photoStorageVerifiedPinIds = <String>{};
+  final Set<String> _photoStorageNeedsRescanPinIds = <String>{};
+  final Map<String, int> _photoSavesInProgressByPinId = <String, int>{};
+  int _photoLoadGeneration = 0;
   PinData? _movingPinOriginal;
+  PinData? _directionPinOriginal;
 
   String? _selectedPinId;
   String? _pendingDirectionPinId;
@@ -152,10 +225,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   @override
   void dispose() {
+    _pickOperationSequence++;
     WidgetsBinding.instance.removeObserver(this);
     _noteController?.dispose();
     _pdfDocument?.close();
     _saveDebounce?.cancel();
+    _saveRetryTimer?.cancel();
     _transformationController.dispose();
     super.dispose();
   }
@@ -178,6 +253,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return;
     }
 
+    final int operationSequence = ++_pickOperationSequence;
+    bool operationIsActive() =>
+        mounted && operationSequence == _pickOperationSequence;
+
     setState(() {
       _isPickingFile = true;
       _errorMessage = null;
@@ -191,7 +270,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         withData: kIsWeb,
       );
 
-      if (!mounted || result == null) {
+      if (!operationIsActive() || result == null) {
         return;
       }
 
@@ -202,6 +281,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       Uint8List? selectedBytes = selectedFile.bytes;
       if (selectedBytes == null && selectedFile.path != null) {
         selectedBytes = await XFile(selectedFile.path!).readAsBytes();
+        if (!operationIsActive()) return;
       }
       if (selectedBytes == null || selectedBytes.isEmpty) {
         setState(() {
@@ -216,6 +296,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       nextDocument = await pdfx.PdfDocument.openData(
         Uint8List.fromList(persistentBytes),
       );
+      if (!operationIsActive()) {
+        await nextDocument.close();
+        return;
+      }
       pdfIdentity = '${selectedFile.name}-${persistentBytes.length}';
 
       final pdfx.PdfDocument? previousDocument = _pdfDocument;
@@ -226,6 +310,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       setState(() {
         _pdfDocument = nextDocument;
         _pageImageBytes = null;
+        _thumbnailFutures.clear();
         _pdfPath = pdfIdentity;
         _pdfBytes = persistentBytes;
 
@@ -235,8 +320,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _selectedTool = null;
 
         _pins.clear();
-        _redoPins.clear();
+        _undoPinEdits.clear();
+        _redoPinEdits.clear();
+        _pendingPhotoCleanupPinIds.clear();
         _photosByPinId.clear();
+        _photoStorageVerifiedPinIds.clear();
+        _photoStorageNeedsRescanPinIds.clear();
+        _photoSavesInProgressByPinId.clear();
         _strokesByPage.clear();
         _undoDrawingEditsByPage.clear();
         _redoDrawingEditsByPage.clear();
@@ -248,6 +338,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _activeEraserSourceIds = null;
         _activeEraserTouchedSourceIds = null;
         _activeEraserEditId = null;
+        _activeEraserAspectRatio = null;
+        _activeEraserBoundsCache = null;
+        _activeEraserSamplesCache = null;
 
         _nextPinNumber = 1;
         _selectedPinId = null;
@@ -259,6 +352,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
       await previousDocument?.close();
       await _renderPage(_currentPage);
+      if (!operationIsActive()) return;
 
       // PDF is written once. Later edits never rewrite this binary.
       await ProjectRepository.savePdfOnce(
@@ -266,6 +360,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         projectName: _projectName,
         bytes: persistentBytes,
       );
+      if (!operationIsActive()) return;
       _pinsDirty = true;
       _drawingsDirty = true;
       _metaDirty = true;
@@ -310,6 +405,30 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     _scheduleSave(pins: false, drawings: false, meta: true);
   }
 
+  void _discardPinRedoHistory() {
+    if (_redoPinEdits.isEmpty) return;
+    for (final _PinEdit edit in _redoPinEdits) {
+      if (edit.kind == _PinEditKind.add &&
+          !_pins.any((PinData pin) => pin.id == edit.pinId)) {
+        _pendingPhotoCleanupPinIds.add(edit.pinId);
+        _photosByPinId.remove(edit.pinId);
+        _photoStorageVerifiedPinIds.remove(edit.pinId);
+        _photoStorageNeedsRescanPinIds.remove(edit.pinId);
+        _photoSavesInProgressByPinId.remove(edit.pinId);
+      }
+    }
+    _redoPinEdits.clear();
+  }
+
+  void _recordPinEdit(_PinEdit edit) {
+    _discardPinRedoHistory();
+    _undoPinEdits.add(edit);
+  }
+
+  bool _samePinPosition(PinData first, PinData second) {
+    return first.xRatio == second.xRatio && first.yRatio == second.yRatio;
+  }
+
   void _addPin(Offset normalizedPosition) {
     if (_selectedTool != FieldTool.pin) {
       return;
@@ -326,7 +445,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     setState(() {
       _pins.add(pin);
-      _redoPins.clear();
+      _recordPinEdit(
+        _PinEdit(
+          kind: _PinEditKind.add,
+          pinId: pin.id,
+          index: _pins.length - 1,
+          after: pin,
+        ),
+      );
 
       _nextPinNumber++;
       _selectedPinId = pin.id;
@@ -351,16 +477,31 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     }
 
     final bool shouldOpenCamera = _captureAfterDirectionPinId == pin.id;
-    final PinData updatedPin = _pins[index].copyWith(
+    final PinData currentPin = _pins[index];
+    final PinData updatedPin = currentPin.copyWith(
       directionDegrees: directionDegrees,
     );
+    final bool directionChanged =
+        currentPin.directionDegrees != updatedPin.directionDegrees;
+    final PinData? gestureOriginal = _directionPinOriginal;
 
     setState(() {
       _pins[index] = updatedPin;
       _pendingDirectionPinId = null;
       _captureAfterDirectionPinId = null;
       _selectedPinId = updatedPin.id;
-      _redoPins.clear();
+      if (directionChanged &&
+          (gestureOriginal == null || gestureOriginal.id != updatedPin.id)) {
+        _recordPinEdit(
+          _PinEdit(
+            kind: _PinEditKind.direction,
+            pinId: updatedPin.id,
+            index: index,
+            before: currentPin,
+            after: updatedPin,
+          ),
+        );
+      }
     });
 
     _scheduleSave();
@@ -372,6 +513,44 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         }
       });
     }
+  }
+
+  void _startPinDirectionChange(PinData pin) {
+    if (_selectedTool != FieldTool.pin) return;
+    final int index = _pins.indexWhere((PinData item) => item.id == pin.id);
+    if (index < 0) return;
+    _directionPinOriginal = _pins[index];
+  }
+
+  void _finishPinDirectionChange(PinData pin) {
+    final PinData? original = _directionPinOriginal;
+    _directionPinOriginal = null;
+    if (original == null || original.id != pin.id) return;
+    final int index = _pins.indexWhere((PinData item) => item.id == pin.id);
+    if (index < 0) return;
+    final PinData current = _pins[index];
+    if (original.directionDegrees == current.directionDegrees) return;
+    setState(() {
+      _recordPinEdit(
+        _PinEdit(
+          kind: _PinEditKind.direction,
+          pinId: current.id,
+          index: index,
+          before: original,
+          after: current,
+        ),
+      );
+    });
+    _scheduleSave(pins: true, drawings: false, meta: true);
+  }
+
+  void _cancelPinDirectionChange(PinData pin) {
+    final PinData? original = _directionPinOriginal;
+    _directionPinOriginal = null;
+    if (original == null || original.id != pin.id) return;
+    final int index = _pins.indexWhere((PinData item) => item.id == pin.id);
+    if (index < 0) return;
+    setState(() => _pins[index] = original);
   }
 
   void _toggleSelectedPinDirectionEditing() {
@@ -400,10 +579,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       _movingPinOriginal = current;
       _selectedPinId = current.id;
       _pinColor = Color(current.colorValue);
-      _redoPins.clear();
       _setNoteController(current.note);
     });
-    unawaited(_ensurePhotosLoadedForPin(current));
+    unawaited(
+      _ensurePhotosLoadedForPin(current).then<void>((bool _) {}),
+    );
   }
 
   void _updatePinPosition(PinData pin, Offset normalizedPosition) {
@@ -419,8 +599,30 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   void _finishPinMove(PinData pin, Offset normalizedPosition) {
     _updatePinPosition(pin, normalizedPosition);
+    final PinData? original = _movingPinOriginal;
     _movingPinOriginal = null;
-    _scheduleSave(pins: true, drawings: false, meta: true);
+    final int index = _pins.indexWhere((PinData item) => item.id == pin.id);
+    bool changed = false;
+    if (original != null && index >= 0) {
+      final PinData current = _pins[index];
+      if (!_samePinPosition(original, current)) {
+        changed = true;
+        setState(() {
+          _recordPinEdit(
+            _PinEdit(
+              kind: _PinEditKind.move,
+              pinId: current.id,
+              index: index,
+              before: original,
+              after: current,
+            ),
+          );
+        });
+      }
+    }
+    if (changed) {
+      _scheduleSave(pins: true, drawings: false, meta: true);
+    }
   }
 
   void _cancelPinMove(PinData pin) {
@@ -434,6 +636,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   Future<void> _selectPin(PinData pin) async {
+    final int loadGeneration = ++_photoLoadGeneration;
     setState(() {
       if (_pendingDirectionPinId != pin.id) {
         _pendingDirectionPinId = null;
@@ -446,25 +649,52 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     try {
       final List<Map<String, dynamic>> rows =
-          await ProjectRepository.loadPhotosForPin(
+          await ProjectRepository.loadPhotoPreviewsForPin(
         projectId: widget.projectId,
         pinId: pin.id,
+        thumbnailBuilder: _makePhotoThumbnail,
       );
-      if (!mounted || _selectedPinId != pin.id) return;
+      if (!mounted ||
+          loadGeneration != _photoLoadGeneration ||
+          _selectedPinId != pin.id) {
+        return;
+      }
       final List<PhotoData> photos = rows
           .map((row) => PhotoData(
                 id: row['photoId'].toString(),
                 fileName: row['fileName']?.toString() ?? '001.jpg',
-                bytes: Uint8List.fromList(row['bytes'] as Uint8List),
+                bytes: row['bytes'] as Uint8List,
               ))
           .toList(growable: false);
+      bool countChanged = false;
       setState(() {
-        // Keep only the currently viewed pin's full-resolution images in RAM.
+        // Keep only lightweight previews for the currently viewed pin in RAM.
         _photosByPinId.clear();
         _photosByPinId[pin.id] = photos;
+        _photoStorageVerifiedPinIds.add(pin.id);
+        _photoStorageNeedsRescanPinIds.remove(pin.id);
+        final int pinIndex =
+            _pins.indexWhere((PinData item) => item.id == pin.id);
+        if (pinIndex >= 0 && _pins[pinIndex].photoCount != photos.length) {
+          final bool saveInProgress =
+              (_photoSavesInProgressByPinId[pin.id] ?? 0) > 0;
+          final int reconciledCount = saveInProgress
+              ? math.max(_pins[pinIndex].photoCount, photos.length)
+              : photos.length;
+          if (_pins[pinIndex].photoCount != reconciledCount) {
+            _pins[pinIndex] =
+                _pins[pinIndex].copyWith(photoCount: reconciledCount);
+            countChanged = true;
+          }
+        }
       });
+      if (countChanged) {
+        _scheduleSave(pins: true, drawings: false, meta: true);
+      }
     } catch (error) {
-      if (mounted) {
+      if (mounted &&
+          loadGeneration == _photoLoadGeneration &&
+          _selectedPinId == pin.id) {
         setState(() => _errorMessage = '写真を読み込めませんでした。\n$error');
       }
     }
@@ -505,6 +735,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return;
     }
 
+    if (_pins[index].note == controller.text) {
+      return;
+    }
+    _discardPinRedoHistory();
     _pins[index] = _pins[index].copyWith(
       note: controller.text,
     );
@@ -526,20 +760,31 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return;
     }
 
-    // Finish any older snapshot before changing pin numbers. This guarantees
-    // the photo folder belonging to the deleted pin is removed before the
-    // remaining folders are renumbered.
+    // Finish any older snapshot before changing pin numbers. The deletion
+    // itself is then committed through the durable cleanup transaction below.
     _saveSelectedPinNote();
     _saveDebounce?.cancel();
-    await _enqueueSave();
+    try {
+      await _enqueueSave();
+    } catch (_) {
+      // _saveProjectNow keeps the dirty flags and exposes the retry state. Do
+      // not remove the pin until the older state has been committed.
+      return;
+    }
     if (!mounted) return;
     final int latestIndex = _pins.indexWhere((pin) => pin.id == selectedId);
     if (latestIndex < 0) return;
 
     setState(() {
       _photosByPinId.remove(selectedId);
+      _photoStorageVerifiedPinIds.remove(selectedId);
+      _photoStorageNeedsRescanPinIds.remove(selectedId);
+      _photoSavesInProgressByPinId.remove(selectedId);
+      _discardPinRedoHistory();
+      _undoPinEdits.removeWhere((_PinEdit edit) => edit.pinId == selectedId);
+      _redoPinEdits.removeWhere((_PinEdit edit) => edit.pinId == selectedId);
       _pins.removeAt(latestIndex);
-      _redoPins.clear();
+      _pendingPhotoCleanupPinIds.add(selectedId);
 
       _renumberPins();
 
@@ -554,13 +799,19 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     _noteController?.dispose();
     _noteController = null;
-    await _enqueueStorageOperation<void>(
-      () => ProjectRepository.deletePhotosForPin(
-        projectId: widget.projectId,
-        pinId: selectedId,
-      ),
-    );
-    _scheduleSave(pins: true, drawings: false, meta: true);
+    _pinsDirty = true;
+    _metaDirty = true;
+    _pdfDirty = true;
+    try {
+      // _saveProjectNow first commits the pin-free snapshot together with the
+      // cleanup marker, then removes photos idempotently, and finally clears
+      // the marker in a second snapshot. A termination at any point therefore
+      // cannot resurrect a pin whose photos have already been deleted.
+      await _enqueueSave();
+    } catch (_) {
+      // The marker and dirty flags remain in memory and automatic retry is
+      // scheduled by _saveProjectNow.
+    }
   }
 
   void _startStroke(Offset normalizedPosition, double pressure) {
@@ -576,6 +827,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       };
       _activeEraserTouchedSourceIds = <String>{};
       _activeEraserEditId = DateTime.now().microsecondsSinceEpoch.toString();
+      _activeEraserAspectRatio = _pageAspectRatio;
+      _activeEraserBoundsCache = <String, Rect>{};
+      _activeEraserSamplesCache = <String, List<DrawingPoint>>{};
       _eraserFragmentSequence = 0;
       _eraseAt(normalizedPosition);
       return;
@@ -678,6 +932,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       _activeEraserSourceIds = null;
       _activeEraserTouchedSourceIds = null;
       _activeEraserEditId = null;
+      _activeEraserAspectRatio = null;
+      _activeEraserBoundsCache = null;
+      _activeEraserSamplesCache = null;
       if (changed) {
         _scheduleSave(pins: false, drawings: true, meta: true);
       }
@@ -755,7 +1012,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return (_undoDrawingEditsByPage[_currentPage]?.isNotEmpty ?? false) ||
           (_strokesByPage[_currentPage]?.isNotEmpty ?? false);
     }
-    return _pins.isNotEmpty;
+    return _undoPinEdits.isNotEmpty;
   }
 
   bool get _canRedoCurrentTool {
@@ -763,7 +1020,26 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (_selectedTool == FieldTool.pen) {
       return (_redoDrawingEditsByPage[_currentPage]?.isNotEmpty ?? false);
     }
-    return _redoPins.isNotEmpty;
+    return _redoPinEdits.isNotEmpty;
+  }
+
+  PinData _applyPinEditValue(
+    PinData current,
+    _PinEdit edit, {
+    required bool redo,
+  }) {
+    final PinData? value = redo ? edit.after : edit.before;
+    if (value == null) return current;
+    return switch (edit.kind) {
+      _PinEditKind.move => current.copyWith(
+          xRatio: value.xRatio,
+          yRatio: value.yRatio,
+        ),
+      _PinEditKind.direction => current.copyWith(
+          directionDegrees: value.directionDegrees,
+        ),
+      _PinEditKind.add => value,
+    };
   }
 
   void _undo() {
@@ -802,32 +1078,46 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return;
     }
 
-    if (_pins.isEmpty) {
+    if (_undoPinEdits.isEmpty) {
       return;
     }
 
-    final PinData removedPin = _pins.last;
+    _PinEdit edit = _undoPinEdits.removeLast();
 
     setState(() {
-      _pins.removeLast();
-      _redoPins.add(removedPin);
-
-      if (_pendingDirectionPinId == removedPin.id) {
-        _pendingDirectionPinId = null;
+      if (edit.kind == _PinEditKind.add) {
+        final int index =
+            _pins.indexWhere((PinData pin) => pin.id == edit.pinId);
+        if (index >= 0) {
+          final PinData removedPin = _pins.removeAt(index);
+          edit = edit.copyWith(after: removedPin);
+          if (_pendingDirectionPinId == removedPin.id) {
+            _pendingDirectionPinId = null;
+          }
+          if (_captureAfterDirectionPinId == removedPin.id) {
+            _captureAfterDirectionPinId = null;
+          }
+          if (_selectedPinId == removedPin.id) {
+            _selectedPinId = null;
+            _noteController?.dispose();
+            _noteController = null;
+          }
+          _renumberPins();
+        }
+      } else {
+        final int index =
+            _pins.indexWhere((PinData pin) => pin.id == edit.pinId);
+        if (index >= 0) {
+          _pins[index] = _applyPinEditValue(
+            _pins[index],
+            edit,
+            redo: false,
+          );
+        }
       }
-      if (_captureAfterDirectionPinId == removedPin.id) {
-        _captureAfterDirectionPinId = null;
-      }
-
-      if (_selectedPinId == removedPin.id) {
-        _selectedPinId = null;
-        _noteController?.dispose();
-        _noteController = null;
-      }
-
-      _renumberPins();
+      _redoPinEdits.add(edit);
     });
-    _scheduleSave();
+    _scheduleSave(pins: true, drawings: false, meta: true);
   }
 
   void _redo() {
@@ -848,22 +1138,31 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return;
     }
 
-    if (_redoPins.isEmpty) {
+    if (_redoPinEdits.isEmpty) {
       return;
     }
 
-    final PinData restoredPin = _redoPins.removeLast();
+    final _PinEdit edit = _redoPinEdits.removeLast();
 
     setState(() {
-      _pins.add(
-        restoredPin.copyWith(
-          number: _nextPinNumber,
-        ),
-      );
-
-      _nextPinNumber++;
+      if (edit.kind == _PinEditKind.add && edit.after != null) {
+        final int insertionIndex = edit.index.clamp(0, _pins.length);
+        _pins.insert(insertionIndex, edit.after!);
+        _renumberPins();
+      } else {
+        final int index =
+            _pins.indexWhere((PinData pin) => pin.id == edit.pinId);
+        if (index >= 0) {
+          _pins[index] = _applyPinEditValue(
+            _pins[index],
+            edit,
+            redo: true,
+          );
+        }
+      }
+      _undoPinEdits.add(edit);
     });
-    _scheduleSave();
+    _scheduleSave(pins: true, drawings: false, meta: true);
   }
 
   void _renumberPins() {
@@ -892,8 +1191,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   Future<void> _capturePhotosForPin(PinData pin) async {
-    await _ensurePhotosLoadedForPin(pin);
-    if (!mounted) return;
+    final bool photosReady = await _ensurePhotosLoadedForPin(pin);
+    if (!photosReady || !mounted || _selectedPinId != pin.id) return;
 
     final int currentIndex = _pins.indexWhere((item) => item.id == pin.id);
     if (currentIndex < 0) return;
@@ -914,6 +1213,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         ),
       ),
     );
+    if (!mounted) return;
+    final int latestPinIndex =
+        _pins.indexWhere((PinData item) => item.id == pin.id);
+    if (latestPinIndex >= 0) {
+      await _ensurePhotosLoadedForPin(_pins[latestPinIndex]);
+    }
   }
 
   PhotoBoardConfig _photoBoardConfigFor(PinData pin) {
@@ -937,6 +1242,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (pinIndex < 0 || !mounted) return;
 
     setState(() {
+      _discardPinRedoHistory();
       _boardBusinessName = config.businessName;
       _boardFacilityName = config.facilityName;
       _pins[pinIndex] = _pins[pinIndex].copyWith(
@@ -955,43 +1261,73 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     _scheduleSave(pins: true, drawings: false, meta: true);
   }
 
-  Future<void> _ensurePhotosLoadedForPin(PinData pin) async {
+  Future<bool> _ensurePhotosLoadedForPin(PinData pin) async {
+    final int loadGeneration = ++_photoLoadGeneration;
     final List<PhotoData>? cached = _photosByPinId[pin.id];
-    if (pin.photoCount == 0) {
-      _photosByPinId.clear();
-      _photosByPinId[pin.id] = <PhotoData>[];
-      return;
-    }
-    if (cached != null && cached.length >= pin.photoCount) {
-      return;
+    if (!_photoStorageNeedsRescanPinIds.contains(pin.id) &&
+        _photoStorageVerifiedPinIds.contains(pin.id) &&
+        cached != null &&
+        cached.length >= pin.photoCount) {
+      return mounted &&
+          loadGeneration == _photoLoadGeneration &&
+          _selectedPinId == pin.id;
     }
 
     try {
       final List<Map<String, dynamic>> rows =
-          await ProjectRepository.loadPhotosForPin(
+          await ProjectRepository.loadPhotoPreviewsForPin(
         projectId: widget.projectId,
         pinId: pin.id,
+        thumbnailBuilder: _makePhotoThumbnail,
       );
-      if (!mounted) return;
+      if (!mounted ||
+          loadGeneration != _photoLoadGeneration ||
+          _selectedPinId != pin.id) {
+        return false;
+      }
       final List<PhotoData> photos = rows
           .map(
             (row) => PhotoData(
               id: row['photoId'].toString(),
               fileName: row['fileName']?.toString() ?? '001.jpg',
-              bytes: Uint8List.fromList(row['bytes'] as Uint8List),
+              bytes: row['bytes'] as Uint8List,
             ),
           )
           .toList(growable: true);
+      bool countChanged = false;
       setState(() {
         _photosByPinId.clear();
         _photosByPinId[pin.id] = photos;
+        _photoStorageVerifiedPinIds.add(pin.id);
+        _photoStorageNeedsRescanPinIds.remove(pin.id);
+        final int pinIndex =
+            _pins.indexWhere((PinData item) => item.id == pin.id);
+        if (pinIndex >= 0 && _pins[pinIndex].photoCount != photos.length) {
+          final bool saveInProgress =
+              (_photoSavesInProgressByPinId[pin.id] ?? 0) > 0;
+          final int reconciledCount = saveInProgress
+              ? math.max(_pins[pinIndex].photoCount, photos.length)
+              : photos.length;
+          if (_pins[pinIndex].photoCount != reconciledCount) {
+            _pins[pinIndex] =
+                _pins[pinIndex].copyWith(photoCount: reconciledCount);
+            countChanged = true;
+          }
+        }
       });
+      if (countChanged) {
+        _scheduleSave(pins: true, drawings: false, meta: true);
+      }
+      return true;
     } catch (error) {
-      if (mounted) {
+      if (mounted &&
+          loadGeneration == _photoLoadGeneration &&
+          _selectedPinId == pin.id) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('直前の写真を読み込めませんでした：$error')),
         );
       }
+      return false;
     }
   }
 
@@ -1002,22 +1338,37 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     );
     try {
       final ui.FrameInfo frame = await codec.getNextFrame();
-      final ByteData? data =
-          await frame.image.toByteData(format: ui.ImageByteFormat.png);
-      frame.image.dispose();
-      return data?.buffer.asUint8List() ?? Uint8List.fromList(bytes);
+      try {
+        final ByteData? data =
+            await frame.image.toByteData(format: ui.ImageByteFormat.png);
+        if (data == null) return _unavailablePhotoPreviewBytes;
+        return data.buffer.asUint8List(
+          data.offsetInBytes,
+          data.lengthInBytes,
+        );
+      } finally {
+        frame.image.dispose();
+      }
     } finally {
       codec.dispose();
     }
   }
 
   Future<PhotoData?> _saveCapturedPhoto(PinData pin, Uint8List bytes) async {
-    final int pinIndex = _pins.indexWhere((item) => item.id == pin.id);
+    int pinIndex = _pins.indexWhere((item) => item.id == pin.id);
     if (pinIndex < 0) return null;
-    final int? backgroundTask =
-        await NativeProjectService.beginBackgroundSave('写真を保存');
+    if (_photoStorageNeedsRescanPinIds.contains(pin.id)) {
+      final bool photosReady = await _ensurePhotosLoadedForPin(_pins[pinIndex]);
+      if (!photosReady || !mounted) return null;
+      pinIndex = _pins.indexWhere((PinData item) => item.id == pin.id);
+      if (pinIndex < 0) return null;
+    }
+    _photoSavesInProgressByPinId[pin.id] =
+        (_photoSavesInProgressByPinId[pin.id] ?? 0) + 1;
+    int? backgroundTask;
 
     try {
+      backgroundTask = await NativeProjectService.beginBackgroundSave('写真を保存');
       final List<PhotoData> existing = List<PhotoData>.from(
         _photosByPinId[pin.id] ?? const <PhotoData>[],
       );
@@ -1027,7 +1378,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       final String photoId =
           '${pin.id}-$photoNumber-${DateTime.now().microsecondsSinceEpoch}';
       final Uint8List thumbnailBytes = await _makePhotoThumbnail(bytes);
-      await _enqueueStorageOperation<void>(
+      final String storedFileName = await _enqueueStorageOperation<String>(
         () => ProjectRepository.savePhoto(
           projectId: widget.projectId,
           projectName: _projectName,
@@ -1041,7 +1392,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       );
       final PhotoData savedPhoto = PhotoData(
         id: photoId,
-        fileName: fileName,
+        fileName: storedFileName,
         bytes: thumbnailBytes,
       );
       existing.add(savedPhoto);
@@ -1053,18 +1404,34 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _selectedPinId = pin.id;
         _photosByPinId.clear();
         _photosByPinId[pin.id] = existing;
+        if (!_photoStorageNeedsRescanPinIds.contains(pin.id)) {
+          _photoStorageVerifiedPinIds.add(pin.id);
+        }
         final int nextCount = math.max(
           _pins[latestPinIndex].photoCount + 1,
           existing.length,
         );
         _pins[latestPinIndex] =
             _pins[latestPinIndex].copyWith(photoCount: nextCount);
-        _redoPins.clear();
+        _discardPinRedoHistory();
         _setNoteController(_pins[latestPinIndex].note);
       });
       _scheduleSave(pins: true, drawings: false, meta: true);
       return savedPhoto;
+    } catch (_) {
+      // savePhoto writes the JPEG before updating its manifest. On a manifest
+      // failure, force the next camera exit/entry to scan the folder so the
+      // committed JPEG is recovered and counted.
+      _photoStorageVerifiedPinIds.remove(pin.id);
+      _photoStorageNeedsRescanPinIds.add(pin.id);
+      rethrow;
     } finally {
+      final int remaining = (_photoSavesInProgressByPinId[pin.id] ?? 1) - 1;
+      if (remaining > 0) {
+        _photoSavesInProgressByPinId[pin.id] = remaining;
+      } else {
+        _photoSavesInProgressByPinId.remove(pin.id);
+      }
       await NativeProjectService.endBackgroundSave(backgroundTask);
     }
   }
@@ -1172,23 +1539,28 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         .toList();
   }
 
-  Future<void> _renderPage(int pageNumber) async {
+  Future<bool> _renderPage(
+    int pageNumber, {
+    bool commitPage = false,
+  }) async {
     final pdfx.PdfDocument? document = _pdfDocument;
     if (document == null ||
         pageNumber < 1 ||
         pageNumber > document.pagesCount) {
-      return;
+      return false;
     }
 
+    final int requestSequence = ++_renderRequestSequence;
     setState(() {
       _isRenderingPage = true;
+      _pageImageBytes = null;
+      _failedRenderPage = null;
       _errorMessage = null;
     });
 
     pdfx.PdfPage? page;
     try {
       page = await document.getPage(pageNumber);
-      final double aspectRatio = page.width / page.height;
       const double renderScale = 2.0;
       final pdfx.PdfPageImage? image = await page.render(
         width: page.width * renderScale,
@@ -1197,26 +1569,52 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         backgroundColor: '#FFFFFF',
       );
 
-      if (!mounted || image == null) {
-        return;
+      if (image == null) {
+        throw StateError('$pageNumberページ目の画像データが空です。');
+      }
+      if (!mounted || requestSequence != _renderRequestSequence) {
+        return false;
+      }
+      final ui.Image decodedPageImage = await _decodeUiImage(image.bytes);
+      final double aspectRatio;
+      try {
+        aspectRatio = decodedPageImage.width / decodedPageImage.height;
+      } finally {
+        decodedPageImage.dispose();
+      }
+      if (!mounted || requestSequence != _renderRequestSequence) {
+        return false;
       }
 
       _transformationController.value = Matrix4.identity();
       setState(() {
+        if (commitPage) {
+          _currentPage = pageNumber;
+        }
         _pageImageBytes = image.bytes;
         _pageAspectRatio = aspectRatio;
         _isRenderingPage = false;
+        _failedRenderPage = null;
       });
+      return true;
     } catch (error) {
-      if (!mounted) {
-        return;
+      if (!mounted || requestSequence != _renderRequestSequence) {
+        return false;
       }
       setState(() {
+        _pageImageBytes = null;
         _isRenderingPage = false;
+        _failedRenderPage = pageNumber;
         _errorMessage = 'PDFページを表示できませんでした。\n$error';
       });
+      return false;
     } finally {
       await page?.close();
+      if (mounted &&
+          requestSequence == _renderRequestSequence &&
+          _isRenderingPage) {
+        setState(() => _isRenderingPage = false);
+      }
     }
   }
 
@@ -1235,14 +1633,28 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     _noteController = null;
 
     setState(() {
-      _currentPage = pageNumber;
       _selectedPinId = null;
       _pendingDirectionPinId = null;
       _captureAfterDirectionPinId = null;
     });
 
-    _scheduleSave();
-    await _renderPage(pageNumber);
+    final bool rendered = await _renderPage(pageNumber, commitPage: true);
+    if (rendered) {
+      _scheduleSave(pins: false, drawings: false, meta: true);
+    }
+  }
+
+  Future<void> _retryFailedPageRender() async {
+    final int? pageNumber = _failedRenderPage;
+    if (pageNumber == null || _isRenderingPage) return;
+    final bool commitPage = pageNumber != _currentPage;
+    final bool rendered = await _renderPage(
+      pageNumber,
+      commitPage: commitPage,
+    );
+    if (rendered && commitPage) {
+      _scheduleSave(pins: false, drawings: false, meta: true);
+    }
   }
 
   String _threeDigits(int value) => value.toString().padLeft(3, '0');
@@ -1376,23 +1788,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       final Canvas canvas = Canvas(recorder);
       canvas.drawImage(background, Offset.zero, Paint());
 
-      for (final DrawingStroke stroke
-          in _strokesByPage[pageNumber] ?? const <DrawingStroke>[]) {
-        if (stroke.points.length < 2) continue;
-        final Paint paint = Paint()
-          ..color = stroke.color
-          ..style = PaintingStyle.stroke
-          ..strokeCap = StrokeCap.round
-          ..strokeJoin = StrokeJoin.round
-          ..strokeWidth = stroke.width * exportScale;
-        final Path path = Path();
-        final DrawingPoint first = stroke.points.first;
-        path.moveTo(first.position.dx * width, first.position.dy * height);
-        for (final DrawingPoint point in stroke.points.skip(1)) {
-          path.lineTo(point.position.dx * width, point.position.dy * height);
-        }
-        canvas.drawPath(path, paint);
-      }
+      paintDrawingStrokes(
+        canvas,
+        Size(width, height),
+        _strokesByPage[pageNumber] ?? const <DrawingStroke>[],
+        widthScale: exportScale,
+      );
 
       final List<PinData> pagePins = _pins
           .where((pin) => pin.pageNumber == pageNumber)
@@ -1445,6 +1846,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   Future<void> _exportProject() async {
     if (_pdfDocument == null || _isExporting) return;
+    ProjectExportZipSink? zipSink;
     _endStroke();
     _saveSelectedPinNote();
     setState(() {
@@ -1455,61 +1857,102 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     try {
       _saveDebounce?.cancel();
       await _enqueueSave();
-      final Uint8List pdfBytes;
-      if (NativeProjectService.isAvailable) {
-        final Uint8List? output =
-            await ProjectRepository.loadOutputPdf(widget.projectId);
-        if (output == null || output.isEmpty) {
-          throw StateError('書き出し用PDFが見つかりません。');
-        }
-        pdfBytes = output;
-      } else {
-        pdfBytes = await _buildAnnotatedPdf();
-      }
       final String baseName = _safeProjectFileName();
-      final Archive archive = Archive();
-      archive.addFile(
-        ArchiveFile.bytes('$baseName.pdf', pdfBytes),
-      );
+      // Write entries incrementally. The previous Archive-based implementation
+      // retained every full-resolution photo and then allocated the ZIP beside
+      // them. PDF and JPEG data are already compressed, so storing them avoids
+      // a second large temporary deflate buffer for each entry.
+      zipSink = await ProjectExportZipSink.create();
+      final ZipEncoder zipEncoder = ZipEncoder()..startEncode(zipSink.output);
+      {
+        final Uint8List pdfBytes;
+        if (NativeProjectService.isAvailable) {
+          final Uint8List? output =
+              await ProjectRepository.loadOutputPdf(widget.projectId);
+          if (output == null || output.isEmpty) {
+            throw StateError('書き出し用PDFが見つかりません。');
+          }
+          pdfBytes = output;
+        } else {
+          pdfBytes = await _buildAnnotatedPdf();
+        }
+        zipEncoder.add(
+          ArchiveFile.noCompress('$baseName.pdf', pdfBytes.length, pdfBytes),
+          autoClose: true,
+        );
+      }
 
+      final List<Map<String, dynamic>> photoMetadata =
+          await ProjectRepository.loadPhotoMetadata(widget.projectId);
+      final Map<String, List<Map<String, dynamic>>> photoMetadataByPin =
+          <String, List<Map<String, dynamic>>>{};
+      for (final Map<String, dynamic> record in photoMetadata) {
+        final String pinId = record['pinId']?.toString() ?? '';
+        if (pinId.isEmpty) continue;
+        photoMetadataByPin
+            .putIfAbsent(pinId, () => <Map<String, dynamic>>[])
+            .add(record);
+      }
       final List<PinData> sortedPins = List<PinData>.from(_pins)
         ..sort((a, b) => a.number.compareTo(b.number));
+      final Map<String, PinData> pinsById = <String, PinData>{
+        for (final PinData pin in sortedPins) pin.id: pin,
+      };
+      final List<Map<String, dynamic>> exportPhotos = <Map<String, dynamic>>[];
       for (final PinData pin in sortedPins) {
-        final String folder = _threeDigits(pin.number);
         final List<Map<String, dynamic>> storedPhotos =
-            await ProjectRepository.loadPhotosForPin(
-          projectId: widget.projectId,
-          pinId: pin.id,
-        );
-        final List<PhotoData> photos = storedPhotos
-            .map((row) => PhotoData(
-                  id: row['photoId'].toString(),
-                  fileName: row['fileName']?.toString() ?? '001.jpg',
-                  bytes: row['bytes'] as Uint8List,
-                ))
-            .toList(growable: false);
-        if (photos.isEmpty) {
-          archive.addFile(ArchiveFile.directory('写真/$folder/'));
-          continue;
+            photoMetadataByPin[pin.id] ?? const <Map<String, dynamic>>[];
+        for (final Map<String, dynamic> storedPhoto in storedPhotos) {
+          final String photoId = storedPhoto['photoId']?.toString() ?? '';
+          final int? storedPinNumber =
+              (storedPhoto['pinNumber'] as num?)?.toInt();
+          final String storedFileName =
+              storedPhoto['fileName']?.toString() ?? '';
+          if (photoId.isEmpty ||
+              storedPinNumber == null ||
+              storedFileName.isEmpty) {
+            continue;
+          }
+          exportPhotos.add(storedPhoto);
         }
-        for (int index = 0; index < photos.length; index++) {
-          final String photoName = _threeDigits(index + 1);
-          archive.addFile(
-            ArchiveFile.bytes(
-              '写真/$folder/$photoName.jpg',
-              photos[index].bytes,
+      }
+
+      final Map<String, int> exportedPhotoCounts = <String, int>{};
+      await ProjectRepository.visitPhotoBytes(
+        projectId: widget.projectId,
+        photos: exportPhotos,
+        visitor: (
+          int _,
+          Map<String, dynamic> storedPhoto,
+          Uint8List photoBytes,
+        ) async {
+          final String pinId = storedPhoto['pinId']?.toString() ?? '';
+          final PinData? pin = pinsById[pinId];
+          if (pin == null || photoBytes.isEmpty) return;
+          final int photoCount = (exportedPhotoCounts[pinId] ?? 0) + 1;
+          exportedPhotoCounts[pinId] = photoCount;
+          zipEncoder.add(
+            ArchiveFile.noCompress(
+              '写真/${_threeDigits(pin.number)}/'
+              '${_threeDigits(photoCount)}.jpg',
+              photoBytes.length,
+              photoBytes,
             ),
+            autoClose: true,
+          );
+        },
+      );
+      for (final PinData pin in sortedPins) {
+        if ((exportedPhotoCounts[pin.id] ?? 0) == 0) {
+          zipEncoder.add(
+            ArchiveFile.directory('写真/${_threeDigits(pin.number)}/'),
+            autoClose: true,
           );
         }
       }
 
-      final Uint8List zipBytes = ZipEncoder().encodeBytes(archive);
-      await FileSaver.instance.saveFile(
-        name: baseName,
-        bytes: zipBytes,
-        fileExtension: 'zip',
-        mimeType: MimeType.zip,
-      );
+      zipEncoder.endEncode();
+      await zipSink.save(baseName);
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1521,10 +1964,20 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _errorMessage = '書き出しに失敗しました。\n$error';
       });
     } finally {
-      if (mounted) {
-        setState(() {
-          _isExporting = false;
-        });
+      try {
+        await zipSink?.dispose();
+      } catch (error) {
+        if (mounted && _errorMessage == null) {
+          setState(() {
+            _errorMessage = '書き出し用の一時ファイルを削除できませんでした。\n$error';
+          });
+        }
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isExporting = false;
+          });
+        }
       }
     }
   }
@@ -1540,9 +1993,37 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     _metaDirty = _metaDirty || meta;
     _pdfDirty = _pdfDirty || pins || drawings;
     _saveDebounce?.cancel();
+    if (mounted) {
+      setState(() {});
+    }
     // A short idle delay lets users write multi-stroke characters without a
     // database transaction being started after every single stroke.
     _saveDebounce = Timer(const Duration(milliseconds: 900), () {
+      _saveDebounce = null;
+      if (mounted) {
+        setState(() {});
+      }
+      _enqueueSaveInBackground();
+    });
+  }
+
+  bool get _hasPendingSave {
+    return _pinsDirty ||
+        _drawingsDirty ||
+        _metaDirty ||
+        _pdfDirty ||
+        _pendingPhotoCleanupPinIds.isNotEmpty ||
+        (_saveDebounce?.isActive ?? false);
+  }
+
+  void _scheduleAutomaticSaveRetry() {
+    if (!mounted || (_saveRetryTimer?.isActive ?? false)) return;
+    final int seconds = math.min(2 << _saveRetryAttempt.clamp(0, 3), 16);
+    _saveRetryAttempt++;
+    _saveRetryTimer = Timer(Duration(seconds: seconds), () {
+      _saveRetryTimer = null;
+      if (!mounted) return;
+      setState(() {});
       _enqueueSaveInBackground();
     });
   }
@@ -1570,26 +2051,92 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     return result;
   }
 
-  List<Map<String, dynamic>> _serializePins() => _pins
-      .map((p) => {
-            'id': p.id,
-            'number': p.number,
-            'pageNumber': p.pageNumber,
-            'xRatio': p.xRatio,
-            'yRatio': p.yRatio,
-            'directionDegrees': p.directionDegrees,
-            'photoCount': p.photoCount,
-            'note': p.note,
-            'colorValue': p.colorValue,
-            'boardEnabled': p.boardEnabled,
-            'boardTemplateId': p.boardTemplateId,
-            'boardShootingLocation': p.boardShootingLocation,
-            'boardCoreStep': p.boardCoreStep,
-            'boardChippingStep': p.boardChippingStep,
-            'boardAsbestosStep': p.boardAsbestosStep,
-            'boardPositionId': p.boardPositionId,
-          })
+  Map<String, dynamic> _serializePin(PinData pin) => <String, dynamic>{
+        'id': pin.id,
+        'number': pin.number,
+        'pageNumber': pin.pageNumber,
+        'xRatio': pin.xRatio,
+        'yRatio': pin.yRatio,
+        'directionDegrees': pin.directionDegrees,
+        'photoCount': pin.photoCount,
+        'note': pin.note,
+        'colorValue': pin.colorValue,
+        'boardEnabled': pin.boardEnabled,
+        'boardTemplateId': pin.boardTemplateId,
+        'boardShootingLocation': pin.boardShootingLocation,
+        'boardCoreStep': pin.boardCoreStep,
+        'boardChippingStep': pin.boardChippingStep,
+        'boardAsbestosStep': pin.boardAsbestosStep,
+        'boardPositionId': pin.boardPositionId,
+      };
+
+  List<Map<String, dynamic>> _serializePins() =>
+      _pins.map(_serializePin).toList(growable: false);
+
+  List<Map<String, dynamic>> _serializePinRedoHistory() => _redoPinEdits
+      .map(
+        (_PinEdit edit) => <String, dynamic>{
+          'kind': edit.kind.name,
+          'pinId': edit.pinId,
+          'index': edit.index,
+          if (edit.before != null) 'before': _serializePin(edit.before!),
+          if (edit.after != null) 'after': _serializePin(edit.after!),
+        },
+      )
       .toList(growable: false);
+
+  PinData? _deserializePin(dynamic raw) {
+    if (raw is! Map) return null;
+    final Map<String, dynamic> map =
+        raw.map((dynamic key, dynamic value) => MapEntry('$key', value));
+    final String id = map['id']?.toString() ?? '';
+    if (id.isEmpty) return null;
+    return PinData(
+      id: id,
+      number: (map['number'] as num?)?.toInt() ?? 1,
+      pageNumber: (map['pageNumber'] as num?)?.toInt() ?? 1,
+      xRatio: (map['xRatio'] as num?)?.toDouble() ?? 0,
+      yRatio: (map['yRatio'] as num?)?.toDouble() ?? 0,
+      directionDegrees: (map['directionDegrees'] as num?)?.toDouble() ?? 0,
+      photoCount: (map['photoCount'] as num?)?.toInt() ?? 0,
+      note: map['note']?.toString() ?? '',
+      colorValue: (map['colorValue'] as num?)?.toInt() ?? 0xFF1976D2,
+      boardEnabled: map['boardEnabled'] == true,
+      boardTemplateId: map['boardTemplateId']?.toString() ?? 'core',
+      boardShootingLocation: map['boardShootingLocation']?.toString() ?? '',
+      boardCoreStep: ((map['boardCoreStep'] as num?)?.toInt() ?? 0).clamp(0, 5),
+      boardChippingStep:
+          ((map['boardChippingStep'] as num?)?.toInt() ?? 0).clamp(0, 5),
+      boardAsbestosStep:
+          ((map['boardAsbestosStep'] as num?)?.toInt() ?? 0).clamp(0, 5),
+      boardPositionId: map['boardPositionId']?.toString() ?? 'bottomLeft',
+    );
+  }
+
+  List<_PinEdit> _deserializePinRedoHistory(dynamic raw) {
+    if (raw is! List) return <_PinEdit>[];
+    final List<_PinEdit> edits = <_PinEdit>[];
+    for (final dynamic item in raw) {
+      if (item is! Map) continue;
+      final Map<String, dynamic> map =
+          item.map((dynamic key, dynamic value) => MapEntry('$key', value));
+      final int kindIndex = _PinEditKind.values.indexWhere(
+        (_PinEditKind kind) => kind.name == map['kind']?.toString(),
+      );
+      final String pinId = map['pinId']?.toString() ?? '';
+      if (kindIndex < 0 || pinId.isEmpty) continue;
+      edits.add(
+        _PinEdit(
+          kind: _PinEditKind.values[kindIndex],
+          pinId: pinId,
+          index: (map['index'] as num?)?.toInt() ?? 0,
+          before: _deserializePin(map['before']),
+          after: _deserializePin(map['after']),
+        ),
+      );
+    }
+    return edits;
+  }
 
   List<Map<String, dynamic>> _serializeStrokes() => _strokesByPage.entries
       .expand((e) => e.value)
@@ -1608,6 +2155,23 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           })
       .toList(growable: false);
 
+  Map<String, dynamic> _projectMetadata() => <String, dynamic>{
+        'pdfName': '$_projectName.pdf',
+        'pageCount': _pageCount,
+        'currentPage': _currentPage,
+        'nextPinNumber': _nextPinNumber,
+        'pinColor': _pinColor.toARGB32(),
+        'penColor': _penColor.toARGB32(),
+        'penWidth': _penWidth,
+        'boardBusinessName': _boardBusinessName,
+        'boardFacilityName': _boardFacilityName,
+        'pendingDirectionPinId': _pendingDirectionPinId,
+        'captureAfterDirectionPinId': _captureAfterDirectionPinId,
+        'pinRedoHistory': _serializePinRedoHistory(),
+        'pendingPhotoCleanupPinIds':
+            _pendingPhotoCleanupPinIds.toList(growable: false),
+      };
+
   Future<void> _saveProjectNow() async {
     if (_isRestoring || _pdfBytes == null) return;
 
@@ -1615,7 +2179,15 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     final bool saveDrawings = _drawingsDirty;
     final bool saveMeta = _metaDirty;
     final bool savePdf = _pdfDirty;
-    if (!savePins && !saveDrawings && !saveMeta && !savePdf) return;
+    final Set<String> cleanupPinIds =
+        Set<String>.of(_pendingPhotoCleanupPinIds);
+    if (!savePins &&
+        !saveDrawings &&
+        !saveMeta &&
+        !savePdf &&
+        cleanupPinIds.isEmpty) {
+      return;
+    }
 
     // Clear before awaiting. New edits made during the write set the flags again
     // and are handled by the next queued save.
@@ -1624,31 +2196,27 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     _metaDirty = false;
     _pdfDirty = false;
 
-    if (mounted) setState(() => _saveInProgress = true);
-    final int? backgroundTask =
-        await NativeProjectService.beginBackgroundSave('案件を保存');
+    if (mounted) {
+      setState(() => _saveInProgress = true);
+    }
+    int? backgroundTask;
     try {
+      backgroundTask = await NativeProjectService.beginBackgroundSave('案件を保存');
       final List<Map<String, dynamic>> pins = _serializePins();
       final List<Map<String, dynamic>> strokes = _serializeStrokes();
-      await ProjectRepository.saveProjectSnapshot(
-        projectId: widget.projectId,
-        projectName: _projectName,
-        metadata: <String, dynamic>{
-          'pdfName': '$_projectName.pdf',
-          'pageCount': _pageCount,
-          'currentPage': _currentPage,
-          'nextPinNumber': _nextPinNumber,
-          'pinColor': _pinColor.toARGB32(),
-          'penColor': _penColor.toARGB32(),
-          'penWidth': _penWidth,
-          'boardBusinessName': _boardBusinessName,
-          'boardFacilityName': _boardFacilityName,
-          'pendingDirectionPinId': _pendingDirectionPinId,
-          'captureAfterDirectionPinId': _captureAfterDirectionPinId,
-        },
-        pins: pins,
-        strokes: strokes,
-      );
+      if (savePins ||
+          saveDrawings ||
+          saveMeta ||
+          savePdf ||
+          cleanupPinIds.isNotEmpty) {
+        await ProjectRepository.saveProjectSnapshot(
+          projectId: widget.projectId,
+          projectName: _projectName,
+          metadata: _projectMetadata(),
+          pins: pins,
+          strokes: strokes,
+        );
+      }
       if (savePdf && NativeProjectService.isAvailable) {
         final String? sourcePath =
             await ProjectRepository.sourcePdfPath(widget.projectId);
@@ -1664,7 +2232,38 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           strokes: strokes,
         );
       }
-      if (mounted) setState(() => _errorMessage = null);
+      for (final String pinId in cleanupPinIds) {
+        await ProjectRepository.deletePhotosForPin(
+          projectId: widget.projectId,
+          pinId: pinId,
+        );
+      }
+      if (cleanupPinIds.isNotEmpty) {
+        // Clear the durable cleanup marker only after every photo folder was
+        // removed. If the app is terminated between these two snapshots, the
+        // next launch safely retries the idempotent cleanup.
+        final Set<String> remainingCleanupPinIds =
+            Set<String>.of(_pendingPhotoCleanupPinIds)
+              ..removeAll(cleanupPinIds);
+        await ProjectRepository.saveProjectSnapshot(
+          projectId: widget.projectId,
+          projectName: _projectName,
+          metadata: <String, dynamic>{
+            ..._projectMetadata(),
+            'pendingPhotoCleanupPinIds':
+                remainingCleanupPinIds.toList(growable: false),
+          },
+          pins: _serializePins(),
+          strokes: _serializeStrokes(),
+        );
+        _pendingPhotoCleanupPinIds.removeAll(cleanupPinIds);
+      }
+      _saveRetryTimer?.cancel();
+      _saveRetryTimer = null;
+      _saveRetryAttempt = 0;
+      if (mounted) {
+        setState(() => _saveErrorMessage = null);
+      }
     } catch (error) {
       // Restore dirty flags so a retry does not lose pending edits.
       _pinsDirty = _pinsDirty || savePins;
@@ -1673,13 +2272,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       _pdfDirty = _pdfDirty || savePdf;
       if (mounted) {
         setState(() {
-          _errorMessage = '案件の保存に失敗しました。再試行します。\n$error';
+          _saveErrorMessage = '案件の保存に失敗しました。\n$error';
         });
+        _scheduleAutomaticSaveRetry();
       }
       rethrow;
     } finally {
       await NativeProjectService.endBackgroundSave(backgroundTask);
-      if (mounted) setState(() => _saveInProgress = false);
+      if (mounted) {
+        setState(() => _saveInProgress = false);
+      }
     }
   }
 
@@ -1689,6 +2291,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     try {
       final String? sourcePath =
           await ProjectRepository.sourcePdfPath(widget.projectId);
+      if (!mounted) return;
       if (sourcePath != null) {
         try {
           await NativeProjectService.synchronizePencilDrawings(sourcePath);
@@ -1696,7 +2299,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           pencilRecoveryError = error;
         }
       }
+      if (!mounted) return;
       final data = await ProjectRepository.loadProject(widget.projectId);
+      if (!mounted) return;
       if (data == null) {
         if (mounted) setState(() => _errorMessage = '案件データが見つかりません。');
         return;
@@ -1716,30 +2321,21 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       final document = await pdfx.PdfDocument.openData(
         Uint8List.fromList(persistentBytes),
       );
-      final restoredPins = (data['pins'] as List? ?? const []).map((v) {
-        final m = v as Map<String, dynamic>;
-        return PinData(
-          id: m['id'] as String,
-          number: (m['number'] as num).toInt(),
-          pageNumber: (m['pageNumber'] as num).toInt(),
-          xRatio: (m['xRatio'] as num).toDouble(),
-          yRatio: (m['yRatio'] as num).toDouble(),
-          directionDegrees: (m['directionDegrees'] as num?)?.toDouble() ?? 0,
-          photoCount: (m['photoCount'] as num?)?.toInt() ?? 0,
-          note: m['note'] as String? ?? '',
-          colorValue: (m['colorValue'] as num?)?.toInt() ?? 0xFF1976D2,
-          boardEnabled: m['boardEnabled'] == true,
-          boardTemplateId: m['boardTemplateId']?.toString() ?? 'core',
-          boardShootingLocation: m['boardShootingLocation']?.toString() ?? '',
-          boardCoreStep:
-              ((m['boardCoreStep'] as num?)?.toInt() ?? 0).clamp(0, 5),
-          boardChippingStep:
-              ((m['boardChippingStep'] as num?)?.toInt() ?? 0).clamp(0, 5),
-          boardAsbestosStep:
-              ((m['boardAsbestosStep'] as num?)?.toInt() ?? 0).clamp(0, 5),
-          boardPositionId: m['boardPositionId']?.toString() ?? 'bottomLeft',
-        );
-      }).toList();
+      if (!mounted) {
+        await document.close();
+        return;
+      }
+      final List<PinData> restoredPins = (data['pins'] as List? ?? const [])
+          .map(_deserializePin)
+          .whereType<PinData>()
+          .toList(growable: true);
+      final List<_PinEdit> restoredRedoPinEdits =
+          _deserializePinRedoHistory(data['pinRedoHistory']);
+      final Set<String> restoredCleanupPinIds =
+          (data['pendingPhotoCleanupPinIds'] as List? ?? const <dynamic>[])
+              .map((dynamic value) => value.toString())
+              .where((String id) => id.isNotEmpty)
+              .toSet();
       final restoredStrokes = <int, List<DrawingStroke>>{};
       for (final v in (data['strokes'] as List? ?? const [])) {
         final m = v as Map<String, dynamic>;
@@ -1776,16 +2372,57 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
               photoCounts[restoredPins[i].id] ?? restoredPins[i].photoCount,
         );
       }
+      for (int i = 0; i < restoredRedoPinEdits.length; i++) {
+        final _PinEdit edit = restoredRedoPinEdits[i];
+        final PinData? after = edit.after;
+        if (edit.kind == _PinEditKind.add && after != null) {
+          restoredRedoPinEdits[i] = edit.copyWith(
+            after: after.copyWith(
+              photoCount: photoCounts[after.id] ?? after.photoCount,
+            ),
+          );
+        }
+      }
+      final Set<String> restoredActivePinIds =
+          restoredPins.map((PinData pin) => pin.id).toSet();
+      restoredRedoPinEdits.removeWhere((_PinEdit edit) {
+        if (edit.kind == _PinEditKind.add) {
+          final bool invalid =
+              edit.after == null || restoredActivePinIds.contains(edit.pinId);
+          if (invalid && !restoredActivePinIds.contains(edit.pinId)) {
+            restoredCleanupPinIds.add(edit.pinId);
+          }
+          return invalid;
+        }
+        return !restoredActivePinIds.contains(edit.pinId);
+      });
       if (!mounted) return;
       setState(() {
         _projectName = data['projectName']?.toString() ?? widget.projectName;
         _pdfDocument = document;
+        _thumbnailFutures.clear();
         _pdfBytes = persistentBytes;
         _pdfPath = '${widget.projectId}-${persistentBytes.length}';
         _pageCount = document.pagesCount;
         _pins
           ..clear()
           ..addAll(restoredPins);
+        _undoPinEdits.clear();
+        _redoPinEdits
+          ..clear()
+          ..addAll(restoredRedoPinEdits);
+        final Set<String> recoverablePinIds = <String>{
+          ...restoredPins.map((PinData pin) => pin.id),
+          ...restoredRedoPinEdits
+              .where((_PinEdit edit) => edit.kind == _PinEditKind.add)
+              .map((_PinEdit edit) => edit.pinId),
+        };
+        _pendingPhotoCleanupPinIds
+          ..clear()
+          ..addAll(
+            restoredCleanupPinIds
+                .where((String id) => !recoverablePinIds.contains(id)),
+          );
         _strokesByPage
           ..clear()
           ..addAll(restoredStrokes);
@@ -1799,7 +2436,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _activeEraserSourceIds = null;
         _activeEraserTouchedSourceIds = null;
         _activeEraserEditId = null;
+        _activeEraserAspectRatio = null;
+        _activeEraserBoundsCache = null;
+        _activeEraserSamplesCache = null;
         _photosByPinId.clear();
+        _photoStorageVerifiedPinIds.clear();
+        _photoStorageNeedsRescanPinIds.clear();
+        _photoSavesInProgressByPinId.clear();
         _nextPinNumber =
             (data['nextPinNumber'] as num?)?.toInt() ?? (_pins.length + 1);
         _pinColor = Color((data['pinColor'] as num?)?.toInt() ?? 0xFF1976D2);
@@ -1822,6 +2465,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             restoredPins.any((PinData pin) => pin.id == captureAfterId)
                 ? captureAfterId
                 : null;
+        if (_pendingDirectionPinId != null) {
+          _selectedTool = FieldTool.pin;
+        }
       });
       await _renderPage(_currentPage);
       if (pencilRecoveryError != null && mounted) {
@@ -1854,13 +2500,31 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   static const double _eraserRadius = 0.025;
-  static const double _eraserSampleSpacing = _eraserRadius / 3;
+
+  double get _eraserAspectRatio {
+    return math.max(_activeEraserAspectRatio ?? _pageAspectRatio, 0.0001);
+  }
+
+  double get _eraserRadiusInPageSpace {
+    return _eraserRadius * math.min(_eraserAspectRatio, 1);
+  }
+
+  Offset _toEraserPageSpace(Offset position) {
+    return Offset(position.dx * _eraserAspectRatio, position.dy);
+  }
 
   void _eraseAt(Offset position) {
     final int? pageNumber = _activeEraserPage;
     if (pageNumber == null) return;
 
-    final Offset pathStart = _lastEraserPosition ?? position;
+    final Offset? previousPosition = _lastEraserPosition;
+    if (previousPosition != null &&
+        (_toEraserPageSpace(position) - _toEraserPageSpace(previousPosition))
+                .distance <
+            _eraserRadiusInPageSpace / 5) {
+      return;
+    }
+    final Offset pathStart = previousPosition ?? position;
     _lastEraserPosition = position;
 
     final List<DrawingStroke>? strokes = _strokesByPage[pageNumber];
@@ -1912,17 +2576,22 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (stroke.points.isEmpty) return null;
     if (!_eraserBoundsOverlapStroke(stroke, pathStart, pathEnd)) return null;
     final List<DrawingPoint> sampledPoints =
-        _densifyDrawingPoints(stroke.points);
-    final double radiusSquared = _eraserRadius * _eraserRadius;
+        _activeEraserSamplesCache?.putIfAbsent(
+              stroke.id,
+              () => _densifyDrawingPoints(stroke.points),
+            ) ??
+            _densifyDrawingPoints(stroke.points);
+    final double radiusSquared =
+        _eraserRadiusInPageSpace * _eraserRadiusInPageSpace;
     bool erasedAnyPoint = false;
     final List<List<DrawingPoint>> outsideRuns = <List<DrawingPoint>>[];
     List<DrawingPoint> currentRun = <DrawingPoint>[];
 
     for (final DrawingPoint point in sampledPoints) {
       final bool erased = _pointToSegmentDistanceSquared(
-            point.position,
-            pathStart,
-            pathEnd,
+            _toEraserPageSpace(point.position),
+            _toEraserPageSpace(pathStart),
+            _toEraserPageSpace(pathEnd),
           ) <=
           radiusSquared;
       if (erased) {
@@ -1940,7 +2609,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       outsideRuns.add(currentRun);
     }
 
-    return outsideRuns
+    final List<DrawingStroke> fragments = outsideRuns
         .map(
           (List<DrawingPoint> points) => DrawingStroke(
             id: '$sourceId-erase-${_activeEraserEditId ?? 'edit'}'
@@ -1952,13 +2621,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           ),
         )
         .toList(growable: false);
+    _activeEraserSamplesCache?.remove(stroke.id);
+    _activeEraserBoundsCache?.remove(stroke.id);
+    for (final DrawingStroke fragment in fragments) {
+      _activeEraserSamplesCache?[fragment.id] = fragment.points;
+      _activeEraserBoundsCache?[fragment.id] = _drawingStrokeBounds(fragment);
+    }
+    return fragments;
   }
 
-  bool _eraserBoundsOverlapStroke(
-    DrawingStroke stroke,
-    Offset pathStart,
-    Offset pathEnd,
-  ) {
+  Rect _drawingStrokeBounds(DrawingStroke stroke) {
     double strokeMinX = stroke.points.first.position.dx;
     double strokeMaxX = strokeMinX;
     double strokeMinY = stroke.points.first.position.dy;
@@ -1970,19 +2642,31 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       strokeMinY = math.min(strokeMinY, position.dy);
       strokeMaxY = math.max(strokeMaxY, position.dy);
     }
+    return Rect.fromLTRB(strokeMinX, strokeMinY, strokeMaxX, strokeMaxY);
+  }
 
-    final double eraserMinX =
-        math.min(pathStart.dx, pathEnd.dx) - _eraserRadius;
-    final double eraserMaxX =
-        math.max(pathStart.dx, pathEnd.dx) + _eraserRadius;
-    final double eraserMinY =
-        math.min(pathStart.dy, pathEnd.dy) - _eraserRadius;
-    final double eraserMaxY =
-        math.max(pathStart.dy, pathEnd.dy) + _eraserRadius;
-    return strokeMaxX >= eraserMinX &&
-        strokeMinX <= eraserMaxX &&
-        strokeMaxY >= eraserMinY &&
-        strokeMinY <= eraserMaxY;
+  bool _eraserBoundsOverlapStroke(
+    DrawingStroke stroke,
+    Offset pathStart,
+    Offset pathEnd,
+  ) {
+    final Rect strokeBounds = _activeEraserBoundsCache?.putIfAbsent(
+          stroke.id,
+          () => _drawingStrokeBounds(stroke),
+        ) ??
+        _drawingStrokeBounds(stroke);
+    final double radiusY = _eraserRadiusInPageSpace;
+    final double radiusX = radiusY / _eraserAspectRatio;
+    final Rect eraserBounds = Rect.fromLTRB(
+      math.min(pathStart.dx, pathEnd.dx) - radiusX,
+      math.min(pathStart.dy, pathEnd.dy) - radiusY,
+      math.max(pathStart.dx, pathEnd.dx) + radiusX,
+      math.max(pathStart.dy, pathEnd.dy) + radiusY,
+    );
+    return strokeBounds.right >= eraserBounds.left &&
+        strokeBounds.left <= eraserBounds.right &&
+        strokeBounds.bottom >= eraserBounds.top &&
+        strokeBounds.top <= eraserBounds.bottom;
   }
 
   List<DrawingPoint> _densifyDrawingPoints(List<DrawingPoint> points) {
@@ -1994,10 +2678,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     for (int index = 1; index < points.length; index++) {
       final DrawingPoint start = points[index - 1];
       final DrawingPoint end = points[index];
-      final double distance = (end.position - start.position).distance;
+      final double distance = (_toEraserPageSpace(end.position) -
+              _toEraserPageSpace(start.position))
+          .distance;
       final int steps = math.max(
         1,
-        (distance / _eraserSampleSpacing).ceil(),
+        (distance / (_eraserRadiusInPageSpace / 3)).ceil(),
       );
       for (int step = 1; step <= steps; step++) {
         final double t = step / steps;
@@ -2076,6 +2762,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                             (PinData pin) => pin.id == selectedId,
                           );
                           if (index >= 0) {
+                            _discardPinRedoHistory();
                             _pins[index] = _pins[index].copyWith(
                               colorValue: color.toARGB32(),
                             );
@@ -2199,6 +2886,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     }
   }
 
+  Future<Uint8List?> _thumbnailForPage(int pageNumber) {
+    return _thumbnailFutures.putIfAbsent(
+      pageNumber,
+      () => _renderThumbnail(pageNumber),
+    );
+  }
+
   void _showPageList() {
     showModalBottomSheet<void>(
       context: context,
@@ -2249,13 +2943,30 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                                 borderRadius: const BorderRadius.vertical(
                                     top: Radius.circular(7)),
                                 child: FutureBuilder<Uint8List?>(
-                                  future: _renderThumbnail(pageNumber),
-                                  builder: (_, snapshot) => snapshot.hasData
-                                      ? Image.memory(snapshot.data!,
-                                          fit: BoxFit.contain)
-                                      : const Center(
-                                          child: CircularProgressIndicator(
-                                              strokeWidth: 2)),
+                                  future: _thumbnailForPage(pageNumber),
+                                  builder: (_, snapshot) {
+                                    if (snapshot.hasData) {
+                                      return Image.memory(
+                                        snapshot.data!,
+                                        fit: BoxFit.contain,
+                                      );
+                                    }
+                                    if (snapshot.hasError ||
+                                        snapshot.connectionState ==
+                                            ConnectionState.done) {
+                                      return const Center(
+                                        child: Icon(
+                                          Icons.broken_image_outlined,
+                                          semanticLabel: 'サムネイルを表示できません',
+                                        ),
+                                      );
+                                    }
+                                    return const Center(
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
+                                    );
+                                  },
                                 ),
                               ),
                             ),
@@ -2282,158 +2993,230 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   Future<void> _returnHome() async {
+    if (_isLeaving) return;
+    setState(() => _isLeaving = true);
     _endStroke();
     _saveSelectedPinNote();
+    final bool hadPinRedo = _redoPinEdits.isNotEmpty;
+    _discardPinRedoHistory();
+    if (hadPinRedo) {
+      _metaDirty = true;
+    }
     _saveDebounce?.cancel();
+    _saveDebounce = null;
+    _saveRetryTimer?.cancel();
+    _saveRetryTimer = null;
 
     try {
-      await _enqueueSave();
+      do {
+        await _enqueueSave();
+      } while (_hasPendingSave);
     } catch (_) {
-      // The screen must never trap the user. Dirty flags remain set and the
-      // already committed photos/PDF stay intact. The project can be reopened
-      // and saving retried.
+      if (!mounted) return;
+      setState(() => _isLeaving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('保存できなかったため画面を閉じませんでした。再試行してください。'),
+          action: SnackBarAction(
+            label: '再試行',
+            onPressed: _returnHome,
+          ),
+        ),
+      );
+      return;
     }
 
-    if (mounted) Navigator.of(context).pop();
+    if (!mounted) return;
+    setState(() => _allowPop = true);
+    Navigator.of(context).pop();
   }
 
   @override
   Widget build(BuildContext context) {
     final PinData? selectedPin = _selectedPin;
 
-    return Scaffold(
-      backgroundColor: const Color(0xFF101722),
-      appBar: AppBar(
-        leading: IconButton(
-          tooltip: 'ホームへ戻る',
-          onPressed: _returnHome,
-          icon: const Icon(Icons.arrow_back_rounded),
-        ),
-        backgroundColor: AppColors.panel,
-        foregroundColor: AppColors.textPrimary,
-        titleSpacing: 8,
-        title: Text(
-          _projectName,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(
-            fontWeight: FontWeight.w700,
+    return PopScope<void>(
+      canPop: _allowPop,
+      onPopInvokedWithResult: (bool didPop, void result) {
+        if (!didPop) {
+          unawaited(_returnHome());
+        }
+      },
+      child: Scaffold(
+        backgroundColor: const Color(0xFF101722),
+        appBar: AppBar(
+          leading: IconButton(
+            tooltip: 'ホームへ戻る',
+            onPressed: _returnHome,
+            icon: const Icon(Icons.arrow_back_rounded),
           ),
-        ),
-        actions: [
-          if (_pdfDocument != null)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Center(
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (_saveInProgress)
-                      const SizedBox.square(
-                        dimension: 14,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    else
-                      const Icon(Icons.cloud_done_rounded, size: 17),
-                    const SizedBox(width: 5),
-                    Text(
-                      _saveInProgress ? '保存中' : '保存済み',
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                  ],
-                ),
-              ),
+          backgroundColor: AppColors.panel,
+          foregroundColor: AppColors.textPrimary,
+          titleSpacing: 8,
+          title: Text(
+            _projectName,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontWeight: FontWeight.w700,
             ),
-          if (_pdfDocument != null)
-            IconButton(
-              tooltip: 'ページ一覧',
-              onPressed: _showPageList,
-              icon: const Icon(Icons.grid_view_rounded),
-            ),
-          if (_pdfDocument != null)
-            Center(
-              child: Container(
-                margin: const EdgeInsets.only(right: 8),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF121B28),
-                  borderRadius: BorderRadius.circular(22),
-                  border: Border.all(color: AppColors.border),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    IconButton(
-                      tooltip: '前のページ',
-                      onPressed: _currentPage > 1
-                          ? () => _goToPage(_currentPage - 1)
-                          : null,
-                      icon: const Icon(Icons.chevron_left_rounded),
-                    ),
-                    SizedBox(
-                      width: 72,
-                      child: Text(
-                        _pageCount > 0 ? '$_currentPage / $_pageCount' : '読込中',
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          color: AppColors.textPrimary,
-                          fontWeight: FontWeight.w700,
+          ),
+          actions: [
+            if (_pdfDocument != null)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Center(
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_saveInProgress)
+                        const SizedBox.square(
+                          dimension: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      else if (_saveErrorMessage != null)
+                        const Icon(
+                          Icons.cloud_off_rounded,
+                          size: 17,
+                          color: Color(0xFFFF7A7A),
+                        )
+                      else if (_hasPendingSave)
+                        const Icon(Icons.cloud_upload_rounded, size: 17)
+                      else
+                        const Icon(Icons.cloud_done_rounded, size: 17),
+                      const SizedBox(width: 5),
+                      Semantics(
+                        liveRegion: true,
+                        label: _saveInProgress
+                            ? '保存中'
+                            : _saveErrorMessage != null
+                                ? '保存失敗、自動再試行します'
+                                : _hasPendingSave
+                                    ? '未保存'
+                                    : '保存済み',
+                        child: Text(
+                          _saveInProgress
+                              ? '保存中'
+                              : _saveErrorMessage != null
+                                  ? '保存失敗・再試行'
+                                  : _hasPendingSave
+                                      ? '未保存'
+                                      : '保存済み',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: _saveErrorMessage != null
+                                ? const Color(0xFFFFA0A0)
+                                : null,
+                          ),
                         ),
                       ),
-                    ),
-                    IconButton(
-                      tooltip: '次のページ',
-                      onPressed: _pageCount > 0 && _currentPage < _pageCount
-                          ? () => _goToPage(_currentPage + 1)
-                          : null,
-                      icon: const Icon(Icons.chevron_right_rounded),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
-            ),
-          const SizedBox(width: 6),
-        ],
-      ),
-      body: SafeArea(
-        child: _pdfDocument == null
-            ? _buildEmptyState()
-            : Stack(
-                children: [
-                  Positioned.fill(
-                    child: _buildDrawingArea(),
+            if (_pdfDocument != null)
+              IconButton(
+                tooltip: 'ページ一覧',
+                onPressed: _isRenderingPage ? null : _showPageList,
+                icon: const Icon(Icons.grid_view_rounded),
+              ),
+            if (_pdfDocument != null)
+              Center(
+                child: Container(
+                  margin: const EdgeInsets.only(right: 8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF121B28),
+                    borderRadius: BorderRadius.circular(22),
+                    border: Border.all(color: AppColors.border),
                   ),
-                  AnimatedPositioned(
-                    duration: const Duration(
-                      milliseconds: 220,
-                    ),
-                    curve: Curves.easeOut,
-                    top: 0,
-                    right: selectedPin == null ? -320 : 0,
-                    bottom: 0,
-                    width: 320,
-                    child: selectedPin == null || _noteController == null
-                        ? const SizedBox.shrink()
-                        : PinSidePanel(
-                            pin: selectedPin,
-                            photos: _photosForPin(selectedPin.id),
-                            noteController: _noteController!,
-                            onClose: _closePinPanel,
-                            onDelete: _deleteSelectedPin,
-                            onAddPhotos: _addPhotosToSelectedPin,
-                            onShowAllPhotos: _showAllPhotosForSelectedPin,
-                            directionEditing:
-                                _pendingDirectionPinId == selectedPin.id,
-                            onChangeDirection:
-                                _toggleSelectedPinDirectionEditing,
-                            onNoteChanged: (_) {
-                              _saveSelectedPinNote();
-                            },
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        tooltip: '前のページ',
+                        onPressed: !_isRenderingPage && _currentPage > 1
+                            ? () => _goToPage(_currentPage - 1)
+                            : null,
+                        icon: const Icon(Icons.chevron_left_rounded),
+                      ),
+                      SizedBox(
+                        width: 72,
+                        child: Text(
+                          _pageCount > 0
+                              ? '$_currentPage / $_pageCount'
+                              : '読込中',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: AppColors.textPrimary,
+                            fontWeight: FontWeight.w700,
                           ),
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: '次のページ',
+                        onPressed: !_isRenderingPage &&
+                                _pageCount > 0 &&
+                                _currentPage < _pageCount
+                            ? () => _goToPage(_currentPage + 1)
+                            : null,
+                        icon: const Icon(Icons.chevron_right_rounded),
+                      ),
+                    ],
                   ),
-                ],
+                ),
+              ),
+            const SizedBox(width: 6),
+          ],
+        ),
+        body: AbsorbPointer(
+          absorbing: _isLeaving,
+          child: SafeArea(
+            child: _pdfDocument == null
+                ? _buildEmptyState()
+                : Stack(
+                    children: [
+                      Positioned.fill(
+                        child: _buildDrawingArea(),
+                      ),
+                      AnimatedPositioned(
+                        duration: const Duration(
+                          milliseconds: 220,
+                        ),
+                        curve: Curves.easeOut,
+                        top: 0,
+                        right: selectedPin == null ? -320 : 0,
+                        bottom: 0,
+                        width: 320,
+                        child: selectedPin == null || _noteController == null
+                            ? const SizedBox.shrink()
+                            : PinSidePanel(
+                                pin: selectedPin,
+                                photos: _photosForPin(selectedPin.id),
+                                noteController: _noteController!,
+                                onClose: _closePinPanel,
+                                onDelete: _deleteSelectedPin,
+                                onAddPhotos: _addPhotosToSelectedPin,
+                                onShowAllPhotos: _showAllPhotosForSelectedPin,
+                                directionEditing:
+                                    _pendingDirectionPinId == selectedPin.id,
+                                onChangeDirection:
+                                    _toggleSelectedPinDirectionEditing,
+                                onNoteChanged: (_) {
+                                  _saveSelectedPinNote();
+                                },
+                              ),
+                      ),
+                    ],
+                  ),
+          ),
+        ),
+        bottomNavigationBar: _pdfDocument == null
+            ? null
+            : IgnorePointer(
+                ignoring: _isLeaving,
+                child: _buildBottomToolbar(),
               ),
       ),
-      bottomNavigationBar: _pdfDocument == null ? null : _buildBottomToolbar(),
     );
   }
 
@@ -2489,7 +3272,36 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       children: [
         Positioned.fill(
           child: imageBytes == null
-              ? const Center(child: CircularProgressIndicator())
+              ? _failedRenderPage == null
+                  ? const Center(child: CircularProgressIndicator())
+                  : Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 520),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
+                            const Icon(
+                              Icons.broken_image_outlined,
+                              size: 44,
+                              color: AppColors.textSecondary,
+                            ),
+                            const SizedBox(height: 12),
+                            Text(
+                              '$_failedRenderPageページ目を表示できませんでした。',
+                              textAlign: TextAlign.center,
+                            ),
+                            const SizedBox(height: 12),
+                            FilledButton.icon(
+                              onPressed: _isRenderingPage
+                                  ? null
+                                  : _retryFailedPageRender,
+                              icon: const Icon(Icons.refresh_rounded),
+                              label: const Text('再試行'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    )
               : SinglePagePdfCanvas(
                   key: ValueKey<String>('${_pdfPath!}-$_currentPage'),
                   imageBytes: imageBytes,
@@ -2504,6 +3316,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   onAddPin: _addPin,
                   onPinTap: _selectPin,
                   onDirectionChanged: _changePinDirection,
+                  onDirectionChangeStart: _startPinDirectionChange,
+                  onDirectionChangeEnd: _finishPinDirectionChange,
+                  onDirectionChangeCancel: _cancelPinDirectionChange,
                   onPinMoveStart: _startPinMove,
                   onPinMoveUpdate: _updatePinPosition,
                   onPinMoveEnd: _finishPinMove,
@@ -2513,6 +3328,23 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   onStrokeEnd: _endStroke,
                 ),
         ),
+        if (imageBytes != null)
+          Positioned(
+            right: 16,
+            bottom: 16,
+            child: Material(
+              color: AppColors.panel.withValues(alpha: 0.92),
+              shape: const CircleBorder(),
+              elevation: 4,
+              child: IconButton(
+                tooltip: '表示位置と拡大率をリセット',
+                onPressed: () {
+                  _transformationController.value = Matrix4.identity();
+                },
+                icon: const Icon(Icons.center_focus_strong_rounded),
+              ),
+            ),
+          ),
         if (_selectedTool == FieldTool.pin && _pendingDirectionPinId != null)
           Positioned(
             left: 16,
@@ -2582,7 +3414,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
               child: Center(child: CircularProgressIndicator()),
             ),
           ),
-        if (_errorMessage != null)
+        if (_errorMessage != null && _failedRenderPage == null)
           Positioned(
             top: 16,
             left: 16,
@@ -2608,6 +3440,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   Widget _buildBottomToolbar() {
+    final bool pageInteractionAvailable =
+        _pageImageBytes != null && !_isRenderingPage;
     return Material(
       color: AppColors.panel,
       elevation: 12,
@@ -2623,6 +3457,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                 iconColor: _pinColor,
                 label: 'ピン',
                 selected: _selectedTool == FieldTool.pin,
+                enabled: pageInteractionAvailable,
                 onPressed: () => _selectTool(FieldTool.pin),
               ),
               _ToolbarButton(
@@ -2632,26 +3467,27 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                 iconColor: _eraserEnabled ? Colors.white : _penColor,
                 label: _eraserEnabled ? '消しゴム' : 'ペン',
                 selected: _selectedTool == FieldTool.pen,
+                enabled: pageInteractionAvailable,
                 onPressed: () => _selectTool(FieldTool.pen),
               ),
               _ToolbarButton(
                 icon: Icons.undo_rounded,
                 label: '戻る',
-                selected: false,
-                enabled: _canUndoCurrentTool,
+                selected: null,
+                enabled: pageInteractionAvailable && _canUndoCurrentTool,
                 onPressed: _undo,
               ),
               _ToolbarButton(
                 icon: Icons.redo_rounded,
                 label: 'やり直し',
-                selected: false,
-                enabled: _canRedoCurrentTool,
+                selected: null,
+                enabled: pageInteractionAvailable && _canRedoCurrentTool,
                 onPressed: _redo,
               ),
               _ToolbarButton(
                 icon: Icons.ios_share_rounded,
                 label: _isExporting ? '書出中' : '書き出し',
-                selected: false,
+                selected: null,
                 enabled: !_isExporting,
                 onPressed: _exportProject,
               ),
@@ -2676,7 +3512,7 @@ class _ToolbarButton extends StatelessWidget {
   final IconData icon;
   final Color? iconColor;
   final String label;
-  final bool selected;
+  final bool? selected;
   final bool enabled;
   final VoidCallback onPressed;
 
@@ -2685,72 +3521,81 @@ class _ToolbarButton extends StatelessWidget {
     final Color resolvedIconColor = iconColor ?? AppColors.textSecondary;
     final bool needsContrastHalo =
         iconColor != null && resolvedIconColor.computeLuminance() < 0.12;
+    final bool isSelected = selected == true;
 
-    return SizedBox(
-      width: 96,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(12),
-        onTap: enabled ? onPressed : null,
-        child: Opacity(
-          opacity: enabled ? 1 : 0.38,
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: <Widget>[
-              AnimatedContainer(
-                duration: const Duration(milliseconds: 150),
-                width: 48,
-                height: 42,
-                decoration: BoxDecoration(
-                  color: selected
-                      ? const Color(0xFF168BFF).withValues(alpha: 0.12)
-                      : Colors.transparent,
-                  borderRadius: BorderRadius.circular(11),
-                  border: Border.all(
-                    color:
-                        selected ? const Color(0xFF4AA8FF) : Colors.transparent,
-                    width: 1.5,
+    return Semantics(
+      button: true,
+      enabled: enabled,
+      selected: selected,
+      label: label,
+      excludeSemantics: true,
+      child: SizedBox(
+        width: 96,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: enabled ? onPressed : null,
+          child: Opacity(
+            opacity: enabled ? 1 : 0.38,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: <Widget>[
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 150),
+                  width: 48,
+                  height: 42,
+                  decoration: BoxDecoration(
+                    color: isSelected
+                        ? const Color(0xFF168BFF).withValues(alpha: 0.12)
+                        : Colors.transparent,
+                    borderRadius: BorderRadius.circular(11),
+                    border: Border.all(
+                      color: isSelected
+                          ? const Color(0xFF4AA8FF)
+                          : Colors.transparent,
+                      width: 1.5,
+                    ),
+                    boxShadow: isSelected
+                        ? <BoxShadow>[
+                            BoxShadow(
+                              color: const Color(0xFF168BFF)
+                                  .withValues(alpha: 0.44),
+                              blurRadius: 11,
+                              spreadRadius: 1,
+                            ),
+                          ]
+                        : const <BoxShadow>[],
                   ),
-                  boxShadow: selected
-                      ? <BoxShadow>[
-                          BoxShadow(
-                            color:
-                                const Color(0xFF168BFF).withValues(alpha: 0.44),
-                            blurRadius: 11,
-                            spreadRadius: 1,
-                          ),
-                        ]
-                      : const <BoxShadow>[],
-                ),
-                alignment: Alignment.center,
-                child: Stack(
                   alignment: Alignment.center,
-                  children: <Widget>[
-                    if (needsContrastHalo)
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: <Widget>[
+                      if (needsContrastHalo)
+                        Icon(
+                          icon,
+                          color: Colors.white.withValues(alpha: 0.72),
+                          size: 28,
+                        ),
                       Icon(
                         icon,
-                        color: Colors.white.withValues(alpha: 0.72),
-                        size: 28,
+                        color: resolvedIconColor,
+                        size: 25,
                       ),
-                    Icon(
-                      icon,
-                      color: resolvedIconColor,
-                      size: 25,
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-              const SizedBox(height: 3),
-              Text(
-                label,
-                style: TextStyle(
-                  color: selected
-                      ? const Color(0xFF79C3FF)
-                      : AppColors.textSecondary,
-                  fontSize: 11.5,
-                  fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                const SizedBox(height: 3),
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: isSelected
+                        ? const Color(0xFF79C3FF)
+                        : AppColors.textSecondary,
+                    fontSize: 11.5,
+                    fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -2782,7 +3627,9 @@ class _PaletteColorButton extends StatelessWidget {
     return Semantics(
       button: true,
       selected: selected,
-      label: '色を選択',
+      label: '${_fieldColorName(color)}を選択',
+      value: selected ? '選択中' : '未選択',
+      excludeSemantics: true,
       child: GestureDetector(
         onTap: onTap,
         child: AnimatedContainer(

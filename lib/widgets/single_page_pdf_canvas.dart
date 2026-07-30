@@ -25,6 +25,9 @@ class SinglePagePdfCanvas extends StatefulWidget {
     required this.onAddPin,
     required this.onPinTap,
     required this.onDirectionChanged,
+    this.onDirectionChangeStart,
+    this.onDirectionChangeEnd,
+    this.onDirectionChangeCancel,
     required this.onPinMoveStart,
     required this.onPinMoveUpdate,
     required this.onPinMoveEnd,
@@ -46,6 +49,9 @@ class SinglePagePdfCanvas extends StatefulWidget {
   final ValueChanged<Offset> onAddPin;
   final ValueChanged<PinData> onPinTap;
   final void Function(PinData pin, double directionDegrees) onDirectionChanged;
+  final ValueChanged<PinData>? onDirectionChangeStart;
+  final ValueChanged<PinData>? onDirectionChangeEnd;
+  final ValueChanged<PinData>? onDirectionChangeCancel;
   final ValueChanged<PinData> onPinMoveStart;
   final void Function(PinData pin, Offset normalizedPosition) onPinMoveUpdate;
   final void Function(PinData pin, Offset normalizedPosition) onPinMoveEnd;
@@ -166,6 +172,13 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
               _activeStylusPointer == null && _movingPinId == null,
           minScale: 1,
           maxScale: 10,
+          minimumPointerCount: widget.pinModeEnabled ? 2 : 1,
+          contentRect: Rect.fromLTWH(
+            (constraints.maxWidth - pageWidth) / 2,
+            (constraints.maxHeight - pageHeight) / 2,
+            pageWidth,
+            pageHeight,
+          ),
           child: Center(
             child: SizedBox(
               key: _pageKey,
@@ -247,11 +260,15 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                     clipBehavior: Clip.none,
                     children: [
                       Positioned.fill(
-                        child: Image.memory(
-                          widget.imageBytes,
-                          fit: BoxFit.fill,
-                          gaplessPlayback: true,
-                          filterQuality: FilterQuality.high,
+                        child: Semantics(
+                          image: true,
+                          label: 'PDF図面',
+                          child: Image.memory(
+                            widget.imageBytes,
+                            fit: BoxFit.fill,
+                            gaplessPlayback: true,
+                            filterQuality: FilterQuality.high,
+                          ),
                         ),
                       ),
                       Positioned.fill(
@@ -269,10 +286,31 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                             selected: pin.id == widget.selectedPinId,
                             awaitingDirection:
                                 pin.id == widget.pendingDirectionPinId,
-                            onTap: () => widget.onPinTap(pin),
-                            onDirectionChanged: (direction) {
-                              widget.onDirectionChanged(pin, direction);
-                            },
+                            onTap: widget.penModeEnabled
+                                ? null
+                                : () => widget.onPinTap(pin),
+                            onDirectionChanged:
+                                widget.pinModeEnabled && pendingPin == null
+                                    ? (double direction) {
+                                        widget.onDirectionChanged(
+                                          pin,
+                                          direction,
+                                        );
+                                      }
+                                    : null,
+                            onDirectionChangeStart: widget.pinModeEnabled &&
+                                    pendingPin == null
+                                ? () => widget.onDirectionChangeStart?.call(pin)
+                                : null,
+                            onDirectionChangeEnd: widget.pinModeEnabled &&
+                                    pendingPin == null
+                                ? () => widget.onDirectionChangeEnd?.call(pin)
+                                : null,
+                            onDirectionChangeCancel: widget.pinModeEnabled &&
+                                    pendingPin == null
+                                ? () =>
+                                    widget.onDirectionChangeCancel?.call(pin)
+                                : null,
                             onMoveStart:
                                 widget.pinModeEnabled && pendingPin == null
                                     ? (_) => _startMovingPin(pin)

@@ -30,9 +30,9 @@ class CameraCaptureScreen extends StatefulWidget {
 
   /// Saves the original JPEG and returns the separately generated thumbnail.
   ///
-  /// The camera screen serializes calls to this callback. This lets the next
-  /// picture be taken while the previous original/thumbnail is being stored,
-  /// without allowing photo numbers to race each other.
+  /// The camera screen serializes and awaits calls to this callback. Keeping
+  /// only one full-resolution image pending prevents rapid capture from
+  /// retaining an unbounded queue of JPEGs on memory-constrained iPads.
   final Future<PhotoData?> Function(Uint8List bytes) onCaptured;
 
   @override
@@ -62,24 +62,33 @@ class _CameraThumbnail {
   }
 }
 
-class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
+class _CameraCaptureScreenState extends State<CameraCaptureScreen>
+    with WidgetsBindingObserver {
   static const Duration _thumbnailMotionDuration = Duration(milliseconds: 420);
   static const double _thumbnailWidth = 112;
   static const double _thumbnailHeight = 78;
   static const double _thumbnailGap = 10;
 
   CameraController? _controller;
+  CameraController? _initializingController;
+  CameraDescription? _selectedCamera;
   bool _initializing = true;
   bool _takingPicture = false;
   bool _closing = false;
+  bool _cameraSuspended = false;
   bool _allowPop = false;
   bool _changingFlash = false;
   bool _flashAvailable = false;
   String? _error;
   FlashMode _flashMode = FlashMode.off;
+  FlashMode _preferredFlashMode = FlashMode.auto;
   double _zoom = 1;
+  double _targetZoom = 1;
   double _minZoom = 1;
   double _maxZoom = 1;
+  int _cameraGeneration = 0;
+  int? _zoomDrainGeneration;
+  Future<void> _cameraDisposeTail = Future<void>.value();
   late int _photoCount;
   late List<_CameraThumbnail> _recentPhotos;
   late PhotoBoardConfig _boardConfig;
@@ -97,6 +106,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _photoCount = widget.initialPhotoCount;
     _boardConfig = widget.initialBoardConfig;
     _recentPhotos = widget.initialPhotos.reversed
@@ -108,29 +118,97 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
           ),
         )
         .toList(growable: true);
-    _initializeCamera();
+    unawaited(_initializeCamera());
   }
 
-  Future<void> _initializeCamera() async {
+  bool _isCurrentCamera(
+    int generation,
+    CameraController controller,
+  ) {
+    return mounted &&
+        generation == _cameraGeneration &&
+        !_cameraSuspended &&
+        !_closing &&
+        (identical(_initializingController, controller) ||
+            identical(_controller, controller));
+  }
+
+  void _scheduleControllerDispose(CameraController? controller) {
+    if (controller == null) return;
+    _cameraDisposeTail = _cameraDisposeTail.then((_) async {
+      try {
+        await controller.dispose();
+      } catch (_) {
+        // A lifecycle transition may race a platform-side camera shutdown.
+      }
+    });
+  }
+
+  Future<FlashMode> _applyFlashMode(
+    CameraController controller,
+    FlashMode requestedMode,
+  ) async {
+    if (requestedMode != FlashMode.always) {
+      await controller.setFlashMode(requestedMode);
+      return requestedMode;
+    }
     try {
-      final cameras = await availableCameras();
-      if (cameras.isEmpty) {
-        throw CameraException('no-camera', '利用できるカメラがありません。');
+      await controller.setFlashMode(FlashMode.always);
+      return FlashMode.always;
+    } catch (_) {
+      // Some camera backends expose the LED only as a continuous torch.
+      await controller.setFlashMode(FlashMode.torch);
+      return FlashMode.torch;
+    }
+  }
+
+  Future<void> _initializeCamera({
+    CameraDescription? preferredCamera,
+  }) async {
+    final int generation = ++_cameraGeneration;
+    CameraController? initializingController;
+    if (mounted) {
+      setState(() {
+        _initializing = true;
+        _error = null;
+      });
+    }
+    try {
+      await _cameraDisposeTail;
+      if (!mounted ||
+          generation != _cameraGeneration ||
+          _cameraSuspended ||
+          _closing) {
+        return;
       }
 
-      CameraDescription? firstBackCamera;
-      CameraDescription? wideBackCamera;
-      for (final camera in cameras) {
-        if (camera.lensDirection == CameraLensDirection.back) {
-          firstBackCamera ??= camera;
-          if (camera.lensType == CameraLensType.wide) {
-            wideBackCamera = camera;
-            break;
+      CameraDescription? selected = preferredCamera ?? _selectedCamera;
+      if (selected == null) {
+        final List<CameraDescription> cameras = await availableCameras();
+        if (cameras.isEmpty) {
+          throw CameraException('no-camera', '利用できるカメラがありません。');
+        }
+
+        CameraDescription? firstBackCamera;
+        CameraDescription? wideBackCamera;
+        for (final CameraDescription camera in cameras) {
+          if (camera.lensDirection == CameraLensDirection.back) {
+            firstBackCamera ??= camera;
+            if (camera.lensType == CameraLensType.wide) {
+              wideBackCamera = camera;
+              break;
+            }
           }
         }
+        selected = wideBackCamera ?? firstBackCamera ?? cameras.first;
       }
-      final CameraDescription selected =
-          wideBackCamera ?? firstBackCamera ?? cameras.first;
+      if (!mounted ||
+          generation != _cameraGeneration ||
+          _cameraSuspended ||
+          _closing) {
+        return;
+      }
+      _selectedCamera = selected;
 
       final controller = CameraController(
         selected,
@@ -138,7 +216,17 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.jpeg,
       );
+      initializingController = controller;
+      _initializingController = controller;
       await controller.initialize();
+      if (!_isCurrentCamera(generation, controller)) {
+        if (identical(_initializingController, controller)) {
+          _initializingController = null;
+          await controller.dispose();
+        }
+        initializingController = null;
+        return;
+      }
 
       bool flashAvailable = false;
       FlashMode initialFlashMode = FlashMode.off;
@@ -158,6 +246,16 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
           );
         }
       }
+      if (flashAvailable && _preferredFlashMode != initialFlashMode) {
+        try {
+          initialFlashMode = await _applyFlashMode(
+            controller,
+            _preferredFlashMode,
+          );
+        } catch (_) {
+          // Keep the supported mode selected during initialization.
+        }
+      }
 
       double minZoom = 1;
       double maxZoom = 1;
@@ -168,22 +266,42 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         // Some camera backends do not expose a zoom range.
       }
 
-      if (!mounted) {
-        await controller.dispose();
+      if (!_isCurrentCamera(generation, controller)) {
+        if (identical(_initializingController, controller)) {
+          _initializingController = null;
+          await controller.dispose();
+        }
+        initializingController = null;
         return;
       }
 
+      _initializingController = null;
       setState(() {
         _controller = controller;
         _minZoom = minZoom;
         _maxZoom = maxZoom < minZoom ? minZoom : maxZoom;
         _zoom = minZoom;
+        _targetZoom = minZoom;
         _flashAvailable = flashAvailable;
         _flashMode = initialFlashMode;
         _initializing = false;
       });
+      initializingController = null;
     } catch (error) {
-      if (!mounted) return;
+      final CameraController? failedController = initializingController;
+      if (failedController != null &&
+          identical(_initializingController, failedController)) {
+        _initializingController = null;
+        try {
+          await failedController.dispose();
+        } catch (_) {}
+      }
+      if (!mounted ||
+          generation != _cameraGeneration ||
+          _cameraSuspended ||
+          _closing) {
+        return;
+      }
       setState(() {
         _error = 'カメラを起動できませんでした。\n$error';
         _initializing = false;
@@ -192,9 +310,56 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   }
 
   @override
-  void dispose() {
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      if (!_cameraSuspended || _closing) return;
+      _cameraSuspended = false;
+      unawaited(_initializeCamera(preferredCamera: _selectedCamera));
+      return;
+    }
+
+    if (state != AppLifecycleState.inactive &&
+        state != AppLifecycleState.paused &&
+        state != AppLifecycleState.hidden &&
+        state != AppLifecycleState.detached) {
+      return;
+    }
+    if (_cameraSuspended) return;
+
+    _cameraSuspended = true;
+    _cameraGeneration += 1;
     _focusIndicatorTimer?.cancel();
-    _controller?.dispose();
+    final CameraController? controller = _controller;
+    final CameraController? initializingController = _initializingController;
+    _controller = null;
+    _initializingController = null;
+    if (mounted) {
+      setState(() {
+        _initializing = true;
+        _flashAvailable = false;
+        _focusIndicatorVisible = false;
+      });
+    }
+    _scheduleControllerDispose(controller);
+    if (!identical(initializingController, controller)) {
+      _scheduleControllerDispose(initializingController);
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _cameraSuspended = true;
+    _cameraGeneration += 1;
+    _focusIndicatorTimer?.cancel();
+    final CameraController? controller = _controller;
+    final CameraController? initializingController = _initializingController;
+    _controller = null;
+    _initializingController = null;
+    _scheduleControllerDispose(controller);
+    if (!identical(initializingController, controller)) {
+      _scheduleControllerDispose(initializingController);
+    }
     super.dispose();
   }
 
@@ -224,10 +389,6 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     setState(() => _takingPicture = true);
     try {
       final PhotoBoardConfig captureBoard = _boardConfig;
-      final Rect normalizedBoardRect = _normalizedBoardRectForCapture(
-        controller,
-        captureBoard.position,
-      );
       final XFile file = await controller.takePicture();
 
       // AVCapturePhotoOutput already plays the system shutter sound on iOS.
@@ -246,7 +407,6 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
               shootingLocation: captureBoard.shootingLocation,
               workStatus: captureBoard.stepLabel,
               position: captureBoard.position.id,
-              normalizedBoardRect: normalizedBoardRect,
             )
           : originalBytes;
 
@@ -282,11 +442,10 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
 
       final Future<void> saveOperation =
           _queueOriginalSave(pendingId, bytes, captureBoard);
-      if (captureBoard.enabled) {
-        // 看板の自動送り中は保存完了を待ち、連続タップで同じ工程名の
-        // 写真が複数作られないようにする。
-        await saveOperation;
-      }
+      // Keep one full-resolution JPEG in flight. This also guarantees that
+      // board auto-advance and the thumbnail count reflect durable storage
+      // before another shutter press is accepted.
+      await saveOperation;
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -296,24 +455,6 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     } finally {
       if (mounted) setState(() => _takingPicture = false);
     }
-  }
-
-  Rect _normalizedBoardRectForCapture(
-    CameraController controller,
-    PhotoBoardPosition position,
-  ) {
-    final RenderObject? renderObject =
-        _cameraPreviewOverlayKey.currentContext?.findRenderObject();
-    if (renderObject is RenderBox &&
-        renderObject.hasSize &&
-        renderObject.size.width > 0 &&
-        renderObject.size.height > 0) {
-      return PhotoBoardLayout.normalizedRectFor(renderObject.size, position);
-    }
-    return PhotoBoardLayout.normalizedRectForAspectRatio(
-      controller.value.aspectRatio,
-      position,
-    );
   }
 
   Future<void> _queueOriginalSave(
@@ -431,23 +572,19 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     if (selectedMode == requestedMode) return;
 
     setState(() => _changingFlash = true);
+    final int generation = _cameraGeneration;
     try {
-      FlashMode appliedMode = requestedMode;
-      if (requestedMode == FlashMode.always) {
-        try {
-          await controller.setFlashMode(FlashMode.always);
-        } catch (_) {
-          // A few devices expose the LED only as a continuous torch.
-          await controller.setFlashMode(FlashMode.torch);
-          appliedMode = FlashMode.torch;
-        }
-      } else {
-        await controller.setFlashMode(requestedMode);
-      }
-
-      if (mounted) setState(() => _flashMode = appliedMode);
+      final FlashMode appliedMode = await _applyFlashMode(
+        controller,
+        requestedMode,
+      );
+      if (!_isCurrentCamera(generation, controller)) return;
+      setState(() {
+        _preferredFlashMode = requestedMode;
+        _flashMode = appliedMode;
+      });
     } catch (_) {
-      if (!mounted) return;
+      if (!mounted || !_isCurrentCamera(generation, controller)) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
@@ -456,20 +593,54 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         ),
       );
     } finally {
-      if (mounted) setState(() => _changingFlash = false);
+      if (_isCurrentCamera(generation, controller)) {
+        setState(() => _changingFlash = false);
+      } else {
+        _changingFlash = false;
+      }
     }
   }
 
-  Future<void> _changeZoom(double delta) async {
+  void _changeZoom(double delta) {
     final controller = _controller;
     if (controller == null || _maxZoom <= _minZoom || _closing) return;
 
-    final next = (_zoom + delta).clamp(_minZoom, _maxZoom).toDouble();
+    final int generation = _cameraGeneration;
+    _targetZoom = (_targetZoom + delta).clamp(_minZoom, _maxZoom).toDouble();
+    if (_zoomDrainGeneration == generation) return;
+    _zoomDrainGeneration = generation;
+    unawaited(_drainZoom(controller, generation));
+  }
+
+  Future<void> _drainZoom(
+    CameraController controller,
+    int generation,
+  ) async {
     try {
-      await controller.setZoomLevel(next);
-      if (mounted) setState(() => _zoom = next);
-    } catch (_) {
-      // Unsupported devices keep the current zoom.
+      while (_isCurrentCamera(generation, controller)) {
+        final double target = _targetZoom;
+        try {
+          await controller.setZoomLevel(target);
+        } catch (_) {
+          // Unsupported devices keep the current zoom.
+          _targetZoom = _zoom;
+          break;
+        }
+        if (!_isCurrentCamera(generation, controller)) return;
+        if ((_zoom - target).abs() > 0.001) {
+          setState(() => _zoom = target);
+        }
+        if ((_targetZoom - target).abs() <= 0.001) break;
+      }
+    } finally {
+      if (_zoomDrainGeneration == generation) {
+        _zoomDrainGeneration = null;
+        if (_isCurrentCamera(generation, controller) &&
+            (_targetZoom - _zoom).abs() > 0.001) {
+          _zoomDrainGeneration = generation;
+          unawaited(_drainZoom(controller, generation));
+        }
+      }
     }
   }
 
@@ -481,6 +652,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         previewSize.height <= 0) {
       return;
     }
+    final int generation = _cameraGeneration;
 
     final Offset point = Offset(
       (localPosition.dx / previewSize.width).clamp(0.0, 1.0),
@@ -517,7 +689,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
       }
     }
 
-    if (!adjusted && mounted) {
+    if (!adjusted && mounted && _isCurrentCamera(generation, controller)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('この端末ではタップによるピント調整を利用できません。')),
       );

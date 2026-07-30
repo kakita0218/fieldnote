@@ -19,6 +19,9 @@ class ProjectFileStore {
   static const String _photosDirectoryName = '写真';
   static const String _recoveryDirectoryName = '.fieldnote-recovery';
   static const String _recoverySourcePdfName = 'source.pdf';
+  static const String _migrationDirectoryPrefix = '.fieldnote-migration-';
+  static const String _migrationBackupPrefix = '.fieldnote-migration-backup-';
+  static const String _movingPhotoDirectoryPrefix = '.moving-';
   static const List<String> _pencilKitSuffixes = <String>[
     '.pencilkit',
     '.pencilkit.pending',
@@ -60,6 +63,19 @@ class ProjectFileStore {
   static String _pdfName(String projectName) => '${_safeName(projectName)}.pdf';
 
   static String _threeDigits(int value) => value.toString().padLeft(3, '0');
+
+  static String _migrationProjectToken(String projectId) =>
+      base64Url.encode(utf8.encode(projectId)).replaceAll('=', '');
+
+  static String _entityName(FileSystemEntity entity) => entity.uri.pathSegments
+      .where((String segment) => segment.isNotEmpty)
+      .last;
+
+  static bool _isInternalProjectDirectory(Directory directory) {
+    final String name = _entityName(directory);
+    return name.startsWith(_migrationDirectoryPrefix) ||
+        name.startsWith(_migrationBackupPrefix);
+  }
 
   static Future<File?> _manifestFile(Directory directory) async {
     File? backup;
@@ -189,28 +205,194 @@ class ProjectFileStore {
     return null;
   }
 
+  static Future<String> _availablePhotoFileName(
+    Directory directory,
+    String requestedName,
+  ) async {
+    final String safeRequested = _safeName(
+      requestedName,
+      fallback: '001.jpg',
+    );
+    final RegExp numberedJpeg = RegExp(r'^(\d+)\.jpg$', caseSensitive: false);
+    final Set<String> existingNames = <String>{};
+    int maximumNumber = 0;
+    if (await directory.exists()) {
+      await for (final FileSystemEntity entity
+          in directory.list(followLinks: false)) {
+        if (entity is! File) continue;
+        String name = _entityName(entity);
+        if (name.toLowerCase().endsWith('.jpg.bak')) {
+          final File target = File(
+            entity.path.substring(0, entity.path.length - '.bak'.length),
+          );
+          await _recoverAtomicFile(target);
+          if (!await target.exists()) continue;
+          name = _entityName(target);
+        }
+        existingNames.add(name.toLowerCase());
+        final RegExpMatch? match = numberedJpeg.firstMatch(name);
+        final int? number = int.tryParse(match?.group(1) ?? '');
+        if (number != null && number > maximumNumber) maximumNumber = number;
+      }
+    }
+
+    final RegExpMatch? requestedMatch = numberedJpeg.firstMatch(safeRequested);
+    if (requestedMatch != null) {
+      final String digits = requestedMatch.group(1)!;
+      final int requestedNumber = int.parse(digits);
+      int candidateNumber =
+          requestedNumber > maximumNumber ? requestedNumber : maximumNumber + 1;
+      final int width = digits.length < 3 ? 3 : digits.length;
+      String candidate =
+          '${candidateNumber.toString().padLeft(width, '0')}.jpg';
+      while (existingNames.contains(candidate.toLowerCase())) {
+        candidateNumber++;
+        candidate = '${candidateNumber.toString().padLeft(width, '0')}.jpg';
+      }
+      return candidate;
+    }
+
+    if (!existingNames.contains(safeRequested.toLowerCase())) {
+      return safeRequested;
+    }
+    final int dot = safeRequested.lastIndexOf('.');
+    final String stem =
+        dot > 0 ? safeRequested.substring(0, dot) : safeRequested;
+    final String extension = dot > 0 ? safeRequested.substring(dot) : '';
+    int suffix = 2;
+    String candidate = '${stem}_$suffix$extension';
+    while (existingNames.contains(candidate.toLowerCase())) {
+      suffix++;
+      candidate = '${stem}_$suffix$extension';
+    }
+    return candidate;
+  }
+
+  static Future<void> _mergePhotoDirectoryWithoutOverwrite({
+    required Directory source,
+    required Directory destination,
+  }) async {
+    await destination.create(recursive: true);
+    final List<FileSystemEntity> entries =
+        await source.list(followLinks: false).toList();
+    for (final FileSystemEntity entity in entries) {
+      if (entity is File) {
+        final String originalName = _entityName(entity);
+        if (originalName.contains('.tmp-')) continue;
+        final String targetName = await _availablePhotoFileName(
+          destination,
+          originalName,
+        );
+        await entity.rename(
+          '${destination.path}${Platform.pathSeparator}$targetName',
+        );
+      }
+    }
+    if (await source.exists()) await source.delete(recursive: true);
+  }
+
+  static Future<void> _recoverStagedPhotoDirectories({
+    required Directory projectDirectory,
+    required Map<String, dynamic> manifest,
+  }) async {
+    final Directory photos = Directory(
+      '${projectDirectory.path}${Platform.pathSeparator}'
+      '$_photosDirectoryName',
+    );
+    if (!await photos.exists()) return;
+    final Map<String, int> pinNumbers = <String, int>{
+      for (final dynamic raw in manifest['pins'] as List? ?? const <dynamic>[])
+        if (raw is Map && raw['id'] != null && raw['number'] is num)
+          raw['id'].toString(): (raw['number'] as num).toInt(),
+    };
+    await for (final FileSystemEntity entity
+        in photos.list(followLinks: false)) {
+      if (entity is! Directory) continue;
+      final String name = _entityName(entity);
+      if (!name.startsWith(_movingPhotoDirectoryPrefix)) continue;
+      final String pinId = name.substring(_movingPhotoDirectoryPrefix.length);
+      final int? pinNumber = pinNumbers[pinId];
+      // A removed pin may still be redoable in the current editor session.
+      // Keep its staged folder until a manifest containing that pin returns.
+      if (pinNumber == null) continue;
+      final Directory destination = Directory(
+        '${photos.path}${Platform.pathSeparator}${_threeDigits(pinNumber)}',
+      );
+      if (await destination.exists()) {
+        await _mergePhotoDirectoryWithoutOverwrite(
+          source: entity,
+          destination: destination,
+        );
+      } else {
+        await entity.rename(destination.path);
+      }
+    }
+  }
+
+  static Future<void> _cleanupMigrationArtifacts(
+    Directory root,
+    String projectId,
+  ) async {
+    if (!await root.exists()) return;
+    final String token = _migrationProjectToken(projectId);
+    final List<String> prefixes = <String>[
+      '$_migrationDirectoryPrefix$token-',
+      '$_migrationBackupPrefix$token-',
+    ];
+    await for (final FileSystemEntity entity in root.list(followLinks: false)) {
+      if (entity is! Directory) continue;
+      final String name = _entityName(entity);
+      if (!prefixes.any(name.startsWith)) continue;
+      try {
+        await entity.delete(recursive: true);
+      } catch (_) {
+        // A later completed migration can retry stale artifact cleanup.
+      }
+    }
+  }
+
   static Future<Directory?> _findProjectDirectory(String projectId) async {
     final Directory? cached = _projectDirectories[projectId];
     if (cached != null && await cached.exists()) {
-      await _cleanupStaleRecoveryStaging(
-        projectId: projectId,
-        projectDirectory: cached,
-      );
-      return cached;
+      try {
+        final Map<String, dynamic>? manifest = await _readManifest(cached);
+        if (manifest?['projectId']?.toString() == projectId) {
+          await _recoverStagedPhotoDirectories(
+            projectDirectory: cached,
+            manifest: manifest!,
+          );
+          await _cleanupStaleRecoveryStaging(
+            projectId: projectId,
+            projectDirectory: cached,
+          );
+          return cached;
+        }
+      } catch (_) {
+        // Fall through to a fresh root scan after a concurrent Files change.
+      }
+      _projectDirectories.remove(projectId);
     }
 
     final Directory root = await _documentsDirectory();
     if (!await root.exists()) return null;
     await for (final FileSystemEntity entity in root.list(followLinks: false)) {
       if (entity is! Directory) continue;
-      final Map<String, dynamic>? manifest = await _readManifest(entity);
-      if (manifest?['projectId']?.toString() == projectId) {
+      if (_isInternalProjectDirectory(entity)) continue;
+      try {
+        final Map<String, dynamic>? manifest = await _readManifest(entity);
+        if (manifest?['projectId']?.toString() != projectId) continue;
+        await _recoverStagedPhotoDirectories(
+          projectDirectory: entity,
+          manifest: manifest!,
+        );
         _projectDirectories[projectId] = entity;
         await _cleanupStaleRecoveryStaging(
           projectId: projectId,
           projectDirectory: entity,
         );
         return entity;
+      } catch (_) {
+        // A Files operation may transiently move one directory during a scan.
       }
     }
     return null;
@@ -375,29 +557,55 @@ class ProjectFileStore {
     if (!await root.exists()) return const <ProjectSummary>[];
 
     final List<ProjectSummary> projects = <ProjectSummary>[];
+    final Map<String, Directory> discovered = <String, Directory>{};
+    final Set<String> completedMigrations = <String>{};
     await for (final FileSystemEntity entity in root.list(followLinks: false)) {
       if (entity is! Directory) continue;
-      final Map<String, dynamic>? manifest = await _readManifest(entity);
-      if (manifest == null) continue;
-      final String id = manifest['projectId']?.toString() ?? '';
-      if (id.isEmpty) continue;
-      await _cleanupStaleRecoveryStaging(
-        projectId: id,
-        projectDirectory: entity,
-      );
-      _projectDirectories[id] = entity;
-      projects.add(
-        ProjectSummary(
-          id: id,
-          name: manifest['projectName']?.toString() ?? '名称未設定',
-          updatedAt:
-              DateTime.tryParse(manifest['updatedAt']?.toString() ?? '') ??
-                  DateTime.fromMillisecondsSinceEpoch(0),
-          pageCount: (manifest['pageCount'] as num?)?.toInt() ?? 0,
-          photoCount: (manifest['photos'] as List?)?.length ?? 0,
-          pinCount: (manifest['pins'] as List?)?.length ?? 0,
-        ),
-      );
+      if (_isInternalProjectDirectory(entity)) continue;
+      try {
+        final Map<String, dynamic>? manifest = await _readManifest(entity);
+        if (manifest == null) continue;
+        final String id = manifest['projectId']?.toString() ?? '';
+        if (id.isEmpty || discovered.containsKey(id)) continue;
+        await _recoverStagedPhotoDirectories(
+          projectDirectory: entity,
+          manifest: manifest,
+        );
+        await _cleanupStaleRecoveryStaging(
+          projectId: id,
+          projectDirectory: entity,
+        );
+        if (manifest['fileMigrationComplete'] == true) {
+          completedMigrations.add(id);
+        }
+        discovered[id] = entity;
+        projects.add(
+          ProjectSummary(
+            id: id,
+            name: manifest['projectName']?.toString() ?? '名称未設定',
+            updatedAt:
+                DateTime.tryParse(manifest['updatedAt']?.toString() ?? '') ??
+                    DateTime.fromMillisecondsSinceEpoch(0),
+            pageCount: manifest['pageCount'] is num
+                ? (manifest['pageCount'] as num).toInt()
+                : 0,
+            photoCount: manifest['photos'] is List
+                ? (manifest['photos'] as List).length
+                : 0,
+            pinCount: manifest['pins'] is List
+                ? (manifest['pins'] as List).length
+                : 0,
+          ),
+        );
+      } catch (_) {
+        // One damaged or concurrently moved folder must not hide other cases.
+      }
+    }
+    _projectDirectories
+      ..clear()
+      ..addAll(discovered);
+    for (final String id in completedMigrations) {
+      await _cleanupMigrationArtifacts(root, id);
     }
     projects.sort(
       (ProjectSummary a, ProjectSummary b) =>
@@ -509,7 +717,158 @@ class ProjectFileStore {
     await _writeJsonAtomically(target, manifest);
   }
 
-  static Future<void> _reconcilePhotoDirectories({
+  static Future<void> importProjectAtomically({
+    required String projectId,
+    required String projectName,
+    required Uint8List pdfBytes,
+    required Map<String, dynamic> metadata,
+    required List<Map<String, dynamic>> pins,
+    required List<Map<String, dynamic>> strokes,
+    required List<Map<String, dynamic>> photos,
+  }) async {
+    if (pdfBytes.isEmpty) throw StateError('PDFデータが空です。');
+    final Directory root = await _documentsDirectory();
+    await root.create(recursive: true);
+    final Directory? existing = await _findProjectDirectory(projectId);
+    final String nonce = DateTime.now().microsecondsSinceEpoch.toString();
+    final Directory staging = Directory(
+      '${root.path}${Platform.pathSeparator}'
+      '$_migrationDirectoryPrefix${_migrationProjectToken(projectId)}-$nonce',
+    );
+    await staging.create(recursive: true);
+
+    try {
+      await _writeBytesAtomically(
+        File(
+          '${staging.path}${Platform.pathSeparator}${_pdfName(projectName)}',
+        ),
+        pdfBytes,
+      );
+      final Map<String, int> pinNumbers = <String, int>{
+        for (final Map<String, dynamic> pin in pins)
+          if (pin['id'] != null && pin['number'] is num)
+            pin['id'].toString(): (pin['number'] as num).toInt(),
+      };
+      final List<Map<String, dynamic>> photoRecords = <Map<String, dynamic>>[];
+      for (final Map<String, dynamic> rawPhoto in photos) {
+        final dynamic rawBytes = rawPhoto['bytes'];
+        final Uint8List? bytes = rawBytes is Uint8List
+            ? rawBytes
+            : rawBytes is List<int>
+                ? Uint8List.fromList(rawBytes)
+                : null;
+        if (bytes == null || bytes.isEmpty) continue;
+        final String pinId = rawPhoto['pinId']?.toString() ?? '';
+        final int? pinNumber = pinNumbers[pinId] ??
+            (rawPhoto['pinNumber'] is num
+                ? (rawPhoto['pinNumber'] as num).toInt()
+                : null);
+        if (pinNumber == null) continue;
+        final Directory photoDirectory = Directory(
+          '${staging.path}${Platform.pathSeparator}$_photosDirectoryName'
+          '${Platform.pathSeparator}${_threeDigits(pinNumber)}',
+        );
+        await photoDirectory.create(recursive: true);
+        final String storedFileName = await _availablePhotoFileName(
+          photoDirectory,
+          rawPhoto['fileName']?.toString() ?? '001.jpg',
+        );
+        await _writeBytesAtomically(
+          File(
+            '${photoDirectory.path}${Platform.pathSeparator}$storedFileName',
+          ),
+          bytes,
+        );
+        photoRecords.add(<String, dynamic>{
+          'projectId': projectId,
+          'pinId': pinId,
+          'pinNumber': pinNumber,
+          'photoId': rawPhoto['photoId']?.toString() ??
+              '$pinId-$storedFileName-$nonce',
+          'fileName': storedFileName,
+          'createdAt': rawPhoto['createdAt']?.toString() ??
+              DateTime.now().toIso8601String(),
+          'byteLength': bytes.length,
+        });
+      }
+
+      final Map<String, dynamic> manifest = <String, dynamic>{
+        ...metadata,
+        'schemaVersion': _schemaVersion,
+        'projectId': projectId,
+        'projectName': projectName,
+        'pdfName': _pdfName(projectName),
+        'updatedAt': DateTime.now().toIso8601String(),
+        'pins': pins,
+        'strokes': strokes,
+        'photos': photoRecords,
+        'fileMigrationComplete': true,
+      };
+      await _writeJsonAtomically(
+        File(
+          '${staging.path}${Platform.pathSeparator}'
+          '${_manifestName(projectName)}',
+        ),
+        manifest,
+      );
+
+      // Keep the hidden editor source recoverable before publishing a complete
+      // manifest. A stopped migration therefore leaves either the old project
+      // or no visible project, and the Hive source can safely retry.
+      await _writeBytesAtomically(await _sourcePdfFile(projectId), pdfBytes);
+
+      Directory destination;
+      Directory? backup;
+      if (existing != null && await existing.exists()) {
+        backup = Directory(
+          '${root.path}${Platform.pathSeparator}'
+          '$_migrationBackupPrefix'
+          '${_migrationProjectToken(projectId)}-$nonce',
+        );
+        await existing.rename(backup.path);
+        try {
+          destination = await staging.rename(existing.path);
+        } catch (_) {
+          if (!await existing.exists() && await backup.exists()) {
+            await backup.rename(existing.path);
+          }
+          rethrow;
+        }
+      } else {
+        final String baseName = _safeName(projectName);
+        String candidate = baseName;
+        int suffix = 2;
+        destination = Directory(
+          '${root.path}${Platform.pathSeparator}$candidate',
+        );
+        while (await destination.exists()) {
+          candidate = '${baseName}_$suffix';
+          suffix++;
+          destination = Directory(
+            '${root.path}${Platform.pathSeparator}$candidate',
+          );
+        }
+        destination = await staging.rename(destination.path);
+      }
+      _projectDirectories[projectId] = destination;
+      if (backup != null && await backup.exists()) {
+        try {
+          await backup.delete(recursive: true);
+        } catch (_) {
+          // The published project is complete; stale hidden backup cleanup is
+          // best effort and is retried after a later migration.
+        }
+      }
+      await _cleanupMigrationArtifacts(root, projectId);
+    } catch (_) {
+      if (await staging.exists()) {
+        await staging.delete(recursive: true);
+      }
+      rethrow;
+    }
+  }
+
+  static Future<Map<String, Directory>> _stagePhotoDirectoryMoves({
     required Directory directory,
     required Map<String, dynamic> oldManifest,
     required List<Map<String, dynamic>> newPins,
@@ -517,7 +876,7 @@ class ProjectFileStore {
     final Directory photos = Directory(
       '${directory.path}${Platform.pathSeparator}$_photosDirectoryName',
     );
-    if (!await photos.exists()) return;
+    if (!await photos.exists()) return <String, Directory>{};
 
     final Map<String, int> oldNumbers = <String, int>{
       for (final dynamic raw
@@ -534,7 +893,7 @@ class ProjectFileStore {
     final Map<String, Directory> staged = <String, Directory>{};
     for (final MapEntry<String, int> entry in oldNumbers.entries) {
       final int? newNumber = newNumbers[entry.key];
-      if (newNumber == null || newNumber == entry.value) continue;
+      if (newNumber == entry.value) continue;
       final Directory current = Directory(
         '${photos.path}${Platform.pathSeparator}${_threeDigits(entry.value)}',
       );
@@ -549,20 +908,39 @@ class ProjectFileStore {
       if (!await current.exists()) continue;
       staged[entry.key] = await current.rename(temporary.path);
     }
+    return staged;
+  }
 
+  static Future<void> _finalizePhotoDirectoryMoves({
+    required Directory directory,
+    required Map<String, Directory> staged,
+    required List<Map<String, dynamic>> newPins,
+  }) async {
+    final Directory photos = Directory(
+      '${directory.path}${Platform.pathSeparator}$_photosDirectoryName',
+    );
+    final Map<String, int> newNumbers = <String, int>{
+      for (final Map<String, dynamic> pin in newPins)
+        if (pin['id'] != null && pin['number'] is num)
+          pin['id'].toString(): (pin['number'] as num).toInt(),
+    };
     for (final MapEntry<String, Directory> entry in staged.entries) {
       final int? number = newNumbers[entry.key];
       if (number == null) {
-        await entry.value.delete(recursive: true);
+        // Preserve data belonging to a temporarily undone pin.
         continue;
       }
       final Directory destination = Directory(
         '${photos.path}${Platform.pathSeparator}${_threeDigits(number)}',
       );
       if (await destination.exists()) {
-        await destination.delete(recursive: true);
+        await _mergePhotoDirectoryWithoutOverwrite(
+          source: entry.value,
+          destination: destination,
+        );
+      } else {
+        await entry.value.rename(destination.path);
       }
-      await entry.value.rename(destination.path);
     }
   }
 
@@ -580,11 +958,30 @@ class ProjectFileStore {
     );
     final Map<String, dynamic> oldManifest =
         await _readManifest(directory) ?? <String, dynamic>{};
-    await _reconcilePhotoDirectories(
+    await _recoverStagedPhotoDirectories(
+      projectDirectory: directory,
+      manifest: oldManifest,
+    );
+    final Map<String, Directory> staged = await _stagePhotoDirectoryMoves(
       directory: directory,
       oldManifest: oldManifest,
       newPins: pins,
     );
+    final Map<String, int> newPinNumbers = <String, int>{
+      for (final Map<String, dynamic> pin in pins)
+        if (pin['id'] != null && pin['number'] is num)
+          pin['id'].toString(): (pin['number'] as num).toInt(),
+    };
+    final List<Map<String, dynamic>> reconciledPhotos = photos.map(
+      (Map<String, dynamic> photo) {
+        final String pinId = photo['pinId']?.toString() ?? '';
+        final int? newNumber = newPinNumbers[pinId];
+        return <String, dynamic>{
+          ...photo,
+          if (newNumber != null) 'pinNumber': newNumber,
+        };
+      },
+    ).toList(growable: false);
 
     final Map<String, dynamic> manifest = <String, dynamic>{
       ...oldManifest,
@@ -596,13 +993,35 @@ class ProjectFileStore {
       'updatedAt': DateTime.now().toIso8601String(),
       'pins': pins,
       'strokes': strokes,
-      'photos': photos,
+      'photos': reconciledPhotos,
     };
     final File? oldFile = await _manifestFile(directory);
     final File target = File(
       '${directory.path}${Platform.pathSeparator}${_manifestName(projectName)}',
     );
-    await _writeJsonAtomically(target, manifest);
+    try {
+      // Commit the new pin mapping before finalizing staged photo directories.
+      // Recovery can then use whichever manifest survived a process stop to
+      // roll the folders forward or back to a consistent numbering scheme.
+      await _writeJsonAtomically(target, manifest);
+    } catch (_) {
+      await _recoverStagedPhotoDirectories(
+        projectDirectory: directory,
+        manifest: oldManifest,
+      );
+      rethrow;
+    }
+    await _finalizePhotoDirectoryMoves(
+      directory: directory,
+      staged: staged,
+      newPins: pins,
+    );
+    // This also recovers a photo folder retained by a previous Undo when that
+    // pin is restored from persisted Redo history.
+    await _recoverStagedPhotoDirectories(
+      projectDirectory: directory,
+      manifest: manifest,
+    );
     if (oldFile != null &&
         oldFile.path != target.path &&
         await oldFile.exists()) {
@@ -610,7 +1029,7 @@ class ProjectFileStore {
     }
   }
 
-  static Future<void> savePhoto({
+  static Future<String> savePhoto({
     required String projectId,
     required String projectName,
     required String pinId,
@@ -628,8 +1047,12 @@ class ProjectFileStore {
       '${Platform.pathSeparator}${_threeDigits(pinNumber)}',
     );
     await photos.create(recursive: true);
+    final String storedFileName = await _availablePhotoFileName(
+      photos,
+      fileName,
+    );
     final File photo = File(
-      '${photos.path}${Platform.pathSeparator}${_safeName(fileName)}',
+      '${photos.path}${Platform.pathSeparator}$storedFileName',
     );
     await _writeBytesAtomically(photo, bytes);
 
@@ -645,7 +1068,7 @@ class ProjectFileStore {
       'pinId': pinId,
       'pinNumber': pinNumber,
       'photoId': photoId,
-      'fileName': fileName,
+      'fileName': storedFileName,
       'createdAt': DateTime.now().toIso8601String(),
       'byteLength': bytes.length,
     });
@@ -664,6 +1087,7 @@ class ProjectFileStore {
           '${_manifestName(projectName)}',
         );
     await _writeJsonAtomically(target, manifest);
+    return storedFileName;
   }
 
   static Future<List<Map<String, dynamic>>> _photoMetadataFromManifest(
@@ -756,6 +1180,67 @@ class ProjectFileStore {
     return _photoMetadataFromManifest(directory, manifest);
   }
 
+  static Future<Uint8List?> loadPhotoBytes({
+    required String projectId,
+    required String photoId,
+    required int pinNumber,
+    required String fileName,
+  }) async {
+    final Directory? directory = await _findProjectDirectory(projectId);
+    if (directory == null) return null;
+    if (pinNumber < 1 ||
+        fileName.isEmpty ||
+        fileName.contains('/') ||
+        fileName.contains(r'\')) {
+      return null;
+    }
+    final File file = File(
+      '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
+      '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
+      '${Platform.pathSeparator}$fileName',
+    );
+    if (!await file.exists()) return null;
+    return file.readAsBytes();
+  }
+
+  /// Visits full-resolution photos one at a time after resolving the project
+  /// directory once. The callback must finish before the next JPEG is read, so
+  /// callers can stream an arbitrarily large project without retaining every
+  /// photo in memory.
+  static Future<bool> visitPhotoBytes({
+    required String projectId,
+    required List<Map<String, dynamic>> photos,
+    required Future<void> Function(
+      int index,
+      Map<String, dynamic> photo,
+      Uint8List bytes,
+    ) visitor,
+  }) async {
+    final Directory? directory = await _findProjectDirectory(projectId);
+    if (directory == null) return false;
+
+    for (int index = 0; index < photos.length; index++) {
+      final Map<String, dynamic> photo = photos[index];
+      final int? pinNumber = (photo['pinNumber'] as num?)?.toInt();
+      final String fileName = photo['fileName']?.toString() ?? '';
+      if (pinNumber == null ||
+          pinNumber < 1 ||
+          fileName.isEmpty ||
+          fileName.contains('/') ||
+          fileName.contains(r'\')) {
+        continue;
+      }
+      final File file = File(
+        '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
+        '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
+        '${Platform.pathSeparator}$fileName',
+      );
+      if (!await file.exists()) continue;
+      await visitor(index, photo, await file.readAsBytes());
+    }
+    return true;
+  }
+
   static Future<List<Map<String, dynamic>>?> loadPhotosForPin({
     required String projectId,
     required String pinId,
@@ -779,7 +1264,7 @@ class ProjectFileStore {
       if (!await file.exists()) continue;
       result.add(<String, dynamic>{
         ...record,
-        'bytes': Uint8List.fromList(await file.readAsBytes()),
+        'bytes': await file.readAsBytes(),
       });
     }
     return result;
@@ -806,7 +1291,7 @@ class ProjectFileStore {
       if (await file.exists()) {
         result.add(<String, dynamic>{
           ...record,
-          'bytes': Uint8List.fromList(await file.readAsBytes()),
+          'bytes': await file.readAsBytes(),
         });
       }
     }
@@ -843,6 +1328,21 @@ class ProjectFileStore {
         '${Platform.pathSeparator}${_threeDigits(number)}',
       );
       if (await photos.exists()) await photos.delete(recursive: true);
+    }
+    final Directory photosRoot = Directory(
+      '${directory.path}${Platform.pathSeparator}$_photosDirectoryName',
+    );
+    if (await photosRoot.exists()) {
+      await for (final FileSystemEntity entity
+          in photosRoot.list(followLinks: false)) {
+        if (entity is! Directory) continue;
+        // Compare an enumerated direct child instead of interpolating pinId
+        // into a path, so a damaged user-visible manifest cannot traverse out
+        // of the photo root.
+        if (_entityName(entity) == '$_movingPhotoDirectoryPrefix$pinId') {
+          await entity.delete(recursive: true);
+        }
+      }
     }
     final List<dynamic> records =
         List<dynamic>.from(manifest['photos'] as List? ?? const <dynamic>[])

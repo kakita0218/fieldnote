@@ -1,4 +1,5 @@
 import Flutter
+import ImageIO
 import PDFKit
 import PencilKit
 import UIKit
@@ -158,8 +159,7 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
       return
     }
     guard
-      let typedBytes = arguments["jpegBytes"] as? FlutterStandardTypedData,
-      let sourceImage = UIImage(data: typedBytes.data)
+      let typedBytes = arguments["jpegBytes"] as? FlutterStandardTypedData
     else {
       result(
         FlutterError(
@@ -177,67 +177,131 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
     let shootingLocation = arguments["shootingLocation"] as? String ?? ""
     let workStatus = arguments["workStatus"] as? String ?? ""
     let position = arguments["position"] as? String ?? "bottomLeft"
-    let normalizedBoardRect = Self.readNormalizedBoardRect(arguments)
+    let sourceData = typedBytes.data
+    let task = startBackgroundTask(named: "FieldNote photo board")
 
-    let format = UIGraphicsImageRendererFormat.default()
-    format.scale = sourceImage.scale
-    format.opaque = true
-    let renderer = UIGraphicsImageRenderer(
-      size: sourceImage.size,
-      format: format
-    )
-    let composed = renderer.image { rendererContext in
-      sourceImage.draw(
-        in: CGRect(origin: .zero, size: sourceImage.size)
-      )
-      Self.drawPhotoBoard(
-        in: rendererContext.cgContext,
-        canvasSize: sourceImage.size,
-        businessName: businessName,
-        facilityName: facilityName,
-        shootingDate: shootingDate,
-        shootingLocation: shootingLocation,
-        workStatus: workStatus,
-        position: position,
-        normalizedBoardRect: normalizedBoardRect
-      )
-    }
+    // Decoding and rendering a maximum-resolution camera image can occupy
+    // hundreds of MB temporarily. Keep that work off Flutter's main thread
+    // and release all intermediate UIKit/Core Graphics objects promptly.
+    DispatchQueue.global(qos: .userInitiated).async {
+      let composition: (jpeg: Data?, decoded: Bool) = autoreleasepool {
+        guard let sourceImage = UIImage(data: sourceData) else {
+          return (nil, false)
+        }
 
-    guard let jpeg = composed.jpegData(compressionQuality: 0.94) else {
-      result(
-        FlutterError(
-          code: "photo_encode_failed",
-          message: "電子看板入り写真を保存形式に変換できませんでした。",
-          details: nil
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = sourceImage.scale
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(
+          size: sourceImage.size,
+          format: format
         )
-      )
-      return
+        let composed = renderer.image { rendererContext in
+          sourceImage.draw(
+            in: CGRect(origin: .zero, size: sourceImage.size)
+          )
+          Self.drawPhotoBoard(
+            in: rendererContext.cgContext,
+            canvasSize: sourceImage.size,
+            businessName: businessName,
+            facilityName: facilityName,
+            shootingDate: shootingDate,
+            shootingLocation: shootingLocation,
+            workStatus: workStatus,
+            position: position
+          )
+        }
+        return (
+          Self.jpegData(
+            from: composed,
+            copyingMetadataFrom: sourceData,
+            compressionQuality: 0.94
+          ),
+          true
+        )
+      }
+
+      DispatchQueue.main.async {
+        self.finishBackgroundTask(task)
+        guard let jpeg = composition.jpeg else {
+          result(
+            FlutterError(
+              code: composition.decoded
+                ? "photo_encode_failed"
+                : "invalid_photo",
+              message: composition.decoded
+                ? "電子看板入り写真を保存形式に変換できませんでした。"
+                : "撮影画像を読み取れませんでした。",
+              details: nil
+            )
+          )
+          return
+        }
+        result(FlutterStandardTypedData(bytes: jpeg))
+      }
     }
-    result(FlutterStandardTypedData(bytes: jpeg))
   }
 
-  private static func readNormalizedBoardRect(
-    _ arguments: [String: Any]
-  ) -> CGRect? {
-    guard
-      let left = (arguments["boardLeft"] as? NSNumber)?.doubleValue,
-      let top = (arguments["boardTop"] as? NSNumber)?.doubleValue,
-      let width = (arguments["boardWidth"] as? NSNumber)?.doubleValue,
-      let height = (arguments["boardHeight"] as? NSNumber)?.doubleValue,
-      left.isFinite,
-      top.isFinite,
-      width.isFinite,
-      height.isFinite,
-      left >= 0,
-      top >= 0,
-      width > 0,
-      height > 0,
-      left + width <= 1.000_001,
-      top + height <= 1.000_001
-    else {
-      return nil
+  private static func jpegData(
+    from image: UIImage,
+    copyingMetadataFrom sourceData: Data,
+    compressionQuality: CGFloat
+  ) -> Data? {
+    guard let imageRef = image.cgImage else {
+      return image.jpegData(compressionQuality: compressionQuality)
     }
-    return CGRect(x: left, y: top, width: width, height: height)
+    guard
+      let destinationData = CFDataCreateMutable(nil, 0),
+      let destination = CGImageDestinationCreateWithData(
+        destinationData,
+        "public.jpeg" as CFString,
+        1,
+        nil
+      )
+    else {
+      return image.jpegData(compressionQuality: compressionQuality)
+    }
+
+    var properties: [CFString: Any] = [:]
+    if
+      let source = CGImageSourceCreateWithData(sourceData as CFData, nil),
+      let sourceProperties = CGImageSourceCopyPropertiesAtIndex(
+        source,
+        0,
+        nil
+      ) as? [CFString: Any]
+    {
+      properties = sourceProperties
+    }
+
+    // UIImage.draw renders the source in its display orientation. Normalize
+    // the copied orientation tag so readers do not rotate the output twice.
+    properties[kCGImagePropertyOrientation] = 1
+    properties[kCGImagePropertyPixelWidth] = imageRef.width
+    properties[kCGImagePropertyPixelHeight] = imageRef.height
+    properties[kCGImageDestinationLossyCompressionQuality] =
+      compressionQuality
+    if var exif =
+      properties[kCGImagePropertyExifDictionary] as? [CFString: Any]
+    {
+      exif[kCGImagePropertyExifPixelXDimension] = imageRef.width
+      exif[kCGImagePropertyExifPixelYDimension] = imageRef.height
+      properties[kCGImagePropertyExifDictionary] = exif
+    }
+    if var tiff =
+      properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any]
+    {
+      tiff[kCGImagePropertyTIFFOrientation] = 1
+      properties[kCGImagePropertyTIFFDictionary] = tiff
+    }
+
+    CGImageDestinationAddImage(
+      destination,
+      imageRef,
+      properties as CFDictionary
+    )
+    guard CGImageDestinationFinalize(destination) else { return nil }
+    return destinationData as Data
   }
 
   private static func drawPhotoBoard(
@@ -248,8 +312,7 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
     shootingDate: String,
     shootingLocation: String,
     workStatus: String,
-    position: String,
-    normalizedBoardRect: CGRect?
+    position: String
   ) {
     let landscape = canvasSize.width >= canvasSize.height
     let boardWidth = landscape
@@ -259,20 +322,16 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
     let margin = min(canvasSize.width, canvasSize.height) * 0.035
     let placeOnRight = position == "topRight" || position == "bottomRight"
     let placeOnTop = position == "topLeft" || position == "topRight"
-    let fallbackBoard = CGRect(
+    // Calculate the board from the decoded JPEG's final, orientation-correct
+    // canvas. A still photo is not guaranteed to have the same aspect ratio as
+    // the live preview, so preview-normalized dimensions can distort or shift
+    // the saved board.
+    let board = CGRect(
       x: placeOnRight ? canvasSize.width - boardWidth - margin : margin,
       y: placeOnTop ? margin : canvasSize.height - boardHeight - margin,
       width: boardWidth,
       height: boardHeight
     )
-    let board = normalizedBoardRect.map {
-      CGRect(
-        x: $0.origin.x * canvasSize.width,
-        y: $0.origin.y * canvasSize.height,
-        width: $0.size.width * canvasSize.width,
-        height: $0.size.height * canvasSize.height
-      )
-    } ?? fallbackBoard
     let lineWidth = max(2, boardWidth * 0.0048)
     let white = UIColor.white
     let boardGreen = UIColor(
@@ -488,10 +547,8 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
     _ call: FlutterMethodCall,
     result: @escaping FlutterResult
   ) {
-    guard
-      let arguments = arguments(call, result: result),
-      let value = arguments["identifier"] as? Int
-    else {
+    guard let arguments = arguments(call, result: result) else { return }
+    guard let value = arguments["identifier"] as? Int else {
       result(nil)
       return
     }
@@ -707,6 +764,86 @@ private enum FieldNotePdfError: LocalizedError {
   }
 }
 
+struct FieldNotePdfPageGeometry {
+  let bounds: CGRect
+  let rotation: Int
+
+  init(bounds: CGRect, rotation: Int) {
+    self.bounds = bounds
+    self.rotation = ((rotation % 360) + 360) % 360
+  }
+
+  init(page: PDFPage) {
+    self.init(
+      // pdfx renders and reports MediaBox dimensions on iOS. Stored ratios
+      // must use the same box so annotations stay aligned when CropBox differs.
+      bounds: page.bounds(for: .mediaBox),
+      rotation: page.rotation
+    )
+  }
+
+  func point(xRatio: CGFloat, yRatio: CGFloat) -> CGPoint? {
+    guard
+      bounds.width.isFinite,
+      bounds.height.isFinite,
+      bounds.width > 0,
+      bounds.height > 0,
+      xRatio.isFinite,
+      yRatio.isFinite
+    else {
+      return nil
+    }
+    let x = min(max(xRatio, 0), 1)
+    let y = min(max(yRatio, 0), 1)
+
+    switch rotation {
+    case 90:
+      return CGPoint(
+        x: bounds.minX + y * bounds.width,
+        y: bounds.minY + x * bounds.height
+      )
+    case 180:
+      return CGPoint(
+        x: bounds.minX + (1 - x) * bounds.width,
+        y: bounds.minY + y * bounds.height
+      )
+    case 270:
+      return CGPoint(
+        x: bounds.minX + (1 - y) * bounds.width,
+        y: bounds.minY + (1 - x) * bounds.height
+      )
+    default:
+      return CGPoint(
+        x: bounds.minX + x * bounds.width,
+        y: bounds.minY + (1 - y) * bounds.height
+      )
+    }
+  }
+
+  func direction(degrees: CGFloat) -> CGPoint {
+    let angle = degrees * .pi / 180
+    let screenX = sin(angle)
+    let screenY = -cos(angle)
+    let pageDirection: CGPoint
+    switch rotation {
+    case 90:
+      pageDirection = CGPoint(x: screenY, y: screenX)
+    case 180:
+      pageDirection = CGPoint(x: -screenX, y: screenY)
+    case 270:
+      pageDirection = CGPoint(x: -screenY, y: -screenX)
+    default:
+      pageDirection = CGPoint(x: screenX, y: -screenY)
+    }
+    let length = hypot(pageDirection.x, pageDirection.y)
+    guard length > 0 else { return CGPoint(x: 0, y: 1) }
+    return CGPoint(
+      x: pageDirection.x / length,
+      y: pageDirection.y / length
+    )
+  }
+}
+
 private enum FieldNotePdfWriter {
   private static let exportPrefix = "fieldnote-export:"
 
@@ -755,40 +892,48 @@ private enum FieldNotePdfWriter {
         pageNumber > 0,
         pageNumber <= document.pageCount,
         let page = document.page(at: pageNumber - 1),
-        let rawPoints = stroke["points"] as? [[String: Any]],
-        rawPoints.count > 1
+        let rawPoints = stroke["points"] as? [Any],
+        !rawPoints.isEmpty
       else {
         continue
       }
-      let pageBounds = page.bounds(for: .mediaBox)
-      let path = UIBezierPath()
-      for (index, rawPoint) in rawPoints.enumerated() {
+
+      let geometry = FieldNotePdfPageGeometry(page: page)
+      let rawBaseWidth = number(stroke["width"])?.doubleValue ?? 3
+      let baseWidth: CGFloat =
+        rawBaseWidth.isFinite && rawBaseWidth > 0
+        ? CGFloat(rawBaseWidth)
+        : 3
+      var points: [CGPoint] = []
+      var widths: [CGFloat] = []
+      for rawValue in rawPoints {
         guard
+          let rawPoint = rawValue as? [String: Any],
           let x = number(rawPoint["x"])?.doubleValue,
-          let y = number(rawPoint["y"])?.doubleValue
+          let y = number(rawPoint["y"])?.doubleValue,
+          x.isFinite,
+          y.isFinite,
+          let point = geometry.point(
+            xRatio: CGFloat(x),
+            yRatio: CGFloat(y)
+          )
         else {
           continue
         }
-        let point = CGPoint(
-          x: CGFloat(x) * pageBounds.width,
-          y: (1 - CGFloat(y)) * pageBounds.height
-        )
-        if index == 0 {
-          path.move(to: point)
-        } else {
-          path.addLine(to: point)
-        }
+        let rawPressure = number(rawPoint["pressure"])?.doubleValue ?? 0.5
+        let pressure = rawPressure.isFinite
+          ? min(max(CGFloat(rawPressure), 0), 1)
+          : 0.5
+        points.append(point)
+        widths.append(baseWidth * (0.55 + pressure * 0.9))
       }
-      let annotation = PDFAnnotation(
-        bounds: CGRect(origin: .zero, size: pageBounds.size),
-        forType: .ink,
-        withProperties: nil
+      guard !points.isEmpty else { continue }
+
+      let annotation = FieldNotePressureStrokeAnnotation(
+        points: points,
+        widths: widths,
+        strokeColor: color(from: stroke["color"])
       )
-      annotation.add(path)
-      annotation.color = color(from: stroke["color"])
-      let border = PDFBorder()
-      border.lineWidth = CGFloat(number(stroke["width"])?.doubleValue ?? 3)
-      annotation.border = border
       setName(
         "\(exportPrefix)stroke:\(stroke["id"] as? String ?? UUID().uuidString)",
         on: annotation
@@ -808,15 +953,21 @@ private enum FieldNotePdfWriter {
         pageNumber <= document.pageCount,
         let page = document.page(at: pageNumber - 1),
         let x = number(pin["xRatio"])?.doubleValue,
-        let y = number(pin["yRatio"])?.doubleValue
+        let y = number(pin["yRatio"])?.doubleValue,
+        x.isFinite,
+        y.isFinite
       else {
         continue
       }
-      let pageBounds = page.bounds(for: .mediaBox)
-      let center = CGPoint(
-        x: CGFloat(x) * pageBounds.width,
-        y: (1 - CGFloat(y)) * pageBounds.height
-      )
+      let geometry = FieldNotePdfPageGeometry(page: page)
+      guard
+        let center = geometry.point(
+          xRatio: CGFloat(x),
+          yRatio: CGFloat(y)
+        )
+      else {
+        continue
+      }
       let pinColor = color(from: pin["colorValue"])
       let edgeColor = readableEdgeColor(for: pinColor)
       let pinId = pin["id"] as? String ?? UUID().uuidString
@@ -841,6 +992,7 @@ private enum FieldNotePdfWriter {
           forType: .circle,
           withProperties: nil
         )
+        photoRing.shouldPrint = true
         photoRing.color = UIColor(
           red: CGFloat(0x49) / 255,
           green: CGFloat(0xb7) / 255,
@@ -856,9 +1008,9 @@ private enum FieldNotePdfWriter {
       }
 
       let direction =
-        CGFloat(number(pin["directionDegrees"])?.doubleValue ?? 0) * .pi / 180
-      let forward = CGPoint(x: sin(direction), y: cos(direction))
-      let side = CGPoint(x: cos(direction), y: -sin(direction))
+        CGFloat(number(pin["directionDegrees"])?.doubleValue ?? 0)
+      let forward = geometry.direction(degrees: direction)
+      let side = CGPoint(x: forward.y, y: -forward.x)
       let arrowCenter = CGPoint(
         x: center.x + forward.x * (radius + 5),
         y: center.y + forward.y * (radius + 5)
@@ -894,6 +1046,7 @@ private enum FieldNotePdfWriter {
         forType: .circle,
         withProperties: nil
       )
+      circle.shouldPrint = true
       circle.color = edgeColor
       circle.interiorColor = pinColor
       let circleBorder = PDFBorder()
@@ -907,6 +1060,7 @@ private enum FieldNotePdfWriter {
         forType: .freeText,
         withProperties: nil
       )
+      label.shouldPrint = true
       label.contents = numberText
       label.font = .boldSystemFont(ofSize: numberText.count >= 3 ? 9 : 11)
       label.fontColor = readableTextColor(for: pinColor)
@@ -985,6 +1139,97 @@ private enum FieldNotePdfWriter {
   }
 }
 
+private final class FieldNotePressureStrokeAnnotation: PDFAnnotation {
+  private let points: [CGPoint]
+  private let widths: [CGFloat]
+  private let strokeColor: UIColor
+
+  init(
+    points: [CGPoint],
+    widths: [CGFloat],
+    strokeColor: UIColor
+  ) {
+    self.points = points
+    self.widths = widths
+    self.strokeColor = strokeColor
+
+    let maximumWidth = widths.max() ?? 3
+    let inset = maximumWidth / 2 + 2
+    let minX = points.map(\.x).min() ?? 0
+    let maxX = points.map(\.x).max() ?? 0
+    let minY = points.map(\.y).min() ?? 0
+    let maxY = points.map(\.y).max() ?? 0
+    super.init(
+      bounds: CGRect(
+        x: minX - inset,
+        y: minY - inset,
+        width: maxX - minX + inset * 2,
+        height: maxY - minY + inset * 2
+      ),
+      forType: .stamp,
+      withProperties: nil
+    )
+    color = strokeColor
+    shouldPrint = true
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func draw(with box: PDFDisplayBox, in context: CGContext) {
+    guard let firstPoint = points.first else { return }
+    context.saveGState()
+    defer { context.restoreGState() }
+    context.setAllowsAntialiasing(true)
+    context.setShouldAntialias(true)
+    context.setStrokeColor(strokeColor.cgColor)
+    context.setFillColor(strokeColor.cgColor)
+    context.setLineCap(.round)
+    context.setLineJoin(.round)
+
+    if points.count == 1 {
+      let width = widths.first ?? 3
+      context.fillEllipse(
+        in: CGRect(
+          x: firstPoint.x - width / 2,
+          y: firstPoint.y - width / 2,
+          width: width,
+          height: width
+        )
+      )
+      return
+    }
+
+    for index in 1..<points.count {
+      let start = points[index - 1]
+      let end = points[index]
+      let startWidth = widths.indices.contains(index - 1)
+        ? widths[index - 1]
+        : 3
+      let endWidth = widths.indices.contains(index) ? widths[index] : startWidth
+      let width = (startWidth + endWidth) / 2
+      if hypot(end.x - start.x, end.y - start.y) < 0.001 {
+        context.fillEllipse(
+          in: CGRect(
+            x: end.x - width / 2,
+            y: end.y - width / 2,
+            width: width,
+            height: width
+          )
+        )
+        continue
+      }
+      context.setLineWidth(width)
+      context.beginPath()
+      context.move(to: start)
+      context.addLine(to: end)
+      context.strokePath()
+    }
+  }
+}
+
 private final class FieldNotePinDirectionAnnotation: PDFAnnotation {
   private let tip: CGPoint
   private let firstBase: CGPoint
@@ -1020,6 +1265,7 @@ private final class FieldNotePinDirectionAnnotation: PDFAnnotation {
       forType: .stamp,
       withProperties: nil
     )
+    shouldPrint = true
   }
 
   @available(*, unavailable)

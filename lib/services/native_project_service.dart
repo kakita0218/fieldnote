@@ -97,7 +97,6 @@ class NativeProjectService {
     required String shootingLocation,
     required String workStatus,
     required String position,
-    required Rect normalizedBoardRect,
   }) async {
     if (!isAvailable) return jpegBytes;
     final Uint8List? result = await _channel.invokeMethod<Uint8List>(
@@ -110,10 +109,6 @@ class NativeProjectService {
         'shootingLocation': shootingLocation,
         'workStatus': workStatus,
         'position': position,
-        'boardLeft': normalizedBoardRect.left,
-        'boardTop': normalizedBoardRect.top,
-        'boardWidth': normalizedBoardRect.width,
-        'boardHeight': normalizedBoardRect.height,
       },
     );
     if (result == null || result.isEmpty) {

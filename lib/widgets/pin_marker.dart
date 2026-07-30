@@ -10,8 +10,11 @@ class PinMarker extends StatelessWidget {
     required this.pin,
     required this.selected,
     required this.awaitingDirection,
-    required this.onTap,
-    required this.onDirectionChanged,
+    this.onTap,
+    this.onDirectionChanged,
+    this.onDirectionChangeStart,
+    this.onDirectionChangeEnd,
+    this.onDirectionChangeCancel,
     this.onMoveStart,
     this.onMoveUpdate,
     this.onMoveEnd,
@@ -30,8 +33,11 @@ class PinMarker extends StatelessWidget {
   final PinData pin;
   final bool selected;
   final bool awaitingDirection;
-  final VoidCallback onTap;
-  final ValueChanged<double> onDirectionChanged;
+  final VoidCallback? onTap;
+  final ValueChanged<double>? onDirectionChanged;
+  final VoidCallback? onDirectionChangeStart;
+  final VoidCallback? onDirectionChangeEnd;
+  final VoidCallback? onDirectionChangeCancel;
   final ValueChanged<Offset>? onMoveStart;
   final ValueChanged<Offset>? onMoveUpdate;
   final ValueChanged<Offset>? onMoveEnd;
@@ -56,9 +62,21 @@ class PinMarker extends StatelessWidget {
     final double gestureSize = math.max(circleSize, 44);
 
     return Semantics(
-      button: true,
+      container: true,
+      button: onTap != null,
+      enabled: onTap != null,
       selected: selected,
       label: 'ピン ${pin.number}',
+      value: <String>[
+        if (pin.photoCount > 0) '写真${pin.photoCount}枚',
+        if (awaitingDirection) '方向を指定中',
+      ].join('、'),
+      hint: onDirectionChanged != null
+          ? 'タップして詳細を開く。ドラッグして方向を変更。長押しして移動'
+          : onTap != null
+              ? 'タップして詳細を開く'
+              : null,
+      excludeSemantics: true,
       child: SizedBox(
         width: markerWidth,
         height: markerHeight,
@@ -87,22 +105,33 @@ class PinMarker extends StatelessWidget {
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTap: onTap,
-                onPanStart: (DragStartDetails details) {
-                  onDirectionChanged(
-                    _directionFromCirclePosition(
-                      details.localPosition,
-                      gestureSize,
-                    ),
-                  );
-                },
-                onPanUpdate: (DragUpdateDetails details) {
-                  onDirectionChanged(
-                    _directionFromCirclePosition(
-                      details.localPosition,
-                      gestureSize,
-                    ),
-                  );
-                },
+                onPanStart: onDirectionChanged == null
+                    ? null
+                    : (DragStartDetails details) {
+                        onDirectionChangeStart?.call();
+                        onDirectionChanged!(
+                          _directionFromCirclePosition(
+                            details.localPosition,
+                            gestureSize,
+                          ),
+                        );
+                      },
+                onPanUpdate: onDirectionChanged == null
+                    ? null
+                    : (DragUpdateDetails details) {
+                        onDirectionChanged!(
+                          _directionFromCirclePosition(
+                            details.localPosition,
+                            gestureSize,
+                          ),
+                        );
+                      },
+                onPanEnd: onDirectionChanged == null
+                    ? null
+                    : (_) => onDirectionChangeEnd?.call(),
+                onPanCancel: onDirectionChanged == null
+                    ? null
+                    : () => onDirectionChangeCancel?.call(),
                 onLongPressStart: onMoveStart == null
                     ? null
                     : (LongPressStartDetails details) {

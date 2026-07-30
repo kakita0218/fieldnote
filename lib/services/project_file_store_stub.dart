@@ -22,6 +22,16 @@ class ProjectFileStore {
     required Uint8List bytes,
   }) async {}
 
+  static Future<void> importProjectAtomically({
+    required String projectId,
+    required String projectName,
+    required Uint8List pdfBytes,
+    required Map<String, dynamic> metadata,
+    required List<Map<String, dynamic>> pins,
+    required List<Map<String, dynamic>> strokes,
+    required List<Map<String, dynamic>> photos,
+  }) async {}
+
   static Future<void> saveSnapshot({
     required String projectId,
     required String projectName,
@@ -31,7 +41,7 @@ class ProjectFileStore {
     required List<Map<String, dynamic>> photos,
   }) async {}
 
-  static Future<void> savePhoto({
+  static Future<String> savePhoto({
     required String projectId,
     required String projectName,
     required String pinId,
@@ -39,12 +49,32 @@ class ProjectFileStore {
     required String photoId,
     required String fileName,
     required Uint8List bytes,
-  }) async {}
+  }) async =>
+      fileName;
 
   static Future<List<Map<String, dynamic>>?> loadPhotoMetadata(
     String projectId,
   ) async =>
       null;
+
+  static Future<Uint8List?> loadPhotoBytes({
+    required String projectId,
+    required String photoId,
+    required int pinNumber,
+    required String fileName,
+  }) async =>
+      null;
+
+  static Future<bool> visitPhotoBytes({
+    required String projectId,
+    required List<Map<String, dynamic>> photos,
+    required Future<void> Function(
+      int index,
+      Map<String, dynamic> photo,
+      Uint8List bytes,
+    ) visitor,
+  }) async =>
+      false;
 
   static Future<List<Map<String, dynamic>>?> loadPhotosForPin({
     required String projectId,
