@@ -64,6 +64,22 @@ class ProjectFileStore {
 
   static String _threeDigits(int value) => value.toString().padLeft(3, '0');
 
+  static String _photoEditToken(String photoId) =>
+      base64Url.encode(utf8.encode(photoId)).replaceAll('=', '');
+
+  static File _editedPhotoFile(
+    Directory projectDirectory, {
+    required int pinNumber,
+    required String photoId,
+  }) {
+    return File(
+      '${projectDirectory.path}${Platform.pathSeparator}$_photosDirectoryName'
+      '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
+      '${Platform.pathSeparator}書き込み済み'
+      '${Platform.pathSeparator}${_photoEditToken(photoId)}.png',
+    );
+  }
+
   static String _migrationProjectToken(String projectId) =>
       base64Url.encode(utf8.encode(projectId)).replaceAll('=', '');
 
@@ -1201,6 +1217,65 @@ class ProjectFileStore {
     );
     if (!await file.exists()) return null;
     return file.readAsBytes();
+  }
+
+  static Future<void> saveEditedPhoto({
+    required String projectId,
+    required int pinNumber,
+    required String photoId,
+    required Uint8List bytes,
+  }) async {
+    if (pinNumber < 1 || photoId.isEmpty || bytes.isEmpty) {
+      throw ArgumentError('書き込み済み写真の保存情報が不正です。');
+    }
+    final Directory? directory = await _findProjectDirectory(projectId);
+    if (directory == null) {
+      throw StateError('案件フォルダが見つかりません。');
+    }
+    await _writeBytesAtomically(
+      _editedPhotoFile(
+        directory,
+        pinNumber: pinNumber,
+        photoId: photoId,
+      ),
+      bytes,
+    );
+  }
+
+  static Future<Uint8List?> loadEditedPhotoBytes({
+    required String projectId,
+    required int pinNumber,
+    required String photoId,
+  }) async {
+    if (pinNumber < 1 || photoId.isEmpty) return null;
+    final Directory? directory = await _findProjectDirectory(projectId);
+    if (directory == null) return null;
+    final File file = _editedPhotoFile(
+      directory,
+      pinNumber: pinNumber,
+      photoId: photoId,
+    );
+    await _recoverAtomicFile(file);
+    if (!await file.exists()) return null;
+    return file.readAsBytes();
+  }
+
+  static Future<void> deleteEditedPhoto({
+    required String projectId,
+    required int pinNumber,
+    required String photoId,
+  }) async {
+    if (pinNumber < 1 || photoId.isEmpty) return;
+    final Directory? directory = await _findProjectDirectory(projectId);
+    if (directory == null) return;
+    final File file = _editedPhotoFile(
+      directory,
+      pinNumber: pinNumber,
+      photoId: photoId,
+    );
+    if (await file.exists()) await file.delete();
+    final File backup = File('${file.path}.bak');
+    if (await backup.exists()) await backup.delete();
   }
 
   /// Visits full-resolution photos one at a time after resolving the project

@@ -1,5 +1,34 @@
 import 'package:flutter/material.dart';
 
+enum DrawingKind {
+  freehand,
+  line,
+  polyline,
+  rectangle,
+  text;
+
+  static DrawingKind fromName(String? value) {
+    return DrawingKind.values.firstWhere(
+      (DrawingKind item) => item.name == value,
+      orElse: () => DrawingKind.freehand,
+    );
+  }
+}
+
+enum DrawingBrush {
+  ballpoint,
+  fountain,
+  marker,
+  highlighter;
+
+  static DrawingBrush fromName(String? value) {
+    return DrawingBrush.values.firstWhere(
+      (DrawingBrush item) => item.name == value,
+      orElse: () => DrawingBrush.fountain,
+    );
+  }
+}
+
 class DrawingPoint {
   const DrawingPoint({
     required this.position,
@@ -17,6 +46,11 @@ class DrawingStroke {
     required this.points,
     this.width = 3.0,
     this.color = const Color(0xFFE53935),
+    this.opacity = 1,
+    this.kind = DrawingKind.freehand,
+    this.brush = DrawingBrush.fountain,
+    this.text = '',
+    this.fontSize = 18,
   });
 
   final String id;
@@ -24,16 +58,33 @@ class DrawingStroke {
   final List<DrawingPoint> points;
   final double width;
   final Color color;
+  final double opacity;
+  final DrawingKind kind;
+  final DrawingBrush brush;
+  final String text;
+  final double fontSize;
 
   DrawingStroke copyWith({
     List<DrawingPoint>? points,
+    double? width,
+    Color? color,
+    double? opacity,
+    DrawingKind? kind,
+    DrawingBrush? brush,
+    String? text,
+    double? fontSize,
   }) {
     return DrawingStroke(
       id: id,
       pageNumber: pageNumber,
       points: points ?? this.points,
-      width: width,
-      color: color,
+      width: width ?? this.width,
+      color: color ?? this.color,
+      opacity: opacity ?? this.opacity,
+      kind: kind ?? this.kind,
+      brush: brush ?? this.brush,
+      text: text ?? this.text,
+      fontSize: fontSize ?? this.fontSize,
     );
   }
 }

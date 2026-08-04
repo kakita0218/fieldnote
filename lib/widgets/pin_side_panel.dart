@@ -15,6 +15,7 @@ class PinSidePanel extends StatelessWidget {
     required this.onNoteChanged,
     required this.onAddPhotos,
     required this.onShowAllPhotos,
+    required this.onPhotoTap,
     required this.directionEditing,
     required this.onChangeDirection,
   });
@@ -27,6 +28,7 @@ class PinSidePanel extends StatelessWidget {
   final ValueChanged<String> onNoteChanged;
   final VoidCallback onAddPhotos;
   final VoidCallback onShowAllPhotos;
+  final ValueChanged<PhotoData> onPhotoTap;
   final bool directionEditing;
   final VoidCallback onChangeDirection;
 
@@ -144,11 +146,31 @@ class PinSidePanel extends StatelessWidget {
                         childAspectRatio: 1,
                       ),
                       itemBuilder: (context, index) {
-                        return ClipRRect(
+                        final PhotoData photo = visiblePhotos[index];
+                        return InkWell(
+                          onTap: () => onPhotoTap(photo),
                           borderRadius: BorderRadius.circular(8),
-                          child: Image.memory(
-                            visiblePhotos[index].bytes,
-                            fit: BoxFit.cover,
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: Stack(
+                              fit: StackFit.expand,
+                              children: <Widget>[
+                                Image.memory(photo.bytes, fit: BoxFit.cover),
+                                const Positioned(
+                                  right: 5,
+                                  bottom: 5,
+                                  child: Icon(
+                                    Icons.fullscreen_rounded,
+                                    color: Colors.white,
+                                    size: 20,
+                                    shadows: <Shadow>[
+                                      Shadow(
+                                          color: Colors.black, blurRadius: 4),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
                         );
                       },

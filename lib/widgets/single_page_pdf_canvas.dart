@@ -20,6 +20,11 @@ class SinglePagePdfCanvas extends StatefulWidget {
     required this.strokes,
     required this.pinModeEnabled,
     required this.penModeEnabled,
+    this.selectionModeEnabled = false,
+    this.textModeEnabled = false,
+    this.eraserEnabled = false,
+    this.eraserRadiusNormalized = 0.025,
+    this.selectedStrokeId,
     required this.selectedPinId,
     required this.pendingDirectionPinId,
     required this.onAddPin,
@@ -35,6 +40,7 @@ class SinglePagePdfCanvas extends StatefulWidget {
     required this.onStrokeStart,
     required this.onStrokeUpdate,
     required this.onStrokeEnd,
+    this.onCanvasTap,
   });
 
   final Uint8List imageBytes;
@@ -44,6 +50,11 @@ class SinglePagePdfCanvas extends StatefulWidget {
   final List<DrawingStroke> strokes;
   final bool pinModeEnabled;
   final bool penModeEnabled;
+  final bool selectionModeEnabled;
+  final bool textModeEnabled;
+  final bool eraserEnabled;
+  final double eraserRadiusNormalized;
+  final String? selectedStrokeId;
   final String? selectedPinId;
   final String? pendingDirectionPinId;
   final ValueChanged<Offset> onAddPin;
@@ -60,6 +71,7 @@ class SinglePagePdfCanvas extends StatefulWidget {
   final void Function(Offset normalizedPosition, double pressure)
       onStrokeUpdate;
   final VoidCallback onStrokeEnd;
+  final ValueChanged<Offset>? onCanvasTap;
 
   @override
   State<SinglePagePdfCanvas> createState() => _SinglePagePdfCanvasState();
@@ -69,6 +81,7 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
   final GlobalKey _pageKey = GlobalKey();
   int? _activeStylusPointer;
   String? _movingPinId;
+  Offset? _eraserCursor;
 
   @override
   void didUpdateWidget(covariant SinglePagePdfCanvas oldWidget) {
@@ -76,6 +89,7 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
     if (oldWidget.penModeEnabled && !widget.penModeEnabled) {
       _activeStylusPointer = null;
     }
+    if (!widget.eraserEnabled) _eraserCursor = null;
   }
 
   double _directionFromPoints(Offset from, Offset to) {
@@ -186,6 +200,22 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
               height: pageHeight,
               child: Listener(
                 behavior: HitTestBehavior.opaque,
+                onPointerHover: widget.eraserEnabled
+                    ? (PointerHoverEvent event) {
+                        if (event.kind != PointerDeviceKind.stylus &&
+                            event.kind != PointerDeviceKind.invertedStylus &&
+                            event.kind != PointerDeviceKind.mouse) {
+                          return;
+                        }
+                        setState(() {
+                          _eraserCursor = _normalize(
+                            event.localPosition,
+                            pageWidth,
+                            pageHeight,
+                          );
+                        });
+                      }
+                    : null,
                 onPointerDown: widget.penModeEnabled
                     ? (event) {
                         if (event.kind != PointerDeviceKind.stylus &&
@@ -197,6 +227,13 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                         if (_activeStylusPointer != null) return;
                         setState(() {
                           _activeStylusPointer = event.pointer;
+                          if (widget.eraserEnabled) {
+                            _eraserCursor = _normalize(
+                              event.localPosition,
+                              pageWidth,
+                              pageHeight,
+                            );
+                          }
                         });
                         widget.onStrokeStart(
                           _normalize(
@@ -208,6 +245,15 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                 onPointerMove: widget.penModeEnabled
                     ? (event) {
                         if (event.pointer != _activeStylusPointer) return;
+                        if (widget.eraserEnabled) {
+                          setState(() {
+                            _eraserCursor = _normalize(
+                              event.localPosition,
+                              pageWidth,
+                              pageHeight,
+                            );
+                          });
+                        }
                         widget.onStrokeUpdate(
                           _normalize(
                               event.localPosition, pageWidth, pageHeight),
@@ -235,7 +281,9 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                     : null,
                 child: GestureDetector(
                   behavior: HitTestBehavior.opaque,
-                  onTapUp: widget.pinModeEnabled
+                  onTapUp: widget.pinModeEnabled ||
+                          widget.selectionModeEnabled ||
+                          widget.textModeEnabled
                       ? (details) {
                           final Offset local = details.localPosition;
 
@@ -251,9 +299,13 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                             return;
                           }
 
-                          widget.onAddPin(
-                            _normalize(local, pageWidth, pageHeight),
-                          );
+                          final Offset normalized =
+                              _normalize(local, pageWidth, pageHeight);
+                          if (widget.pinModeEnabled) {
+                            widget.onAddPin(normalized);
+                          } else {
+                            widget.onCanvasTap?.call(normalized);
+                          }
                         }
                       : null,
                   child: Stack(
@@ -272,8 +324,22 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                         ),
                       ),
                       Positioned.fill(
-                        child: HandwritingLayer(strokes: widget.strokes),
+                        child: HandwritingLayer(
+                          strokes: widget.strokes,
+                          selectedStrokeId: widget.selectedStrokeId,
+                        ),
                       ),
+                      if (widget.eraserEnabled && _eraserCursor != null)
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: CustomPaint(
+                              painter: _EraserCursorPainter(
+                                position: _eraserCursor!,
+                                radiusNormalized: widget.eraserRadiusNormalized,
+                              ),
+                            ),
+                          ),
+                        ),
                       for (final PinData pin in widget.pins)
                         Positioned(
                           left: pin.xRatio * pageWidth -
@@ -286,7 +352,9 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                             selected: pin.id == widget.selectedPinId,
                             awaitingDirection:
                                 pin.id == widget.pendingDirectionPinId,
-                            onTap: widget.penModeEnabled
+                            onTap: widget.penModeEnabled ||
+                                    widget.selectionModeEnabled ||
+                                    widget.textModeEnabled
                                 ? null
                                 : () => widget.onPinTap(pin),
                             onDirectionChanged:
@@ -340,5 +408,47 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
         );
       },
     );
+  }
+}
+
+class _EraserCursorPainter extends CustomPainter {
+  const _EraserCursorPainter({
+    required this.position,
+    required this.radiusNormalized,
+  });
+
+  final Offset position;
+  final double radiusNormalized;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Offset center = Offset(
+      position.dx * size.width,
+      position.dy * size.height,
+    );
+    final double radius =
+        radiusNormalized.clamp(0.004, 0.12) * math.min(size.width, size.height);
+    canvas.drawCircle(
+      center,
+      radius,
+      Paint()
+        ..color = Colors.white.withValues(alpha: 0.22)
+        ..style = PaintingStyle.fill,
+    );
+    canvas.drawCircle(
+      center,
+      radius,
+      Paint()
+        ..color = const Color(0xFF1976D2)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.5,
+    );
+    canvas.drawCircle(center, 2.2, Paint()..color = const Color(0xFF1976D2));
+  }
+
+  @override
+  bool shouldRepaint(covariant _EraserCursorPainter oldDelegate) {
+    return oldDelegate.position != position ||
+        oldDelegate.radiusNormalized != radiusNormalized;
   }
 }

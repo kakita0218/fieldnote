@@ -90,6 +90,7 @@ class PinMarker extends StatelessWidget {
                     number: pin.number,
                     directionDegrees: pin.directionDegrees,
                     color: Color(pin.colorValue),
+                    opacity: pin.opacity,
                     selected: selected,
                     awaitingDirection: awaitingDirection,
                     hasPhoto: pin.photoCount > 0,
@@ -162,6 +163,7 @@ class _PinMarkerPainter extends CustomPainter {
     required this.number,
     required this.directionDegrees,
     required this.color,
+    required this.opacity,
     required this.selected,
     required this.awaitingDirection,
     required this.hasPhoto,
@@ -170,6 +172,7 @@ class _PinMarkerPainter extends CustomPainter {
   final int number;
   final double directionDegrees;
   final Color color;
+  final double opacity;
   final bool selected;
   final bool awaitingDirection;
   final bool hasPhoto;
@@ -183,10 +186,16 @@ class _PinMarkerPainter extends CustomPainter {
         emphasized ? PinMarker.selectedCircleSize : PinMarker.normalCircleSize;
     final double radius = diameter / 2;
     final Offset center = Offset(size.width / 2, PinMarker.markerCenterY);
-    final Color textColor = _isYellow ? const Color(0xFF10151C) : Colors.white;
-    final Color edgeColor = _isYellow
-        ? const Color(0xFF3B3420)
-        : Colors.white.withValues(alpha: 0.96);
+    final double safeOpacity = opacity.clamp(0.1, 1.0);
+    final Color markerColor = color.withValues(
+      alpha: (color.a * safeOpacity).clamp(0.0, 1.0),
+    );
+    final Color textColor = (_isYellow ? const Color(0xFF10151C) : Colors.white)
+        .withValues(alpha: safeOpacity);
+    final Color edgeColor = (_isYellow
+            ? const Color(0xFF3B3420)
+            : Colors.white.withValues(alpha: 0.96))
+        .withValues(alpha: safeOpacity);
 
     if (emphasized) {
       canvas.drawCircle(
@@ -205,7 +214,7 @@ class _PinMarkerPainter extends CustomPainter {
         center,
         radius + 3.5,
         Paint()
-          ..color = const Color(0xFF49B7FF)
+          ..color = const Color(0xFF49B7FF).withValues(alpha: safeOpacity)
           ..style = PaintingStyle.stroke
           ..strokeWidth = 2.2,
       );
@@ -240,9 +249,9 @@ class _PinMarkerPainter extends CustomPainter {
         ..strokeWidth = 2.6
         ..strokeJoin = StrokeJoin.round,
     );
-    canvas.drawPath(arrow, Paint()..color = color);
+    canvas.drawPath(arrow, Paint()..color = markerColor);
 
-    canvas.drawCircle(center, radius, Paint()..color = color);
+    canvas.drawCircle(center, radius, Paint()..color = markerColor);
     canvas.drawCircle(
       center,
       radius,
@@ -279,6 +288,7 @@ class _PinMarkerPainter extends CustomPainter {
     return oldDelegate.number != number ||
         oldDelegate.directionDegrees != directionDegrees ||
         oldDelegate.color != color ||
+        oldDelegate.opacity != opacity ||
         oldDelegate.selected != selected ||
         oldDelegate.awaitingDirection != awaitingDirection ||
         oldDelegate.hasPhoto != hasPhoto;

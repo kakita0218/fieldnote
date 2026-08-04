@@ -65,6 +65,26 @@ class ProjectFileStore {
   }) async =>
       null;
 
+  static Future<void> saveEditedPhoto({
+    required String projectId,
+    required int pinNumber,
+    required String photoId,
+    required Uint8List bytes,
+  }) async {}
+
+  static Future<Uint8List?> loadEditedPhotoBytes({
+    required String projectId,
+    required int pinNumber,
+    required String photoId,
+  }) async =>
+      null;
+
+  static Future<void> deleteEditedPhoto({
+    required String projectId,
+    required int pinNumber,
+    required String photoId,
+  }) async {}
+
   static Future<bool> visitPhotoBytes({
     required String projectId,
     required List<Map<String, dynamic>> photos,

@@ -57,4 +57,42 @@ void main() {
     expect(data.getUint8(centerPixel + 2), lessThan(100));
     expect(data.getUint8(centerPixel + 3), 255);
   });
+
+  test('矩形は対角線を描かず外枠だけを描画する', () async {
+    const DrawingStroke rectangle = DrawingStroke(
+      id: 'rectangle-1',
+      pageNumber: 1,
+      width: 4,
+      color: Colors.red,
+      kind: DrawingKind.rectangle,
+      points: <DrawingPoint>[
+        DrawingPoint(position: Offset(0.2, 0.2)),
+        DrawingPoint(position: Offset(0.8, 0.8)),
+      ],
+    );
+    final ui.PictureRecorder recorder = ui.PictureRecorder();
+    final Canvas canvas = Canvas(recorder);
+    canvas.drawRect(
+      const Rect.fromLTWH(0, 0, 100, 100),
+      Paint()..color = Colors.white,
+    );
+    paintDrawingStrokes(
+      canvas,
+      const Size(100, 100),
+      const <DrawingStroke>[rectangle],
+    );
+
+    final ui.Image image = await recorder.endRecording().toImage(100, 100);
+    final ByteData data =
+        (await image.toByteData(format: ui.ImageByteFormat.rawRgba))!;
+    image.dispose();
+    final int centerPixel = (50 * 100 + 50) * 4;
+    final int borderPixel = (20 * 100 + 50) * 4;
+
+    expect(data.getUint8(centerPixel), 255);
+    expect(data.getUint8(centerPixel + 1), 255);
+    expect(data.getUint8(centerPixel + 2), 255);
+    expect(data.getUint8(borderPixel), greaterThan(200));
+    expect(data.getUint8(borderPixel + 1), lessThan(100));
+  });
 }

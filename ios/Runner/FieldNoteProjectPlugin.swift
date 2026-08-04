@@ -904,8 +904,22 @@ private enum FieldNotePdfWriter {
         rawBaseWidth.isFinite && rawBaseWidth > 0
         ? CGFloat(rawBaseWidth)
         : 3
+      let kind = stroke["kind"] as? String ?? "freehand"
+      let brush = stroke["brush"] as? String ?? "fountain"
+      let rawOpacity = number(stroke["opacity"])?.doubleValue ?? 1
+      let opacity = rawOpacity.isFinite
+        ? min(max(CGFloat(rawOpacity), 0.05), 1)
+        : 1
+      let effectiveOpacity = brush == "highlighter"
+        ? min(opacity, 0.55)
+        : opacity
+      let strokeColor = applyingOpacity(
+        effectiveOpacity,
+        to: color(from: stroke["color"])
+      )
       var points: [CGPoint] = []
       var widths: [CGFloat] = []
+      var normalizedPoints: [CGPoint] = []
       for rawValue in rawPoints {
         guard
           let rawPoint = rawValue as? [String: Any],
@@ -925,14 +939,70 @@ private enum FieldNotePdfWriter {
           ? min(max(CGFloat(rawPressure), 0), 1)
           : 0.5
         points.append(point)
-        widths.append(baseWidth * (0.55 + pressure * 0.9))
+        normalizedPoints.append(CGPoint(x: x, y: y))
+        let width: CGFloat
+        if kind == "line" || kind == "rectangle" || brush == "ballpoint" || brush == "highlighter" {
+          width = baseWidth
+        } else if brush == "marker" {
+          width = baseWidth * 1.1
+        } else {
+          width = baseWidth * (0.55 + pressure * 0.9)
+        }
+        widths.append(width)
       }
       guard !points.isEmpty else { continue }
+
+      if kind == "text" {
+        let rawFontSize = number(stroke["fontSize"])?.doubleValue ?? 24
+        let fontSize: CGFloat = rawFontSize.isFinite && rawFontSize > 0
+          ? CGFloat(rawFontSize)
+          : 24
+        let text = stroke["text"] as? String ?? ""
+        guard !text.isEmpty else { continue }
+        let lineCount = max(text.components(separatedBy: .newlines).count, 1)
+        let textBounds = CGRect(
+          x: points[0].x,
+          y: points[0].y - fontSize * 1.45 * CGFloat(lineCount),
+          width: max(geometry.bounds.width * 0.45, fontSize * 2),
+          height: fontSize * 1.45 * CGFloat(lineCount)
+        )
+        let annotation = PDFAnnotation(
+          bounds: textBounds,
+          forType: .freeText,
+          withProperties: nil
+        )
+        annotation.shouldPrint = true
+        annotation.contents = text
+        annotation.font = .systemFont(ofSize: fontSize, weight: .semibold)
+        annotation.fontColor = strokeColor
+        annotation.color = .clear
+        let border = PDFBorder()
+        border.lineWidth = 0
+        annotation.border = border
+        setName(
+          "\(exportPrefix)stroke:\(stroke["id"] as? String ?? UUID().uuidString)",
+          on: annotation
+        )
+        page.addAnnotation(annotation)
+        continue
+      }
+
+      if kind == "rectangle", normalizedPoints.count >= 2 {
+        let first = normalizedPoints[0]
+        let last = normalizedPoints[normalizedPoints.count - 1]
+        if
+          let topRight = geometry.point(xRatio: last.x, yRatio: first.y),
+          let bottomLeft = geometry.point(xRatio: first.x, yRatio: last.y)
+        {
+          points = [points[0], topRight, points[points.count - 1], bottomLeft, points[0]]
+          widths = Array(repeating: baseWidth, count: points.count)
+        }
+      }
 
       let annotation = FieldNotePressureStrokeAnnotation(
         points: points,
         widths: widths,
-        strokeColor: color(from: stroke["color"])
+        strokeColor: strokeColor
       )
       setName(
         "\(exportPrefix)stroke:\(stroke["id"] as? String ?? UUID().uuidString)",
@@ -968,8 +1038,18 @@ private enum FieldNotePdfWriter {
       else {
         continue
       }
-      let pinColor = color(from: pin["colorValue"])
-      let edgeColor = readableEdgeColor(for: pinColor)
+      let rawPinOpacity = number(pin["opacity"])?.doubleValue ?? 1
+      let pinOpacity = rawPinOpacity.isFinite
+        ? min(max(CGFloat(rawPinOpacity), 0.1), 1)
+        : 1
+      let pinColor = applyingOpacity(
+        pinOpacity,
+        to: color(from: pin["colorValue"])
+      )
+      let edgeColor = applyingOpacity(
+        pinOpacity,
+        to: readableEdgeColor(for: pinColor)
+      )
       let pinId = pin["id"] as? String ?? UUID().uuidString
       let numberText = "\(number(pin["number"])?.intValue ?? 0)"
       let radius: CGFloat = 12
@@ -997,7 +1077,7 @@ private enum FieldNotePdfWriter {
           red: CGFloat(0x49) / 255,
           green: CGFloat(0xb7) / 255,
           blue: CGFloat(0xff) / 255,
-          alpha: 1
+          alpha: pinOpacity
         )
         photoRing.interiorColor = .clear
         let photoRingBorder = PDFBorder()
@@ -1063,7 +1143,10 @@ private enum FieldNotePdfWriter {
       label.shouldPrint = true
       label.contents = numberText
       label.font = .boldSystemFont(ofSize: numberText.count >= 3 ? 9 : 11)
-      label.fontColor = readableTextColor(for: pinColor)
+      label.fontColor = applyingOpacity(
+        pinOpacity,
+        to: readableTextColor(for: pinColor)
+      )
       label.alignment = .center
       label.color = .clear
       let labelBorder = PDFBorder()
@@ -1094,6 +1177,12 @@ private enum FieldNotePdfWriter {
       blue: CGFloat(argb & 0xff) / 255,
       alpha: CGFloat((argb >> 24) & 0xff) / 255
     )
+  }
+
+  private static func applyingOpacity(_ opacity: CGFloat, to color: UIColor) -> UIColor {
+    var alpha: CGFloat = 1
+    color.getRed(nil, green: nil, blue: nil, alpha: &alpha)
+    return color.withAlphaComponent(min(max(alpha * opacity, 0), 1))
   }
 
   private static func readableTextColor(for color: UIColor) -> UIColor {

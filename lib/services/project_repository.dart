@@ -18,6 +18,7 @@ class ProjectRepository {
   static const String _photoMetaBoxName = 'fieldnote_photo_meta_v5';
   static const String _photoBytesBoxName = 'fieldnote_photo_bytes_v5';
   static const String _thumbnailBoxName = 'fieldnote_thumbnails_v5';
+  static const String _editedPhotoBoxName = 'fieldnote_edited_photos_v1';
   static const String _trashBoxName = 'fieldnote_project_trash_v1';
   static final Uint8List _unavailablePhotoPreviewBytes = base64Decode(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk'
@@ -40,6 +41,8 @@ class ProjectRepository {
       Hive.openBox<dynamic>(_photoBytesBoxName);
   static Future<Box<dynamic>> _thumbnailBox() =>
       Hive.openBox<dynamic>(_thumbnailBoxName);
+  static Future<Box<dynamic>> _editedPhotoBox() =>
+      Hive.openBox<dynamic>(_editedPhotoBoxName);
   static Future<Box<dynamic>> _trashBox() =>
       Hive.openBox<dynamic>(_trashBoxName);
 
@@ -389,6 +392,63 @@ class ProjectRepository {
     return _asBytes((await _thumbnailBox()).get(key));
   }
 
+  static Future<void> saveEditedPhoto({
+    required String projectId,
+    required int pinNumber,
+    required String photoId,
+    required Uint8List bytes,
+  }) async {
+    if (bytes.isEmpty) {
+      throw StateError('書き込み済み写真が空です。');
+    }
+    await ProjectFileStore.saveEditedPhoto(
+      projectId: projectId,
+      pinNumber: pinNumber,
+      photoId: photoId,
+      bytes: bytes,
+    );
+    if (!ProjectFileStore.isAuthoritative) {
+      await (await _editedPhotoBox()).put(
+        _photoKey(projectId, photoId),
+        Uint8List.fromList(bytes),
+      );
+    }
+  }
+
+  static Future<Uint8List?> loadEditedPhotoBytes({
+    required String projectId,
+    required int pinNumber,
+    required String photoId,
+  }) async {
+    final Uint8List? bytes = await ProjectFileStore.loadEditedPhotoBytes(
+      projectId: projectId,
+      pinNumber: pinNumber,
+      photoId: photoId,
+    );
+    if (bytes != null && bytes.isNotEmpty) return bytes;
+    if (ProjectFileStore.isAuthoritative) return null;
+    return _asBytes(
+      (await _editedPhotoBox()).get(_photoKey(projectId, photoId)),
+    );
+  }
+
+  static Future<void> deleteEditedPhoto({
+    required String projectId,
+    required int pinNumber,
+    required String photoId,
+  }) async {
+    await ProjectFileStore.deleteEditedPhoto(
+      projectId: projectId,
+      pinNumber: pinNumber,
+      photoId: photoId,
+    );
+    try {
+      await (await _editedPhotoBox()).delete(_photoKey(projectId, photoId));
+    } catch (_) {
+      if (!ProjectFileStore.isAuthoritative) rethrow;
+    }
+  }
+
   /// Visits full-resolution photos sequentially without retaining the complete
   /// set in memory. Native storage resolves the project folder once; web falls
   /// back to the Hive boxes that are authoritative there.
@@ -628,6 +688,7 @@ class ProjectRepository {
       final Box<dynamic> metaBox = await _photoMetaBox();
       final Box<dynamic> bytesBox = await _photoBytesBox();
       final Box<dynamic> thumbnailBox = await _thumbnailBox();
+      final Box<dynamic> editedPhotoBox = await _editedPhotoBox();
       final List<dynamic> keys = <dynamic>[];
       for (final dynamic key in metaBox.keys) {
         final Map<String, dynamic> meta = _asMap(metaBox.get(key));
@@ -639,6 +700,7 @@ class ProjectRepository {
       await metaBox.deleteAll(keys);
       await bytesBox.deleteAll(keys);
       await thumbnailBox.deleteAll(keys);
+      await editedPhotoBox.deleteAll(keys);
     }
 
     if (ProjectFileStore.isAuthoritative) {
@@ -968,6 +1030,7 @@ class ProjectRepository {
         final Box<dynamic> photoMeta = await _photoMetaBox();
         final Box<dynamic> photoBytes = await _photoBytesBox();
         final Box<dynamic> thumbnails = await _thumbnailBox();
+        final Box<dynamic> editedPhotos = await _editedPhotoBox();
         final List<dynamic> keys = <dynamic>[];
         for (final dynamic key in photoMeta.keys) {
           final Map<String, dynamic> meta = _asMap(photoMeta.get(key));
@@ -976,6 +1039,7 @@ class ProjectRepository {
         await photoMeta.deleteAll(keys);
         await photoBytes.deleteAll(keys);
         await thumbnails.deleteAll(keys);
+        await editedPhotos.deleteAll(keys);
 
         // Remove legacy copy only after deletion was requested explicitly.
         try {

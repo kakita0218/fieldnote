@@ -20,6 +20,7 @@ class CameraCaptureScreen extends StatefulWidget {
     required this.initialBoardConfig,
     required this.onBoardConfigChanged,
     required this.onCaptured,
+    required this.onPhotoTap,
   });
 
   final int pinNumber;
@@ -34,6 +35,7 @@ class CameraCaptureScreen extends StatefulWidget {
   /// only one full-resolution image pending prevents rapid capture from
   /// retaining an unbounded queue of JPEGs on memory-constrained iPads.
   final Future<PhotoData?> Function(Uint8List bytes) onCaptured;
+  final ValueChanged<String> onPhotoTap;
 
   @override
   State<CameraCaptureScreen> createState() => _CameraCaptureScreenState();
@@ -1307,6 +1309,9 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen>
                   isPending: _recentPhotos[index].isPending,
                   width: _thumbnailWidth,
                   height: _thumbnailHeight,
+                  onTap: _recentPhotos[index].isPending
+                      ? null
+                      : () => widget.onPhotoTap(_recentPhotos[index].id),
                 ),
               ),
             ),
@@ -1489,62 +1494,81 @@ class _CameraThumbnailCard extends StatelessWidget {
     required this.isPending,
     required this.width,
     required this.height,
+    this.onTap,
   });
 
   final Uint8List bytes;
   final bool isPending;
   final double width;
   final double height;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: width,
-      height: height,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: isPending ? Colors.white : Colors.white70,
-          width: isPending ? 2.4 : 1.5,
-        ),
-        boxShadow: const [
-          BoxShadow(
-            color: Colors.black45,
-            blurRadius: 10,
-            offset: Offset(0, 4),
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        width: width,
+        height: height,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: isPending ? Colors.white : Colors.white70,
+            width: isPending ? 2.4 : 1.5,
           ),
-        ],
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(10),
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            Image.memory(
-              bytes,
-              fit: BoxFit.cover,
-              gaplessPlayback: true,
-              cacheWidth: 360,
+          boxShadow: const [
+            BoxShadow(
+              color: Colors.black45,
+              blurRadius: 10,
+              offset: Offset(0, 4),
             ),
-            if (isPending)
-              Positioned(
-                right: 7,
-                top: 7,
-                child: Container(
-                  width: 16,
-                  height: 16,
-                  padding: const EdgeInsets.all(3),
-                  decoration: const BoxDecoration(
-                    color: Colors.black54,
-                    shape: BoxShape.circle,
-                  ),
-                  child: const CircularProgressIndicator(
-                    strokeWidth: 1.7,
-                    color: Colors.white,
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              Image.memory(
+                bytes,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+                cacheWidth: 360,
+              ),
+              if (isPending)
+                Positioned(
+                  right: 7,
+                  top: 7,
+                  child: Container(
+                    width: 16,
+                    height: 16,
+                    padding: const EdgeInsets.all(3),
+                    decoration: const BoxDecoration(
+                      color: Colors.black54,
+                      shape: BoxShape.circle,
+                    ),
+                    child: const CircularProgressIndicator(
+                      strokeWidth: 1.7,
+                      color: Colors.white,
+                    ),
                   ),
                 ),
-              ),
-          ],
+              if (!isPending)
+                const Positioned(
+                  right: 6,
+                  bottom: 5,
+                  child: Icon(
+                    Icons.fullscreen_rounded,
+                    color: Colors.white,
+                    size: 20,
+                    shadows: <Shadow>[
+                      Shadow(color: Colors.black, blurRadius: 4),
+                    ],
+                  ),
+                ),
+            ],
+          ),
         ),
       ),
     );

@@ -22,12 +22,17 @@ import '../widgets/handwriting_layer.dart';
 import '../widgets/single_page_pdf_canvas.dart';
 import '../widgets/pin_side_panel.dart';
 import '../services/native_project_service.dart';
+import '../services/drawing_serialization.dart';
 import '../services/project_export_zip_sink.dart';
 import '../services/project_repository.dart';
+import 'photo_editor_screen.dart';
 
 enum FieldTool {
+  select,
   pin,
   pen,
+  shape,
+  text,
 }
 
 const List<Color> _fieldPaletteColors = <Color>[
@@ -170,8 +175,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   FieldTool? _selectedTool;
   Color _pinColor = _fieldPaletteColors.first;
+  double _pinOpacity = 1;
   Color _penColor = const Color(0xFFE53935);
   double _penWidth = 3.0;
+  double _penOpacity = 1;
+  DrawingBrush _penBrush = DrawingBrush.fountain;
+  DrawingKind _shapeKind = DrawingKind.line;
+  double _eraserWidth = 28;
+  double _textFontSize = 22;
   bool _eraserEnabled = false;
   late String _boardBusinessName;
   String _boardFacilityName = '';
@@ -181,6 +192,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   final List<_PinEdit> _redoPinEdits = <_PinEdit>[];
   final Set<String> _pendingPhotoCleanupPinIds = <String>{};
   final Map<int, List<DrawingStroke>> _strokesByPage = {};
+  final Map<String, List<DrawingStroke>> _photoAnnotationsById =
+      <String, List<DrawingStroke>>{};
   final Map<int, List<_DrawingEdit>> _undoDrawingEditsByPage = {};
   final Map<int, List<_DrawingEdit>> _redoDrawingEditsByPage = {};
   DrawingStroke? _activeStroke;
@@ -204,6 +217,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   PinData? _directionPinOriginal;
 
   String? _selectedPinId;
+  String? _selectedAnnotationId;
+  bool _suppressPinPanel = false;
   String? _pendingDirectionPinId;
   String? _captureAfterDirectionPinId;
   TextEditingController? _noteController;
@@ -328,6 +343,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _photoStorageNeedsRescanPinIds.clear();
         _photoSavesInProgressByPinId.clear();
         _strokesByPage.clear();
+        _photoAnnotationsById.clear();
         _undoDrawingEditsByPage.clear();
         _redoDrawingEditsByPage.clear();
         _activeStroke = null;
@@ -344,6 +360,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
         _nextPinNumber = 1;
         _selectedPinId = null;
+        _selectedAnnotationId = null;
+        _suppressPinPanel = false;
         _pendingDirectionPinId = null;
         _captureAfterDirectionPinId = null;
 
@@ -387,16 +405,25 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     _endStroke();
 
     if (_selectedTool == tool) {
-      if (tool == FieldTool.pin) {
-        _showPinSettings();
-      } else {
-        _showPenSettings();
+      switch (tool) {
+        case FieldTool.pin:
+          _showPinSettings();
+        case FieldTool.pen:
+          _showPenSettings();
+        case FieldTool.shape:
+          _showShapeSettings();
+        case FieldTool.text:
+          _showTextSettings();
+        case FieldTool.select:
+          _showSelectionSettings();
       }
       return;
     }
 
     setState(() {
       _selectedTool = tool;
+      if (tool != FieldTool.select) _selectedAnnotationId = null;
+      if (tool != FieldTool.pen) _eraserEnabled = false;
       if (tool != FieldTool.pin) {
         _pendingDirectionPinId = null;
         _captureAfterDirectionPinId = null;
@@ -441,6 +468,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       xRatio: normalizedPosition.dx,
       yRatio: normalizedPosition.dy,
       colorValue: _pinColor.toARGB32(),
+      opacity: _pinOpacity,
     );
 
     setState(() {
@@ -456,11 +484,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
       _nextPinNumber++;
       _selectedPinId = pin.id;
+      _suppressPinPanel = true;
       _pendingDirectionPinId = pin.id;
       _captureAfterDirectionPinId = pin.id;
 
       _setNoteController(pin.note);
     });
+    _transformationController.value = Matrix4.identity();
     _scheduleSave();
   }
 
@@ -490,6 +520,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       _pendingDirectionPinId = null;
       _captureAfterDirectionPinId = null;
       _selectedPinId = updatedPin.id;
+      _pinColor = Color(updatedPin.colorValue);
+      _pinOpacity = updatedPin.opacity;
+      _setNoteController(updatedPin.note);
       if (directionChanged &&
           (gestureOriginal == null || gestureOriginal.id != updatedPin.id)) {
         _recordPinEdit(
@@ -509,9 +542,36 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (shouldOpenCamera) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
-          _capturePhotosForPin(updatedPin);
+          _captureThenOpenPinDetails(updatedPin);
         }
       });
+    }
+  }
+
+  Future<void> _captureThenOpenPinDetails(PinData pin) async {
+    final int beforeCount = pin.photoCount;
+    await _capturePhotosForPin(pin);
+    if (!mounted) return;
+    final int index = _pins.indexWhere((PinData item) => item.id == pin.id);
+    if (index < 0) return;
+    final PinData latest = _pins[index];
+    if (latest.photoCount > beforeCount) {
+      setState(() {
+        _suppressPinPanel = false;
+        _selectedPinId = latest.id;
+        _pinColor = Color(latest.colorValue);
+        _pinOpacity = latest.opacity;
+        _setNoteController(latest.note);
+      });
+      _transformationController.value = Matrix4.identity();
+      unawaited(_ensurePhotosLoadedForPin(latest));
+    } else {
+      setState(() {
+        _suppressPinPanel = false;
+        _selectedPinId = null;
+      });
+      _noteController?.dispose();
+      _noteController = null;
     }
   }
 
@@ -578,7 +638,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     setState(() {
       _movingPinOriginal = current;
       _selectedPinId = current.id;
+      _suppressPinPanel = false;
       _pinColor = Color(current.colorValue);
+      _pinOpacity = current.opacity;
       _setNoteController(current.note);
     });
     unawaited(
@@ -643,9 +705,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _captureAfterDirectionPinId = null;
       }
       _selectedPinId = pin.id;
+      _suppressPinPanel = false;
       _pinColor = Color(pin.colorValue);
+      _pinOpacity = pin.opacity;
       _setNoteController(pin.note);
     });
+    _transformationController.value = Matrix4.identity();
 
     try {
       final List<Map<String, dynamic>> rows =
@@ -666,6 +731,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                 bytes: row['bytes'] as Uint8List,
               ))
           .toList(growable: false);
+      await _replaceWithEditedPreviews(pin, photos);
       bool countChanged = false;
       setState(() {
         // Keep only lightweight previews for the currently viewed pin in RAM.
@@ -706,6 +772,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     setState(() {
       _selectedPinId = null;
+      _suppressPinPanel = false;
       _pendingDirectionPinId = null;
       _captureAfterDirectionPinId = null;
     });
@@ -759,6 +826,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (index < 0) {
       return;
     }
+    final Set<String> photoIds =
+        (_photosByPinId[selectedId] ?? const <PhotoData>[])
+            .map((PhotoData photo) => photo.id)
+            .toSet();
 
     // Finish any older snapshot before changing pin numbers. The deletion
     // itself is then committed through the durable cleanup transaction below.
@@ -777,6 +848,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     setState(() {
       _photosByPinId.remove(selectedId);
+      for (final String photoId in photoIds) {
+        _photoAnnotationsById.remove(photoId);
+      }
+      _photoAnnotationsById.removeWhere(
+        (String photoId, List<DrawingStroke> _) =>
+            photoId.startsWith('$selectedId-'),
+      );
       _photoStorageVerifiedPinIds.remove(selectedId);
       _photoStorageNeedsRescanPinIds.remove(selectedId);
       _photoSavesInProgressByPinId.remove(selectedId);
@@ -815,8 +893,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   void _startStroke(Offset normalizedPosition, double pressure) {
-    if (_selectedTool != FieldTool.pen) return;
-    if (_eraserEnabled) {
+    if (_selectedTool != FieldTool.pen && _selectedTool != FieldTool.shape) {
+      return;
+    }
+    if (_selectedTool == FieldTool.pen && _eraserEnabled) {
       _activeEraserPage = _currentPage;
       _lastEraserPosition = null;
       final List<DrawingStroke> strokes =
@@ -835,16 +915,26 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return;
     }
 
+    final DrawingKind kind =
+        _selectedTool == FieldTool.shape ? _shapeKind : DrawingKind.freehand;
     final DrawingStroke stroke = DrawingStroke(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
       pageNumber: _currentPage,
       width: _penWidth,
       color: _penColor,
+      opacity: _penOpacity,
+      kind: kind,
+      brush: _penBrush,
       points: <DrawingPoint>[
         DrawingPoint(
           position: normalizedPosition,
           pressure: pressure,
         ),
+        if (kind == DrawingKind.line || kind == DrawingKind.rectangle)
+          DrawingPoint(
+            position: normalizedPosition,
+            pressure: pressure,
+          ),
       ],
     );
 
@@ -859,7 +949,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   void _updateStroke(Offset normalizedPosition, double pressure) {
-    if (_eraserEnabled) {
+    if (_selectedTool == FieldTool.pen && _eraserEnabled) {
       if (_activeEraserPage != null) {
         _eraseAt(normalizedPosition);
       }
@@ -872,6 +962,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     final List<DrawingStroke>? pageStrokes = _strokesByPage[_currentPage];
     if (pageStrokes == null || pageStrokes.isEmpty) {
+      return;
+    }
+
+    if (active.kind == DrawingKind.line ||
+        active.kind == DrawingKind.rectangle) {
+      active.points[active.points.length - 1] = DrawingPoint(
+        position: normalizedPosition,
+        pressure: pressure,
+      );
+      setState(() {});
       return;
     }
 
@@ -972,6 +1072,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     );
   }
 
+  bool get _drawingToolSelected =>
+      _selectedTool != null && _selectedTool != FieldTool.pin;
+
   void _applyDrawingEdit(
     int pageNumber,
     _DrawingEdit edit, {
@@ -1008,7 +1111,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   bool get _canUndoCurrentTool {
     if (_selectedTool == null) return false;
-    if (_selectedTool == FieldTool.pen) {
+    if (_drawingToolSelected) {
       return (_undoDrawingEditsByPage[_currentPage]?.isNotEmpty ?? false) ||
           (_strokesByPage[_currentPage]?.isNotEmpty ?? false);
     }
@@ -1017,7 +1120,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   bool get _canRedoCurrentTool {
     if (_selectedTool == null) return false;
-    if (_selectedTool == FieldTool.pen) {
+    if (_drawingToolSelected) {
       return (_redoDrawingEditsByPage[_currentPage]?.isNotEmpty ?? false);
     }
     return _redoPinEdits.isNotEmpty;
@@ -1043,7 +1146,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   void _undo() {
-    if (_selectedTool == FieldTool.pen) {
+    if (_drawingToolSelected) {
       _endStroke();
       final List<DrawingStroke>? pageStrokes = _strokesByPage[_currentPage];
       final List<_DrawingEdit> undo =
@@ -1121,7 +1224,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   void _redo() {
-    if (_selectedTool == FieldTool.pen) {
+    if (_drawingToolSelected) {
       _endStroke();
       final List<_DrawingEdit>? redo = _redoDrawingEditsByPage[_currentPage];
       if (redo == null || redo.isEmpty) {
@@ -1210,6 +1313,15 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             _updatePhotoBoardConfig(currentPin.id, config);
           },
           onCaptured: (bytes) => _saveCapturedPhoto(currentPin, bytes),
+          onPhotoTap: (String photoId) {
+            final List<PhotoData> photos = _photosForPin(currentPin.id);
+            final int index = photos.indexWhere(
+              (PhotoData photo) => photo.id == photoId,
+            );
+            if (index >= 0) {
+              _openPhotoEditor(currentPin, photos[index]);
+            }
+          },
         ),
       ),
     );
@@ -1294,6 +1406,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             ),
           )
           .toList(growable: true);
+      await _replaceWithEditedPreviews(pin, photos);
       bool countChanged = false;
       setState(() {
         _photosByPinId.clear();
@@ -1351,6 +1464,34 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       }
     } finally {
       codec.dispose();
+    }
+  }
+
+  Future<void> _replaceWithEditedPreviews(
+    PinData pin,
+    List<PhotoData> photos,
+  ) async {
+    for (int index = 0; index < photos.length; index++) {
+      final PhotoData photo = photos[index];
+      if (!(_photoAnnotationsById[photo.id]?.isNotEmpty ?? false)) continue;
+      try {
+        final Uint8List? edited = await ProjectRepository.loadEditedPhotoBytes(
+          projectId: widget.projectId,
+          pinNumber: pin.number,
+          photoId: photo.id,
+        );
+        if (edited == null || edited.isEmpty) continue;
+        final Uint8List preview = await _makePhotoThumbnail(edited);
+        photos[index] = PhotoData(
+          id: photo.id,
+          fileName: photo.fileName,
+          bytes: preview,
+          savedPath: photo.savedPath,
+        );
+      } catch (_) {
+        // The vector annotation remains authoritative and can be rendered
+        // again when the photo editor is opened.
+      }
     }
   }
 
@@ -1497,11 +1638,32 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                       childAspectRatio: 1.2,
                     ),
                     itemBuilder: (context, index) {
-                      return ClipRRect(
+                      final PhotoData photo = photos[index];
+                      return InkWell(
+                        onTap: () {
+                          Navigator.of(context).pop();
+                          _openPhotoEditor(pin, photo);
+                        },
                         borderRadius: BorderRadius.circular(10),
-                        child: Image.memory(
-                          photos[index].bytes,
-                          fit: BoxFit.cover,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(10),
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: <Widget>[
+                              Image.memory(photo.bytes, fit: BoxFit.cover),
+                              const Positioned(
+                                right: 8,
+                                bottom: 8,
+                                child: Icon(
+                                  Icons.fullscreen_rounded,
+                                  color: Colors.white,
+                                  shadows: <Shadow>[
+                                    Shadow(color: Colors.black, blurRadius: 5),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       );
                     },
@@ -1512,6 +1674,102 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           ),
         );
       },
+    );
+  }
+
+  Future<void> _openPhotoEditor(PinData pin, PhotoData photo) async {
+    final List<PhotoData> photos = _photosForPin(pin.id);
+    if (photos.isEmpty) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (BuildContext context) => PhotoEditorScreen(
+          projectId: widget.projectId,
+          pinNumber: pin.number,
+          photos: photos,
+          initialPhotoId: photo.id,
+          annotations: <String, List<DrawingStroke>>{
+            for (final PhotoData item in photos)
+              item.id: List<DrawingStroke>.of(
+                _photoAnnotationsById[item.id] ?? const <DrawingStroke>[],
+              ),
+          },
+          onSaved: (
+            String photoId,
+            List<DrawingStroke> strokes,
+            Uint8List? renderedImage,
+          ) async {
+            if (renderedImage == null || strokes.isEmpty) {
+              await _enqueueStorageOperation<void>(
+                () => ProjectRepository.deleteEditedPhoto(
+                  projectId: widget.projectId,
+                  pinNumber: pin.number,
+                  photoId: photoId,
+                ),
+              );
+            } else {
+              await _enqueueStorageOperation<void>(
+                () => ProjectRepository.saveEditedPhoto(
+                  projectId: widget.projectId,
+                  pinNumber: pin.number,
+                  photoId: photoId,
+                  bytes: renderedImage,
+                ),
+              );
+            }
+            if (!mounted) return;
+            Uint8List? preview;
+            if (renderedImage != null && renderedImage.isNotEmpty) {
+              preview = await _makePhotoThumbnail(renderedImage);
+            } else {
+              PhotoData? originalPhoto;
+              for (final PhotoData candidate in photos) {
+                if (candidate.id == photoId) {
+                  originalPhoto = candidate;
+                  break;
+                }
+              }
+              if (originalPhoto != null) {
+                final Uint8List? originalBytes =
+                    await ProjectRepository.loadPhotoBytes(
+                  projectId: widget.projectId,
+                  photoId: photoId,
+                  pinNumber: pin.number,
+                  fileName: originalPhoto.fileName,
+                );
+                if (originalBytes != null && originalBytes.isNotEmpty) {
+                  preview = await _makePhotoThumbnail(originalBytes);
+                }
+              }
+            }
+            if (!mounted) return;
+            setState(() {
+              if (strokes.isEmpty) {
+                _photoAnnotationsById.remove(photoId);
+              } else {
+                _photoAnnotationsById[photoId] =
+                    List<DrawingStroke>.of(strokes);
+              }
+              if (preview != null) {
+                final List<PhotoData>? cached = _photosByPinId[pin.id];
+                final int index = cached?.indexWhere(
+                      (PhotoData item) => item.id == photoId,
+                    ) ??
+                    -1;
+                if (cached != null && index >= 0) {
+                  final PhotoData current = cached[index];
+                  cached[index] = PhotoData(
+                    id: current.id,
+                    fileName: current.fileName,
+                    bytes: preview,
+                    savedPath: current.savedPath,
+                  );
+                }
+              }
+            });
+            _scheduleSave(pins: false, drawings: false, meta: true);
+          },
+        ),
+      ),
     );
   }
 
@@ -1683,12 +1941,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     Offset center,
     double exportScale,
   ) {
-    final Color pinColor = Color(pin.colorValue);
+    final Color basePinColor = Color(pin.colorValue);
+    final double pinOpacity = pin.opacity.clamp(0.1, 1);
+    final Color pinColor = basePinColor.withValues(
+      alpha: (basePinColor.a * pinOpacity).clamp(0.0, 1.0),
+    );
     final bool lightColor = pinColor.computeLuminance() > 0.62;
     final Color edgeColor = lightColor
-        ? const Color(0xFF3B3420)
-        : Colors.white.withValues(alpha: 0.96);
-    final Color textColor = lightColor ? const Color(0xFF10151C) : Colors.white;
+        ? const Color(0xFF3B3420).withValues(alpha: pinOpacity)
+        : Colors.white.withValues(alpha: 0.96 * pinOpacity);
+    final Color textColor =
+        (lightColor ? const Color(0xFF10151C) : Colors.white)
+            .withValues(alpha: pinOpacity);
     final double radius = 12 * exportScale;
     final double angle = pin.directionDegrees * math.pi / 180;
     final Offset forward = Offset(math.sin(angle), -math.cos(angle));
@@ -1715,7 +1979,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         center,
         radius + 3.5 * exportScale,
         Paint()
-          ..color = const Color(0xFF49B7FF)
+          ..color = const Color(0xFF49B7FF).withValues(alpha: pinOpacity)
           ..style = PaintingStyle.stroke
           ..strokeWidth = 2.2 * exportScale,
       );
@@ -1931,15 +2195,46 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           if (pin == null || photoBytes.isEmpty) return;
           final int photoCount = (exportedPhotoCounts[pinId] ?? 0) + 1;
           exportedPhotoCounts[pinId] = photoCount;
-          zipEncoder.add(
-            ArchiveFile.noCompress(
-              '写真/${_threeDigits(pin.number)}/'
-              '${_threeDigits(photoCount)}.jpg',
-              photoBytes.length,
-              photoBytes,
-            ),
-            autoClose: true,
-          );
+          final String photoId = storedPhoto['photoId']?.toString() ?? '';
+          final bool hasAnnotations =
+              _photoAnnotationsById[photoId]?.isNotEmpty ?? false;
+          final String folder = '写真/${_threeDigits(pin.number)}/';
+          final String number = _threeDigits(photoCount);
+          if (hasAnnotations) {
+            zipEncoder.add(
+              ArchiveFile.noCompress(
+                '$folder${number}_原本.jpg',
+                photoBytes.length,
+                photoBytes,
+              ),
+              autoClose: true,
+            );
+            final Uint8List? edited =
+                await ProjectRepository.loadEditedPhotoBytes(
+              projectId: widget.projectId,
+              pinNumber: pin.number,
+              photoId: photoId,
+            );
+            if (edited != null && edited.isNotEmpty) {
+              zipEncoder.add(
+                ArchiveFile.noCompress(
+                  '$folder${number}_書き込み済み.png',
+                  edited.length,
+                  edited,
+                ),
+                autoClose: true,
+              );
+            }
+          } else {
+            zipEncoder.add(
+              ArchiveFile.noCompress(
+                '$folder$number.jpg',
+                photoBytes.length,
+                photoBytes,
+              ),
+              autoClose: true,
+            );
+          }
         },
       );
       for (final PinData pin in sortedPins) {
@@ -2061,6 +2356,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         'photoCount': pin.photoCount,
         'note': pin.note,
         'colorValue': pin.colorValue,
+        'opacity': pin.opacity,
         'boardEnabled': pin.boardEnabled,
         'boardTemplateId': pin.boardTemplateId,
         'boardShootingLocation': pin.boardShootingLocation,
@@ -2101,6 +2397,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       photoCount: (map['photoCount'] as num?)?.toInt() ?? 0,
       note: map['note']?.toString() ?? '',
       colorValue: (map['colorValue'] as num?)?.toInt() ?? 0xFF1976D2,
+      opacity: ((map['opacity'] as num?)?.toDouble() ?? 1).clamp(0.1, 1),
       boardEnabled: map['boardEnabled'] == true,
       boardTemplateId: map['boardTemplateId']?.toString() ?? 'core',
       boardShootingLocation: map['boardShootingLocation']?.toString() ?? '',
@@ -2139,21 +2436,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   List<Map<String, dynamic>> _serializeStrokes() => _strokesByPage.entries
-      .expand((e) => e.value)
-      .map((s) => {
-            'id': s.id,
-            'pageNumber': s.pageNumber,
-            'width': s.width,
-            'color': s.color.toARGB32(),
-            'points': s.points
-                .map((p) => {
-                      'x': p.position.dx,
-                      'y': p.position.dy,
-                      'pressure': p.pressure,
-                    })
-                .toList(growable: false),
-          })
+      .expand((MapEntry<int, List<DrawingStroke>> entry) => entry.value)
+      .map(serializeDrawingStroke)
       .toList(growable: false);
+
+  Map<String, dynamic> _serializePhotoAnnotations() => <String, dynamic>{
+        for (final MapEntry<String, List<DrawingStroke>> entry
+            in _photoAnnotationsById.entries)
+          if (entry.value.isNotEmpty)
+            entry.key:
+                entry.value.map(serializeDrawingStroke).toList(growable: false),
+      };
 
   Map<String, dynamic> _projectMetadata() => <String, dynamic>{
         'pdfName': '$_projectName.pdf',
@@ -2163,6 +2456,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         'pinColor': _pinColor.toARGB32(),
         'penColor': _penColor.toARGB32(),
         'penWidth': _penWidth,
+        'pinOpacity': _pinOpacity,
+        'penOpacity': _penOpacity,
+        'penBrush': _penBrush.name,
+        'shapeKind': _shapeKind.name,
+        'eraserWidth': _eraserWidth,
+        'textFontSize': _textFontSize,
+        'photoAnnotations': _serializePhotoAnnotations(),
         'boardBusinessName': _boardBusinessName,
         'boardFacilityName': _boardFacilityName,
         'pendingDirectionPinId': _pendingDirectionPinId,
@@ -2338,23 +2638,31 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
               .toSet();
       final restoredStrokes = <int, List<DrawingStroke>>{};
       for (final v in (data['strokes'] as List? ?? const [])) {
-        final m = v as Map<String, dynamic>;
-        final page = (m['pageNumber'] as num).toInt();
-        final stroke = DrawingStroke(
-          id: m['id'] as String,
-          pageNumber: page,
-          width: (m['width'] as num?)?.toDouble() ?? 3,
-          color: Color((m['color'] as num?)?.toInt() ?? 0xFFE53935),
-          points: (m['points'] as List? ?? const []).map((v) {
-            final p = v as Map<String, dynamic>;
-            return DrawingPoint(
-              position: Offset(
-                  (p['x'] as num).toDouble(), (p['y'] as num).toDouble()),
-              pressure: (p['pressure'] as num?)?.toDouble() ?? 0.5,
-            );
-          }).toList(),
+        final DrawingStroke? stroke = deserializeDrawingStroke(
+          v,
+          defaultPageNumber: 1,
         );
+        if (stroke == null) continue;
+        final int page = stroke.pageNumber;
         restoredStrokes.putIfAbsent(page, () => []).add(stroke);
+      }
+      final Map<String, List<DrawingStroke>> restoredPhotoAnnotations =
+          <String, List<DrawingStroke>>{};
+      final dynamic rawPhotoAnnotations = data['photoAnnotations'];
+      if (rawPhotoAnnotations is Map) {
+        for (final MapEntry<dynamic, dynamic> entry
+            in rawPhotoAnnotations.entries) {
+          final String photoId = entry.key.toString();
+          if (photoId.isEmpty || entry.value is! List) continue;
+          final List<DrawingStroke> annotations = <DrawingStroke>[];
+          for (final dynamic rawStroke in entry.value as List) {
+            final DrawingStroke? stroke = deserializeDrawingStroke(rawStroke);
+            if (stroke != null) annotations.add(stroke);
+          }
+          if (annotations.isNotEmpty) {
+            restoredPhotoAnnotations[photoId] = annotations;
+          }
+        }
       }
       // Photo binaries are intentionally not loaded here. Only metadata is used
       // to repair counts; bytes are loaded when a pin is opened.
@@ -2426,6 +2734,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _strokesByPage
           ..clear()
           ..addAll(restoredStrokes);
+        _photoAnnotationsById
+          ..clear()
+          ..addAll(restoredPhotoAnnotations);
         _undoDrawingEditsByPage.clear();
         _redoDrawingEditsByPage.clear();
         _activeStroke = null;
@@ -2446,12 +2757,27 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _nextPinNumber =
             (data['nextPinNumber'] as num?)?.toInt() ?? (_pins.length + 1);
         _pinColor = Color((data['pinColor'] as num?)?.toInt() ?? 0xFF1976D2);
+        _pinOpacity =
+            ((data['pinOpacity'] as num?)?.toDouble() ?? 1).clamp(0.1, 1);
         _penColor = Color((data['penColor'] as num?)?.toInt() ?? 0xFFE53935);
         _boardBusinessName =
             data['boardBusinessName']?.toString() ?? _projectName;
         _boardFacilityName = data['boardFacilityName']?.toString() ?? '';
         _selectedTool = null;
         _penWidth = (data['penWidth'] as num?)?.toDouble() ?? 3;
+        _penOpacity =
+            ((data['penOpacity'] as num?)?.toDouble() ?? 1).clamp(0.1, 1);
+        _penBrush = DrawingBrush.fromName(data['penBrush']?.toString());
+        _shapeKind = DrawingKind.fromName(data['shapeKind']?.toString());
+        if (_shapeKind != DrawingKind.line &&
+            _shapeKind != DrawingKind.polyline &&
+            _shapeKind != DrawingKind.rectangle) {
+          _shapeKind = DrawingKind.line;
+        }
+        _eraserWidth =
+            ((data['eraserWidth'] as num?)?.toDouble() ?? 28).clamp(6, 80);
+        _textFontSize =
+            ((data['textFontSize'] as num?)?.toDouble() ?? 22).clamp(12, 64);
         _currentPage =
             ((data['currentPage'] as num?)?.toInt() ?? 1).clamp(1, _pageCount);
         final String? pendingId = data['pendingDirectionPinId']?.toString();
@@ -2499,14 +2825,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     }
   }
 
-  static const double _eraserRadius = 0.025;
-
   double get _eraserAspectRatio {
     return math.max(_activeEraserAspectRatio ?? _pageAspectRatio, 0.0001);
   }
 
   double get _eraserRadiusInPageSpace {
-    return _eraserRadius * math.min(_eraserAspectRatio, 1);
+    final double normalized = (_eraserWidth / 1120).clamp(0.006, 0.08);
+    return normalized * math.min(_eraserAspectRatio, 1);
   }
 
   Offset _toEraserPageSpace(Offset position) {
@@ -2575,6 +2900,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   ) {
     if (stroke.points.isEmpty) return null;
     if (!_eraserBoundsOverlapStroke(stroke, pathStart, pathEnd)) return null;
+    if (stroke.kind == DrawingKind.text ||
+        stroke.kind == DrawingKind.rectangle ||
+        stroke.kind == DrawingKind.line) {
+      return const <DrawingStroke>[];
+    }
     final List<DrawingPoint> sampledPoints =
         _activeEraserSamplesCache?.putIfAbsent(
               stroke.id,
@@ -2618,6 +2948,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             points: points,
             width: stroke.width,
             color: stroke.color,
+            opacity: stroke.opacity,
+            kind: stroke.kind,
+            brush: stroke.brush,
+            text: stroke.text,
+            fontSize: stroke.fontSize,
           ),
         )
         .toList(growable: false);
@@ -2719,68 +3054,479 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     return (point - closestPoint).distanceSquared;
   }
 
+  DrawingStroke? _annotationAt(Offset position) {
+    final List<DrawingStroke> strokes =
+        _strokesByPage[_currentPage] ?? const <DrawingStroke>[];
+    for (final DrawingStroke stroke in strokes.reversed) {
+      if (stroke.points.isEmpty) continue;
+      if (stroke.kind == DrawingKind.text ||
+          stroke.kind == DrawingKind.rectangle) {
+        final Rect bounds = drawingStrokeBounds(
+          stroke,
+          const Size(1000, 1000),
+        ).inflate(12);
+        if (bounds.contains(Offset(position.dx * 1000, position.dy * 1000))) {
+          return stroke;
+        }
+        continue;
+      }
+      if (stroke.points.length == 1 &&
+          (stroke.points.first.position - position).distance <= 0.025) {
+        return stroke;
+      }
+      for (int index = 1; index < stroke.points.length; index++) {
+        if (_pointToSegmentDistanceSquared(
+              position,
+              stroke.points[index - 1].position,
+              stroke.points[index].position,
+            ) <=
+            0.000625) {
+          return stroke;
+        }
+      }
+    }
+    return null;
+  }
+
+  Future<void> _handleCanvasTap(Offset position) async {
+    if (_selectedTool == FieldTool.select) {
+      final DrawingStroke? selected = _annotationAt(position);
+      setState(() => _selectedAnnotationId = selected?.id);
+      return;
+    }
+    if (_selectedTool != FieldTool.text) return;
+    final TextEditingController controller = TextEditingController();
+    final String? text = await showDialog<String>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        title: const Text('テキストを入力'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          minLines: 2,
+          maxLines: 7,
+          stylusHandwritingEnabled: true,
+          decoration: const InputDecoration(
+            hintText: 'キーボードまたはApple Pencilで入力',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('配置'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (text == null || text.isEmpty || !mounted) return;
+    final DrawingStroke annotation = DrawingStroke(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      pageNumber: _currentPage,
+      points: <DrawingPoint>[DrawingPoint(position: position)],
+      width: _penWidth,
+      color: _penColor,
+      opacity: _penOpacity,
+      kind: DrawingKind.text,
+      text: text,
+      fontSize: _textFontSize,
+    );
+    setState(() {
+      final List<DrawingStroke> pageStrokes =
+          _strokesByPage.putIfAbsent(_currentPage, () => <DrawingStroke>[]);
+      final int index = pageStrokes.length;
+      pageStrokes.add(annotation);
+      _selectedAnnotationId = annotation.id;
+      _undoDrawingEditsByPage
+          .putIfAbsent(_currentPage, () => <_DrawingEdit>[])
+          .add(
+            _DrawingEdit(
+              removedStrokes: const <_IndexedDrawingStroke>[],
+              addedStrokes: <_IndexedDrawingStroke>[
+                _IndexedDrawingStroke(stroke: annotation, index: index),
+              ],
+            ),
+          );
+      _redoDrawingEditsByPage[_currentPage]?.clear();
+    });
+    _scheduleSave(pins: false, drawings: true, meta: true);
+  }
+
+  DrawingStroke? get _selectedAnnotation {
+    final String? id = _selectedAnnotationId;
+    if (id == null) return null;
+    for (final DrawingStroke stroke
+        in _strokesByPage[_currentPage] ?? const <DrawingStroke>[]) {
+      if (stroke.id == id) return stroke;
+    }
+    return null;
+  }
+
+  void _changeSelectedAnnotation({
+    Color? color,
+    double? width,
+    double? opacity,
+    double? fontSize,
+  }) {
+    final DrawingStroke? selected = _selectedAnnotation;
+    if (selected == null) return;
+    final List<DrawingStroke>? strokes = _strokesByPage[_currentPage];
+    final int index = strokes?.indexWhere(
+          (DrawingStroke stroke) => stroke.id == selected.id,
+        ) ??
+        -1;
+    if (strokes == null || index < 0) return;
+    final DrawingStroke updated = selected.copyWith(
+      color: color,
+      width: width,
+      opacity: opacity,
+      fontSize: fontSize,
+    );
+    setState(() {
+      strokes[index] = updated;
+      _undoDrawingEditsByPage
+          .putIfAbsent(_currentPage, () => <_DrawingEdit>[])
+          .add(
+            _DrawingEdit(
+              removedStrokes: <_IndexedDrawingStroke>[
+                _IndexedDrawingStroke(stroke: selected, index: index),
+              ],
+              addedStrokes: <_IndexedDrawingStroke>[
+                _IndexedDrawingStroke(stroke: updated, index: index),
+              ],
+            ),
+          );
+      _redoDrawingEditsByPage[_currentPage]?.clear();
+    });
+    _scheduleSave(pins: false, drawings: true, meta: true);
+  }
+
+  void _deleteSelectedAnnotation() {
+    final DrawingStroke? selected = _selectedAnnotation;
+    final List<DrawingStroke>? strokes = _strokesByPage[_currentPage];
+    final int index = strokes?.indexWhere(
+          (DrawingStroke stroke) => stroke.id == selected?.id,
+        ) ??
+        -1;
+    if (selected == null || strokes == null || index < 0) return;
+    setState(() {
+      strokes.removeAt(index);
+      _selectedAnnotationId = null;
+      _undoDrawingEditsByPage
+          .putIfAbsent(_currentPage, () => <_DrawingEdit>[])
+          .add(
+            _DrawingEdit(
+              removedStrokes: <_IndexedDrawingStroke>[
+                _IndexedDrawingStroke(stroke: selected, index: index),
+              ],
+              addedStrokes: const <_IndexedDrawingStroke>[],
+            ),
+          );
+      _redoDrawingEditsByPage[_currentPage]?.clear();
+    });
+    _scheduleSave(pins: false, drawings: true, meta: true);
+  }
+
+  Future<void> _showSelectionSettings() async {
+    if (_selectedAnnotation == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('変更する線・図形・テキストを選択してください。')),
+      );
+      return;
+    }
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: AppColors.panel,
+      builder: (BuildContext context) => StatefulBuilder(
+        builder: (BuildContext context, StateSetter updateSheet) {
+          final DrawingStroke? selected = _selectedAnnotation;
+          if (selected == null) return const SizedBox.shrink();
+          return SafeArea(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const Text(
+                    '選択した注釈',
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+                  ),
+                  const SizedBox(height: 16),
+                  Wrap(
+                    spacing: 14,
+                    children: _fieldPaletteColors.map((Color color) {
+                      return _PaletteColorButton(
+                        color: color,
+                        selected: selected.color.toARGB32() == color.toARGB32(),
+                        onTap: () {
+                          _changeSelectedAnnotation(color: color);
+                          updateSheet(() {});
+                        },
+                      );
+                    }).toList(growable: false),
+                  ),
+                  const SizedBox(height: 14),
+                  Text(selected.kind == DrawingKind.text
+                      ? '文字サイズ ${selected.fontSize.round()}'
+                      : '太さ ${selected.width.toStringAsFixed(0)}'),
+                  Slider(
+                    value: (selected.kind == DrawingKind.text
+                            ? selected.fontSize
+                            : selected.width)
+                        .clamp(
+                      selected.kind == DrawingKind.text ? 12 : 1,
+                      selected.kind == DrawingKind.text ? 64 : 24,
+                    ),
+                    min: selected.kind == DrawingKind.text ? 12 : 1,
+                    max: selected.kind == DrawingKind.text ? 64 : 24,
+                    onChanged: (double value) {
+                      if (selected.kind == DrawingKind.text) {
+                        _changeSelectedAnnotation(fontSize: value);
+                      } else {
+                        _changeSelectedAnnotation(width: value);
+                      }
+                      updateSheet(() {});
+                    },
+                  ),
+                  Text('透過率 ${(selected.opacity * 100).round()}%'),
+                  Slider(
+                    value: selected.opacity.clamp(0.1, 1),
+                    min: 0.1,
+                    max: 1,
+                    divisions: 18,
+                    onChanged: (double value) {
+                      _changeSelectedAnnotation(opacity: value);
+                      updateSheet(() {});
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.pop(context);
+                      _deleteSelectedAnnotation();
+                    },
+                    icon: const Icon(Icons.delete_outline_rounded),
+                    label: const Text('選択した注釈を削除'),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _showShapeSettings() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: AppColors.panel,
+      builder: (BuildContext context) => StatefulBuilder(
+        builder: (BuildContext context, StateSetter updateSheet) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Text(
+                  '図形設定',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 16),
+                SegmentedButton<DrawingKind>(
+                  segments: const <ButtonSegment<DrawingKind>>[
+                    ButtonSegment(value: DrawingKind.line, label: Text('直線')),
+                    ButtonSegment(
+                        value: DrawingKind.polyline, label: Text('連続線')),
+                    ButtonSegment(
+                        value: DrawingKind.rectangle, label: Text('矩形')),
+                  ],
+                  selected: <DrawingKind>{_shapeKind},
+                  onSelectionChanged: (Set<DrawingKind> values) {
+                    setState(() => _shapeKind = values.first);
+                    updateSheet(() {});
+                    _scheduleSave(pins: false, drawings: false, meta: true);
+                  },
+                ),
+                const SizedBox(height: 16),
+                Text('太さ ${_penWidth.toStringAsFixed(0)}'),
+                Slider(
+                  value: _penWidth.clamp(1, 24),
+                  min: 1,
+                  max: 24,
+                  onChanged: (double value) {
+                    setState(() => _penWidth = value);
+                    updateSheet(() {});
+                    _scheduleSave(pins: false, drawings: false, meta: true);
+                  },
+                ),
+                Text('透過率 ${(_penOpacity * 100).round()}%'),
+                Slider(
+                  value: _penOpacity.clamp(0.1, 1),
+                  min: 0.1,
+                  max: 1,
+                  divisions: 18,
+                  onChanged: (double value) {
+                    setState(() => _penOpacity = value);
+                    updateSheet(() {});
+                    _scheduleSave(pins: false, drawings: false, meta: true);
+                  },
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showTextSettings() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: AppColors.panel,
+      builder: (BuildContext context) => StatefulBuilder(
+        builder: (BuildContext context, StateSetter updateSheet) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Text(
+                  'テキスト設定',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 16),
+                Text('文字サイズ ${_textFontSize.round()}'),
+                Slider(
+                  value: _textFontSize.clamp(12, 64),
+                  min: 12,
+                  max: 64,
+                  onChanged: (double value) {
+                    setState(() => _textFontSize = value);
+                    updateSheet(() {});
+                    _scheduleSave(pins: false, drawings: false, meta: true);
+                  },
+                ),
+                Text('透過率 ${(_penOpacity * 100).round()}%'),
+                Slider(
+                  value: _penOpacity.clamp(0.1, 1),
+                  min: 0.1,
+                  max: 1,
+                  divisions: 18,
+                  onChanged: (double value) {
+                    setState(() => _penOpacity = value);
+                    updateSheet(() {});
+                    _scheduleSave(pins: false, drawings: false, meta: true);
+                  },
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Future<void> _showPinSettings() async {
     await showModalBottomSheet<void>(
       context: context,
       backgroundColor: AppColors.panel,
-      builder: (BuildContext sheetContext) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 20, 20, 24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              const Text(
-                'ピンの色',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                _selectedPinId == null
-                    ? '次に配置するピンの色を選択'
-                    : '選択中のピンと、次に配置するピンの色を変更',
-                style: const TextStyle(
-                  color: AppColors.textSecondary,
-                  fontSize: 13,
+      builder: (BuildContext sheetContext) => StatefulBuilder(
+        builder: (BuildContext context, StateSetter setSheetState) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 20, 20, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const Text(
+                  'ピンの色',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
                 ),
-              ),
-              const SizedBox(height: 18),
-              Wrap(
-                spacing: 14,
-                runSpacing: 14,
-                children: _fieldPaletteColors.map((Color color) {
-                  return _PaletteColorButton(
-                    color: color,
-                    selected: _pinColor.toARGB32() == color.toARGB32(),
-                    onTap: () {
-                      bool changedSelectedPin = false;
-                      setState(() {
-                        _pinColor = color;
-                        final String? selectedId = _selectedPinId;
-                        if (selectedId != null) {
-                          final int index = _pins.indexWhere(
-                            (PinData pin) => pin.id == selectedId,
-                          );
-                          if (index >= 0) {
-                            _discardPinRedoHistory();
-                            _pins[index] = _pins[index].copyWith(
-                              colorValue: color.toARGB32(),
+                const SizedBox(height: 6),
+                Text(
+                  _selectedPinId == null
+                      ? '次に配置するピンの色を選択'
+                      : '選択中のピンと、次に配置するピンの色を変更',
+                  style: const TextStyle(
+                    color: AppColors.textSecondary,
+                    fontSize: 13,
+                  ),
+                ),
+                const SizedBox(height: 18),
+                Wrap(
+                  spacing: 14,
+                  runSpacing: 14,
+                  children: _fieldPaletteColors.map((Color color) {
+                    return _PaletteColorButton(
+                      color: color,
+                      selected: _pinColor.toARGB32() == color.toARGB32(),
+                      onTap: () {
+                        bool changedSelectedPin = false;
+                        setState(() {
+                          _pinColor = color;
+                          final String? selectedId = _selectedPinId;
+                          if (selectedId != null) {
+                            final int index = _pins.indexWhere(
+                              (PinData pin) => pin.id == selectedId,
                             );
-                            changedSelectedPin = true;
+                            if (index >= 0) {
+                              _discardPinRedoHistory();
+                              _pins[index] = _pins[index].copyWith(
+                                colorValue: color.toARGB32(),
+                              );
+                              changedSelectedPin = true;
+                            }
                           }
-                        }
-                      });
-                      _scheduleSave(
-                        pins: changedSelectedPin,
-                        drawings: false,
-                        meta: true,
+                        });
+                        _scheduleSave(
+                          pins: changedSelectedPin,
+                          drawings: false,
+                          meta: true,
+                        );
+                        setSheetState(() {});
+                      },
+                    );
+                  }).toList(growable: false),
+                ),
+                const SizedBox(height: 18),
+                Text('透過率 ${(_pinOpacity * 100).round()}%'),
+                Slider(
+                  value: _pinOpacity.clamp(0.1, 1),
+                  min: 0.1,
+                  max: 1,
+                  divisions: 18,
+                  onChanged: (double value) {
+                    bool changedSelectedPin = false;
+                    setState(() {
+                      _pinOpacity = value;
+                      final String? selectedId = _selectedPinId;
+                      final int index = _pins.indexWhere(
+                        (PinData pin) => pin.id == selectedId,
                       );
-                      Navigator.of(sheetContext).pop();
-                    },
-                  );
-                }).toList(growable: false),
-              ),
-            ],
+                      if (index >= 0) {
+                        _discardPinRedoHistory();
+                        _pins[index] = _pins[index].copyWith(opacity: value);
+                        changedSelectedPin = true;
+                      }
+                    });
+                    setSheetState(() {});
+                    _scheduleSave(
+                      pins: changedSelectedPin,
+                      drawings: false,
+                      meta: true,
+                    );
+                  },
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -2794,7 +3540,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       builder: (BuildContext context) => StatefulBuilder(
         builder: (BuildContext context, StateSetter setSheetState) {
           return SafeArea(
-            child: Padding(
+            child: SingleChildScrollView(
               padding: const EdgeInsets.all(20),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -2803,6 +3549,44 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   const Text(
                     'ペン設定',
                     style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+                  ),
+                  const SizedBox(height: 14),
+                  SegmentedButton<DrawingBrush>(
+                    segments: const <ButtonSegment<DrawingBrush>>[
+                      ButtonSegment(
+                        value: DrawingBrush.ballpoint,
+                        label: Text('ボールペン'),
+                      ),
+                      ButtonSegment(
+                        value: DrawingBrush.fountain,
+                        label: Text('万年筆'),
+                      ),
+                      ButtonSegment(
+                        value: DrawingBrush.marker,
+                        label: Text('マーカー'),
+                      ),
+                      ButtonSegment(
+                        value: DrawingBrush.highlighter,
+                        label: Text('蛍光'),
+                      ),
+                    ],
+                    selected: <DrawingBrush>{_penBrush},
+                    onSelectionChanged: (Set<DrawingBrush> values) {
+                      setState(() {
+                        _penBrush = values.first;
+                        _eraserEnabled = false;
+                        if (_penBrush == DrawingBrush.highlighter &&
+                            _penOpacity > 0.55) {
+                          _penOpacity = 0.35;
+                        }
+                      });
+                      setSheetState(() {});
+                      _scheduleSave(
+                        pins: false,
+                        drawings: false,
+                        meta: true,
+                      );
+                    },
                   ),
                   const SizedBox(height: 18),
                   Wrap(
@@ -2833,10 +3617,26 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   Slider(
                     value: _penWidth,
                     min: 1,
-                    max: 10,
-                    divisions: 9,
+                    max: 24,
+                    divisions: 23,
                     onChanged: (double value) {
                       setState(() => _penWidth = value);
+                      setSheetState(() {});
+                      _scheduleSave(
+                        pins: false,
+                        drawings: false,
+                        meta: true,
+                      );
+                    },
+                  ),
+                  Text('透過率 ${(_penOpacity * 100).round()}%'),
+                  Slider(
+                    value: _penOpacity.clamp(0.1, 1),
+                    min: 0.1,
+                    max: 1,
+                    divisions: 18,
+                    onChanged: (double value) {
+                      setState(() => _penOpacity = value);
                       setSheetState(() {});
                       _scheduleSave(
                         pins: false,
@@ -2859,6 +3659,25 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                       ),
                     ),
                   ),
+                  if (_eraserEnabled) ...<Widget>[
+                    const SizedBox(height: 12),
+                    Text('消しゴムの太さ ${_eraserWidth.round()}'),
+                    Slider(
+                      value: _eraserWidth,
+                      min: 6,
+                      max: 80,
+                      divisions: 37,
+                      onChanged: (double value) {
+                        setState(() => _eraserWidth = value);
+                        setSheetState(() {});
+                        _scheduleSave(
+                          pins: false,
+                          drawings: false,
+                          meta: true,
+                        );
+                      },
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -3175,7 +3994,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                 ? _buildEmptyState()
                 : Stack(
                     children: [
-                      Positioned.fill(
+                      AnimatedPositioned(
+                        duration: const Duration(milliseconds: 220),
+                        curve: Curves.easeOut,
+                        top: 0,
+                        left: 0,
+                        bottom: 0,
+                        right:
+                            selectedPin != null && !_suppressPinPanel ? 320 : 0,
                         child: _buildDrawingArea(),
                       ),
                       AnimatedPositioned(
@@ -3184,10 +4010,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                         ),
                         curve: Curves.easeOut,
                         top: 0,
-                        right: selectedPin == null ? -320 : 0,
+                        right:
+                            selectedPin == null || _suppressPinPanel ? -320 : 0,
                         bottom: 0,
                         width: 320,
-                        child: selectedPin == null || _noteController == null
+                        child: selectedPin == null ||
+                                _suppressPinPanel ||
+                                _noteController == null
                             ? const SizedBox.shrink()
                             : PinSidePanel(
                                 pin: selectedPin,
@@ -3197,6 +4026,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                                 onDelete: _deleteSelectedPin,
                                 onAddPhotos: _addPhotosToSelectedPin,
                                 onShowAllPhotos: _showAllPhotosForSelectedPin,
+                                onPhotoTap: (PhotoData photo) =>
+                                    _openPhotoEditor(selectedPin, photo),
                                 directionEditing:
                                     _pendingDirectionPinId == selectedPin.id,
                                 onChangeDirection:
@@ -3310,7 +4141,15 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   pins: _currentPagePins,
                   strokes: _currentPageStrokes,
                   pinModeEnabled: _selectedTool == FieldTool.pin,
-                  penModeEnabled: _selectedTool == FieldTool.pen,
+                  penModeEnabled: _selectedTool == FieldTool.pen ||
+                      _selectedTool == FieldTool.shape,
+                  selectionModeEnabled: _selectedTool == FieldTool.select,
+                  textModeEnabled: _selectedTool == FieldTool.text,
+                  eraserEnabled:
+                      _selectedTool == FieldTool.pen && _eraserEnabled,
+                  eraserRadiusNormalized:
+                      (_eraserWidth / 1120).clamp(0.006, 0.08),
+                  selectedStrokeId: _selectedAnnotationId,
                   selectedPinId: _selectedPinId,
                   pendingDirectionPinId: _pendingDirectionPinId,
                   onAddPin: _addPin,
@@ -3326,6 +4165,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   onStrokeStart: _startStroke,
                   onStrokeUpdate: _updateStroke,
                   onStrokeEnd: _endStroke,
+                  onCanvasTap: _handleCanvasTap,
                 ),
         ),
         if (imageBytes != null)
@@ -3453,6 +4293,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             mainAxisAlignment: MainAxisAlignment.center,
             children: <Widget>[
               _ToolbarButton(
+                icon: Icons.select_all_rounded,
+                label: '選択',
+                selected: _selectedTool == FieldTool.select,
+                enabled: pageInteractionAvailable,
+                onPressed: () => _selectTool(FieldTool.select),
+              ),
+              _ToolbarButton(
                 icon: Icons.location_on_rounded,
                 iconColor: _pinColor,
                 label: 'ピン',
@@ -3469,6 +4316,22 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                 selected: _selectedTool == FieldTool.pen,
                 enabled: pageInteractionAvailable,
                 onPressed: () => _selectTool(FieldTool.pen),
+              ),
+              _ToolbarButton(
+                icon: Icons.category_outlined,
+                iconColor: _penColor,
+                label: '図形',
+                selected: _selectedTool == FieldTool.shape,
+                enabled: pageInteractionAvailable,
+                onPressed: () => _selectTool(FieldTool.shape),
+              ),
+              _ToolbarButton(
+                icon: Icons.text_fields_rounded,
+                iconColor: _penColor,
+                label: 'テキスト',
+                selected: _selectedTool == FieldTool.text,
+                enabled: pageInteractionAvailable,
+                onPressed: () => _selectTool(FieldTool.text),
               ),
               _ToolbarButton(
                 icon: Icons.undo_rounded,

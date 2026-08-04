@@ -187,6 +187,82 @@ void main() {
     );
   });
 
+  test('写真の原本と書き込み済み画像を分けて保存する', () async {
+    const String projectId = 'edited-photo';
+    const String projectName = '写真書き込み';
+    const String pinId = 'pin-1';
+    const String photoId = 'photo/日本語-1';
+    await ProjectRepository.createProject(id: projectId, name: projectName);
+    await ProjectRepository.savePdfOnce(
+      projectId: projectId,
+      projectName: projectName,
+      bytes: Uint8List.fromList(<int>[1]),
+    );
+    await ProjectRepository.saveProjectSnapshot(
+      projectId: projectId,
+      projectName: projectName,
+      metadata: const <String, dynamic>{},
+      pins: const <Map<String, dynamic>>[
+        <String, dynamic>{'id': pinId, 'number': 1},
+      ],
+      strokes: const <Map<String, dynamic>>[],
+    );
+    await ProjectRepository.savePhoto(
+      projectId: projectId,
+      projectName: projectName,
+      pinId: pinId,
+      pinNumber: 1,
+      photoId: photoId,
+      fileName: '001.jpg',
+      bytes: Uint8List.fromList(<int>[1, 2, 3]),
+    );
+    await ProjectRepository.saveEditedPhoto(
+      projectId: projectId,
+      pinNumber: 1,
+      photoId: photoId,
+      bytes: Uint8List.fromList(<int>[9, 8, 7, 6]),
+    );
+
+    expect(
+      await ProjectRepository.loadEditedPhotoBytes(
+        projectId: projectId,
+        pinNumber: 1,
+        photoId: photoId,
+      ),
+      <int>[9, 8, 7, 6],
+    );
+    final List<Map<String, dynamic>> originals =
+        await ProjectRepository.loadPhotosForPin(
+      projectId: projectId,
+      pinId: pinId,
+    );
+    expect(originals, hasLength(1));
+    expect(originals.single['bytes'], <int>[1, 2, 3]);
+
+    await ProjectRepository.deleteEditedPhoto(
+      projectId: projectId,
+      pinNumber: 1,
+      photoId: photoId,
+    );
+    expect(
+      await ProjectRepository.loadEditedPhotoBytes(
+        projectId: projectId,
+        pinNumber: 1,
+        photoId: photoId,
+      ),
+      isNull,
+    );
+    expect(
+      await ProjectRepository.loadPhotoBytes(
+        projectId: projectId,
+        photoId: photoId,
+        pinNumber: 1,
+        fileName: '001.jpg',
+      ),
+      <int>[1, 2, 3],
+    );
+  });
+
   test('中断された写真フォルダ移動をmanifestのピン番号へ回収する', () async {
     const String projectId = 'moving-photo-recovery';
     const String projectName = '写真移動復元';
