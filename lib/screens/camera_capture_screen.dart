@@ -53,11 +53,12 @@ class _CameraThumbnail {
   final bool isPending;
 
   _CameraThumbnail copyWith({
+    String? id,
     Uint8List? bytes,
     bool? isPending,
   }) {
     return _CameraThumbnail(
-      id: id,
+      id: id ?? this.id,
       bytes: bytes ?? this.bytes,
       isPending: isPending ?? this.isPending,
     );
@@ -486,6 +487,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen>
         if (result != null) {
           if (index >= 0) {
             _recentPhotos[index] = _recentPhotos[index].copyWith(
+              id: result.id,
               bytes: result.bytes,
               isPending: false,
             );
