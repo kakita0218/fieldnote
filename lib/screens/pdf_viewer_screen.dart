@@ -183,6 +183,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   DrawingKind _shapeKind = DrawingKind.line;
   double _eraserWidth = 28;
   double _textFontSize = 22;
+  double _textBoxWidthRatio = 0.45;
   bool _eraserEnabled = false;
   late String _boardBusinessName;
   String _boardFacilityName = '';
@@ -198,6 +199,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   final Map<int, List<_DrawingEdit>> _redoDrawingEditsByPage = {};
   DrawingStroke? _activeStroke;
   int? _activeStrokeIndex;
+  DrawingStroke? _movingTextOriginal;
+  Offset? _movingTextGrabOffset;
   int? _activeEraserPage;
   Offset? _lastEraserPosition;
   List<DrawingStroke>? _activeEraserBeforeStrokes;
@@ -259,6 +262,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     }
     _endStroke();
     _saveSelectedPinNote();
+    _discardEmptyTextDrafts(_currentPage);
     _saveDebounce?.cancel();
     _enqueueSaveInBackground();
   }
@@ -420,7 +424,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return;
     }
 
+    bool removedDraft = false;
     setState(() {
+      if (tool != FieldTool.text) {
+        removedDraft = _discardEmptyTextDrafts(_currentPage);
+      }
       _selectedTool = tool;
       if (tool != FieldTool.select) _selectedAnnotationId = null;
       if (tool != FieldTool.pen) _eraserEnabled = false;
@@ -429,7 +437,37 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _captureAfterDirectionPinId = null;
       }
     });
-    _scheduleSave(pins: false, drawings: false, meta: true);
+    _scheduleSave(
+      pins: false,
+      drawings: removedDraft,
+      meta: true,
+    );
+  }
+
+  bool _discardEmptyTextDrafts(int pageNumber) {
+    final List<DrawingStroke>? strokes = _strokesByPage[pageNumber];
+    if (strokes == null) return false;
+    final Set<String> draftIds = strokes
+        .where(
+          (DrawingStroke stroke) =>
+              stroke.kind == DrawingKind.text && stroke.text.trim().isEmpty,
+        )
+        .map((DrawingStroke stroke) => stroke.id)
+        .toSet();
+    if (draftIds.isEmpty) return false;
+    strokes.removeWhere((DrawingStroke stroke) => draftIds.contains(stroke.id));
+    bool referencesDraft(_DrawingEdit edit) => <_IndexedDrawingStroke>[
+          ...edit.removedStrokes,
+          ...edit.addedStrokes,
+        ].any(
+          (_IndexedDrawingStroke item) => draftIds.contains(item.stroke.id),
+        );
+    _undoDrawingEditsByPage[pageNumber]?.removeWhere(referencesDraft);
+    _redoDrawingEditsByPage[pageNumber]?.removeWhere(referencesDraft);
+    if (draftIds.contains(_selectedAnnotationId)) {
+      _selectedAnnotationId = null;
+    }
+    return true;
   }
 
   void _discardPinRedoHistory() {
@@ -1887,6 +1925,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     _endStroke();
     _saveSelectedPinNote();
+    final bool removedTextDraft = _discardEmptyTextDrafts(_currentPage);
     _noteController?.dispose();
     _noteController = null;
 
@@ -1898,7 +1937,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     final bool rendered = await _renderPage(pageNumber, commitPage: true);
     if (rendered) {
-      _scheduleSave(pins: false, drawings: false, meta: true);
+      _scheduleSave(
+        pins: false,
+        drawings: removedTextDraft,
+        meta: true,
+      );
     }
   }
 
@@ -2437,15 +2480,29 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   List<Map<String, dynamic>> _serializeStrokes() => _strokesByPage.entries
       .expand((MapEntry<int, List<DrawingStroke>> entry) => entry.value)
+      .where(
+        (DrawingStroke stroke) =>
+            stroke.kind != DrawingKind.text || stroke.text.trim().isNotEmpty,
+      )
       .map(serializeDrawingStroke)
       .toList(growable: false);
 
   Map<String, dynamic> _serializePhotoAnnotations() => <String, dynamic>{
         for (final MapEntry<String, List<DrawingStroke>> entry
             in _photoAnnotationsById.entries)
-          if (entry.value.isNotEmpty)
-            entry.key:
-                entry.value.map(serializeDrawingStroke).toList(growable: false),
+          if (entry.value.any(
+            (DrawingStroke stroke) =>
+                stroke.kind != DrawingKind.text ||
+                stroke.text.trim().isNotEmpty,
+          ))
+            entry.key: entry.value
+                .where(
+                  (DrawingStroke stroke) =>
+                      stroke.kind != DrawingKind.text ||
+                      stroke.text.trim().isNotEmpty,
+                )
+                .map(serializeDrawingStroke)
+                .toList(growable: false),
       };
 
   Map<String, dynamic> _projectMetadata() => <String, dynamic>{
@@ -2462,6 +2519,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         'shapeKind': _shapeKind.name,
         'eraserWidth': _eraserWidth,
         'textFontSize': _textFontSize,
+        'textBoxWidthRatio': _textBoxWidthRatio,
         'photoAnnotations': _serializePhotoAnnotations(),
         'boardBusinessName': _boardBusinessName,
         'boardFacilityName': _boardFacilityName,
@@ -2778,6 +2836,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             ((data['eraserWidth'] as num?)?.toDouble() ?? 28).clamp(6, 80);
         _textFontSize =
             ((data['textFontSize'] as num?)?.toDouble() ?? 22).clamp(12, 64);
+        _textBoxWidthRatio =
+            ((data['textBoxWidthRatio'] as num?)?.toDouble() ?? 0.45)
+                .clamp(0.12, 0.8);
         _currentPage =
             ((data['currentPage'] as num?)?.toInt() ?? 1).clamp(1, _pageCount);
         final String? pendingId = data['pendingDirectionPinId']?.toString();
@@ -2953,6 +3014,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             brush: stroke.brush,
             text: stroke.text,
             fontSize: stroke.fontSize,
+            textBoxWidthRatio: stroke.textBoxWidthRatio,
           ),
         )
         .toList(growable: false);
@@ -3061,11 +3123,15 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       if (stroke.points.isEmpty) continue;
       if (stroke.kind == DrawingKind.text ||
           stroke.kind == DrawingKind.rectangle) {
+        final Size hitTestSize = Size(_pageAspectRatio * 1000, 1000);
         final Rect bounds = drawingStrokeBounds(
           stroke,
-          const Size(1000, 1000),
+          hitTestSize,
         ).inflate(12);
-        if (bounds.contains(Offset(position.dx * 1000, position.dy * 1000))) {
+        if (bounds.contains(Offset(
+          position.dx * hitTestSize.width,
+          position.dy * hitTestSize.height,
+        ))) {
           return stroke;
         }
         continue;
@@ -3095,7 +3161,70 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return;
     }
     if (_selectedTool != FieldTool.text) return;
-    final TextEditingController controller = TextEditingController();
+    final DrawingStroke? hit = _annotationAt(position);
+    if (hit?.kind == DrawingKind.text) {
+      setState(() => _selectedAnnotationId = hit!.id);
+      return;
+    }
+
+    final List<DrawingStroke> pageStrokes =
+        _strokesByPage.putIfAbsent(_currentPage, () => <DrawingStroke>[]);
+    final int draftIndex = pageStrokes.indexWhere(
+      (DrawingStroke stroke) =>
+          stroke.kind == DrawingKind.text && stroke.text.trim().isEmpty,
+    );
+    if (draftIndex >= 0) {
+      final DrawingStroke draft = pageStrokes[draftIndex];
+      setState(() {
+        pageStrokes[draftIndex] = draft.copyWith(
+          points: <DrawingPoint>[DrawingPoint(position: position)],
+        );
+        _selectedAnnotationId = draft.id;
+      });
+      return;
+    }
+
+    final DrawingStroke annotation = DrawingStroke(
+      id: DateTime.now().microsecondsSinceEpoch.toString(),
+      pageNumber: _currentPage,
+      points: <DrawingPoint>[DrawingPoint(position: position)],
+      width: _penWidth,
+      color: _penColor,
+      opacity: _penOpacity,
+      kind: DrawingKind.text,
+      fontSize: _textFontSize,
+      textBoxWidthRatio: _textBoxWidthRatio,
+    );
+    setState(() {
+      final int index = pageStrokes.length;
+      pageStrokes.add(annotation);
+      _selectedAnnotationId = annotation.id;
+      _undoDrawingEditsByPage
+          .putIfAbsent(_currentPage, () => <_DrawingEdit>[])
+          .add(
+            _DrawingEdit(
+              removedStrokes: const <_IndexedDrawingStroke>[],
+              addedStrokes: <_IndexedDrawingStroke>[
+                _IndexedDrawingStroke(stroke: annotation, index: index),
+              ],
+            ),
+          );
+      _redoDrawingEditsByPage[_currentPage]?.clear();
+    });
+  }
+
+  Future<void> _handleCanvasDoubleTap(Offset position) async {
+    final DrawingStroke? hit = _annotationAt(position);
+    if (hit?.kind != DrawingKind.text) return;
+    setState(() => _selectedAnnotationId = hit!.id);
+    await _editSelectedText();
+  }
+
+  Future<void> _editSelectedText() async {
+    final DrawingStroke? selected = _selectedAnnotation;
+    if (selected == null || selected.kind != DrawingKind.text) return;
+    final TextEditingController controller =
+        TextEditingController(text: selected.text);
     final String? text = await showDialog<String>(
       context: context,
       builder: (BuildContext context) => AlertDialog(
@@ -3124,37 +3253,101 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       ),
     );
     controller.dispose();
-    if (text == null || text.isEmpty || !mounted) return;
-    final DrawingStroke annotation = DrawingStroke(
-      id: DateTime.now().microsecondsSinceEpoch.toString(),
-      pageNumber: _currentPage,
-      points: <DrawingPoint>[DrawingPoint(position: position)],
-      width: _penWidth,
-      color: _penColor,
-      opacity: _penOpacity,
-      kind: DrawingKind.text,
-      text: text,
-      fontSize: _textFontSize,
+    if (text == null || !mounted) return;
+    if (text.isEmpty) {
+      _deleteSelectedAnnotation();
+      return;
+    }
+    if (text == selected.text) return;
+    _changeSelectedAnnotation(text: text);
+  }
+
+  bool _startTextAnnotationMove(Offset position) {
+    if (_selectedTool != FieldTool.text && _selectedTool != FieldTool.select) {
+      return false;
+    }
+    final DrawingStroke? hit = _annotationAt(position);
+    if (hit == null || hit.kind != DrawingKind.text || hit.points.isEmpty) {
+      return false;
+    }
+    _movingTextOriginal = hit;
+    _movingTextGrabOffset = hit.points.first.position - position;
+    setState(() => _selectedAnnotationId = hit.id);
+    return true;
+  }
+
+  void _updateTextAnnotationMove(Offset position) {
+    final DrawingStroke? original = _movingTextOriginal;
+    final Offset? grabOffset = _movingTextGrabOffset;
+    if (original == null || grabOffset == null) return;
+    final List<DrawingStroke>? strokes = _strokesByPage[original.pageNumber];
+    final int index = strokes?.indexWhere(
+          (DrawingStroke stroke) => stroke.id == original.id,
+        ) ??
+        -1;
+    if (strokes == null || index < 0) return;
+    final Offset next = position + grabOffset;
+    final Offset clamped = Offset(
+      next.dx.clamp(0.0, 1.0),
+      next.dy.clamp(0.0, 1.0),
     );
     setState(() {
-      final List<DrawingStroke> pageStrokes =
-          _strokesByPage.putIfAbsent(_currentPage, () => <DrawingStroke>[]);
-      final int index = pageStrokes.length;
-      pageStrokes.add(annotation);
-      _selectedAnnotationId = annotation.id;
+      strokes[index] = strokes[index].copyWith(
+        points: <DrawingPoint>[
+          DrawingPoint(
+            position: clamped,
+            pressure: strokes[index].points.first.pressure,
+          ),
+        ],
+      );
+    });
+  }
+
+  void _finishTextAnnotationMove(Offset position) {
+    _updateTextAnnotationMove(position);
+    final DrawingStroke? original = _movingTextOriginal;
+    _movingTextOriginal = null;
+    _movingTextGrabOffset = null;
+    if (original == null) return;
+    final List<DrawingStroke>? strokes = _strokesByPage[original.pageNumber];
+    final int index = strokes?.indexWhere(
+          (DrawingStroke stroke) => stroke.id == original.id,
+        ) ??
+        -1;
+    if (strokes == null || index < 0) return;
+    final DrawingStroke current = strokes[index];
+    if (current.points.first.position == original.points.first.position) return;
+    setState(() {
       _undoDrawingEditsByPage
-          .putIfAbsent(_currentPage, () => <_DrawingEdit>[])
+          .putIfAbsent(original.pageNumber, () => <_DrawingEdit>[])
           .add(
             _DrawingEdit(
-              removedStrokes: const <_IndexedDrawingStroke>[],
+              removedStrokes: <_IndexedDrawingStroke>[
+                _IndexedDrawingStroke(stroke: original, index: index),
+              ],
               addedStrokes: <_IndexedDrawingStroke>[
-                _IndexedDrawingStroke(stroke: annotation, index: index),
+                _IndexedDrawingStroke(stroke: current, index: index),
               ],
             ),
           );
-      _redoDrawingEditsByPage[_currentPage]?.clear();
+      _redoDrawingEditsByPage[original.pageNumber]?.clear();
     });
     _scheduleSave(pins: false, drawings: true, meta: true);
+  }
+
+  void _cancelTextAnnotationMove() {
+    final DrawingStroke? original = _movingTextOriginal;
+    _movingTextOriginal = null;
+    _movingTextGrabOffset = null;
+    if (original == null) return;
+    final List<DrawingStroke>? strokes = _strokesByPage[original.pageNumber];
+    final int index = strokes?.indexWhere(
+          (DrawingStroke stroke) => stroke.id == original.id,
+        ) ??
+        -1;
+    if (strokes != null && index >= 0) {
+      setState(() => strokes[index] = original);
+    }
   }
 
   DrawingStroke? get _selectedAnnotation {
@@ -3172,6 +3365,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     double? width,
     double? opacity,
     double? fontSize,
+    String? text,
+    double? textBoxWidthRatio,
   }) {
     final DrawingStroke? selected = _selectedAnnotation;
     if (selected == null) return;
@@ -3186,6 +3381,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       width: width,
       opacity: opacity,
       fontSize: fontSize,
+      text: text,
+      textBoxWidthRatio: textBoxWidthRatio,
     );
     setState(() {
       strokes[index] = updated;
@@ -3293,6 +3490,33 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                       updateSheet(() {});
                     },
                   ),
+                  if (selected.kind == DrawingKind.text) ...<Widget>[
+                    Text(
+                      'テキスト枠の横幅 '
+                      '${(selected.textBoxWidthRatio * 100).round()}%',
+                    ),
+                    Slider(
+                      value: selected.textBoxWidthRatio.clamp(0.12, 0.8),
+                      min: 0.12,
+                      max: 0.8,
+                      divisions: 17,
+                      onChanged: (double value) {
+                        _changeSelectedAnnotation(textBoxWidthRatio: value);
+                        updateSheet(() {});
+                      },
+                    ),
+                    FilledButton.icon(
+                      onPressed: () {
+                        Navigator.pop(context);
+                        _editSelectedText();
+                      },
+                      icon: const Icon(Icons.keyboard_rounded),
+                      label: Text(
+                        selected.text.isEmpty ? '文字入力を開始' : '文字を再編集',
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                  ],
                   Text('透過率 ${(selected.opacity * 100).round()}%'),
                   Slider(
                     value: selected.opacity.clamp(0.1, 1),
@@ -3410,6 +3634,20 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   max: 64,
                   onChanged: (double value) {
                     setState(() => _textFontSize = value);
+                    updateSheet(() {});
+                    _scheduleSave(pins: false, drawings: false, meta: true);
+                  },
+                ),
+                Text(
+                  'テキスト枠の横幅 ${(_textBoxWidthRatio * 100).round()}%',
+                ),
+                Slider(
+                  value: _textBoxWidthRatio.clamp(0.12, 0.8),
+                  min: 0.12,
+                  max: 0.8,
+                  divisions: 17,
+                  onChanged: (double value) {
+                    setState(() => _textBoxWidthRatio = value);
                     updateSheet(() {});
                     _scheduleSave(pins: false, drawings: false, meta: true);
                   },
@@ -4098,6 +4336,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   Widget _buildDrawingArea() {
     final Uint8List? imageBytes = _pageImageBytes;
+    final DrawingStroke? selectedText =
+        _selectedAnnotation?.kind == DrawingKind.text
+            ? _selectedAnnotation
+            : null;
 
     return Stack(
       children: [
@@ -4166,6 +4408,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   onStrokeUpdate: _updateStroke,
                   onStrokeEnd: _endStroke,
                   onCanvasTap: _handleCanvasTap,
+                  onCanvasDoubleTap: _handleCanvasDoubleTap,
+                  onAnnotationMoveStart: _startTextAnnotationMove,
+                  onAnnotationMoveUpdate: _updateTextAnnotationMove,
+                  onAnnotationMoveEnd: _finishTextAnnotationMove,
+                  onAnnotationMoveCancel: _cancelTextAnnotationMove,
                 ),
         ),
         if (imageBytes != null)
@@ -4182,6 +4429,55 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   _transformationController.value = Matrix4.identity();
                 },
                 icon: const Icon(Icons.center_focus_strong_rounded),
+              ),
+            ),
+          ),
+        if (imageBytes != null &&
+            selectedText != null &&
+            (_selectedTool == FieldTool.text ||
+                _selectedTool == FieldTool.select))
+          Positioned(
+            top: 16,
+            right: 16,
+            child: Material(
+              color: AppColors.panel.withValues(alpha: 0.96),
+              elevation: 6,
+              borderRadius: BorderRadius.circular(24),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    const Padding(
+                      padding: EdgeInsets.only(left: 8),
+                      child: Text(
+                        'ドラッグで移動',
+                        style: TextStyle(
+                          color: AppColors.textSecondary,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                    TextButton.icon(
+                      onPressed: _editSelectedText,
+                      icon: const Icon(Icons.keyboard_rounded, size: 19),
+                      label: Text(
+                        selectedText.text.isEmpty ? '文字入力' : '再編集',
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: '色・サイズ・横幅・透過率',
+                      onPressed: _showSelectionSettings,
+                      icon: const Icon(Icons.tune_rounded),
+                    ),
+                    IconButton(
+                      tooltip: 'テキストを削除',
+                      onPressed: _deleteSelectedAnnotation,
+                      color: const Color(0xFFFF6B6B),
+                      icon: const Icon(Icons.delete_outline_rounded),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),

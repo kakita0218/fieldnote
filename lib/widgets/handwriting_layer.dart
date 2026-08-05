@@ -42,13 +42,14 @@ Rect drawingStrokeBounds(DrawingStroke stroke, Size size) {
     bottom = position.dy > bottom ? position.dy : bottom;
   }
   if (stroke.kind == DrawingKind.text) {
+    final String measuredText = stroke.text.isEmpty ? '文字を入力' : stroke.text;
     final TextPainter painter = TextPainter(
       text: TextSpan(
-        text: stroke.text,
+        text: measuredText,
         style: TextStyle(fontSize: stroke.fontSize),
       ),
       textDirection: TextDirection.ltr,
-    )..layout(maxWidth: size.width * 0.45);
+    )..layout(maxWidth: size.width * stroke.textBoxWidthRatio);
     right = left + painter.width;
     bottom = top + painter.height;
   }
@@ -76,22 +77,29 @@ void paintDrawingStrokes(
 
     if (stroke.kind == DrawingKind.text) {
       final DrawingPoint anchor = stroke.points.first;
-      final TextPainter painter = TextPainter(
-        text: TextSpan(
-          text: stroke.text,
-          style: TextStyle(
-            color: color,
-            fontSize: stroke.fontSize * widthScale,
-            fontWeight: FontWeight.w600,
+      final bool showPlaceholder =
+          stroke.text.isEmpty && selectedStrokeId == stroke.id;
+      if (stroke.text.isNotEmpty || showPlaceholder) {
+        final TextPainter painter = TextPainter(
+          text: TextSpan(
+            text: showPlaceholder ? '文字を入力' : stroke.text,
+            style: TextStyle(
+              color: showPlaceholder
+                  ? color.withValues(alpha: color.a * 0.55)
+                  : color,
+              fontSize: stroke.fontSize * widthScale,
+              fontWeight: FontWeight.w600,
+              fontStyle: showPlaceholder ? FontStyle.italic : FontStyle.normal,
+            ),
           ),
-        ),
-        textDirection: TextDirection.ltr,
-      )..layout(maxWidth: size.width * 0.45);
-      painter.paint(
-        canvas,
-        Offset(
-            anchor.position.dx * size.width, anchor.position.dy * size.height),
-      );
+          textDirection: TextDirection.ltr,
+        )..layout(maxWidth: size.width * stroke.textBoxWidthRatio);
+        painter.paint(
+          canvas,
+          Offset(anchor.position.dx * size.width,
+              anchor.position.dy * size.height),
+        );
+      }
     } else if (stroke.kind == DrawingKind.rectangle &&
         stroke.points.length >= 2) {
       final Offset start = Offset(

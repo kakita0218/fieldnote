@@ -18,6 +18,7 @@ void main() {
       brush: DrawingBrush.highlighter,
       text: '点検済み',
       fontSize: 32,
+      textBoxWidthRatio: 0.6,
     );
 
     final DrawingStroke restored =
@@ -30,6 +31,7 @@ void main() {
     expect(restored.opacity, 0.45);
     expect(restored.text, '点検済み');
     expect(restored.fontSize, 32);
+    expect(restored.textBoxWidthRatio, 0.6);
     expect(restored.points.single.position, const Offset(0.25, 0.4));
     expect(restored.points.single.pressure, 0.8);
   });
@@ -48,5 +50,6 @@ void main() {
     expect(restored.kind, DrawingKind.freehand);
     expect(restored.brush, DrawingBrush.fountain);
     expect(restored.opacity, 1);
+    expect(restored.textBoxWidthRatio, 0.45);
   });
 }

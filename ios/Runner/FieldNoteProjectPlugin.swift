@@ -959,11 +959,16 @@ private enum FieldNotePdfWriter {
           : 24
         let text = stroke["text"] as? String ?? ""
         guard !text.isEmpty else { continue }
+        let rawTextBoxWidthRatio =
+          number(stroke["textBoxWidthRatio"])?.doubleValue ?? 0.45
+        let textBoxWidthRatio = rawTextBoxWidthRatio.isFinite
+          ? min(max(CGFloat(rawTextBoxWidthRatio), 0.12), 0.8)
+          : 0.45
         let lineCount = max(text.components(separatedBy: .newlines).count, 1)
         let textBounds = CGRect(
           x: points[0].x,
           y: points[0].y - fontSize * 1.45 * CGFloat(lineCount),
-          width: max(geometry.bounds.width * 0.45, fontSize * 2),
+          width: max(geometry.bounds.width * textBoxWidthRatio, fontSize * 2),
           height: fontSize * 1.45 * CGFloat(lineCount)
         )
         let annotation = PDFAnnotation(

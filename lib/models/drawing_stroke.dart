@@ -51,6 +51,7 @@ class DrawingStroke {
     this.brush = DrawingBrush.fountain,
     this.text = '',
     this.fontSize = 18,
+    this.textBoxWidthRatio = 0.45,
   });
 
   final String id;
@@ -63,6 +64,7 @@ class DrawingStroke {
   final DrawingBrush brush;
   final String text;
   final double fontSize;
+  final double textBoxWidthRatio;
 
   DrawingStroke copyWith({
     List<DrawingPoint>? points,
@@ -73,6 +75,7 @@ class DrawingStroke {
     DrawingBrush? brush,
     String? text,
     double? fontSize,
+    double? textBoxWidthRatio,
   }) {
     return DrawingStroke(
       id: id,
@@ -85,6 +88,7 @@ class DrawingStroke {
       brush: brush ?? this.brush,
       text: text ?? this.text,
       fontSize: fontSize ?? this.fontSize,
+      textBoxWidthRatio: textBoxWidthRatio ?? this.textBoxWidthRatio,
     );
   }
 }

@@ -306,6 +306,7 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
             brush: stroke.brush,
             text: stroke.text,
             fontSize: stroke.fontSize,
+            textBoxWidthRatio: stroke.textBoxWidthRatio,
           ),
         );
       }

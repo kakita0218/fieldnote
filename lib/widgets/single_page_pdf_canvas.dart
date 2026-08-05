@@ -41,6 +41,11 @@ class SinglePagePdfCanvas extends StatefulWidget {
     required this.onStrokeUpdate,
     required this.onStrokeEnd,
     this.onCanvasTap,
+    this.onCanvasDoubleTap,
+    this.onAnnotationMoveStart,
+    this.onAnnotationMoveUpdate,
+    this.onAnnotationMoveEnd,
+    this.onAnnotationMoveCancel,
   });
 
   final Uint8List imageBytes;
@@ -72,6 +77,11 @@ class SinglePagePdfCanvas extends StatefulWidget {
       onStrokeUpdate;
   final VoidCallback onStrokeEnd;
   final ValueChanged<Offset>? onCanvasTap;
+  final ValueChanged<Offset>? onCanvasDoubleTap;
+  final bool Function(Offset normalizedPosition)? onAnnotationMoveStart;
+  final ValueChanged<Offset>? onAnnotationMoveUpdate;
+  final ValueChanged<Offset>? onAnnotationMoveEnd;
+  final VoidCallback? onAnnotationMoveCancel;
 
   @override
   State<SinglePagePdfCanvas> createState() => _SinglePagePdfCanvasState();
@@ -82,6 +92,8 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
   int? _activeStylusPointer;
   String? _movingPinId;
   Offset? _eraserCursor;
+  bool _movingAnnotation = false;
+  Offset? _lastAnnotationPosition;
 
   @override
   void didUpdateWidget(covariant SinglePagePdfCanvas oldWidget) {
@@ -90,6 +102,10 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
       _activeStylusPointer = null;
     }
     if (!widget.eraserEnabled) _eraserCursor = null;
+    if (!widget.selectionModeEnabled && !widget.textModeEnabled) {
+      _movingAnnotation = false;
+      _lastAnnotationPosition = null;
+    }
   }
 
   double _directionFromPoints(Offset from, Offset to) {
@@ -182,8 +198,9 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
 
         return TouchInteractiveViewer(
           transformationController: widget.transformationController,
-          interactionEnabled:
-              _activeStylusPointer == null && _movingPinId == null,
+          interactionEnabled: _activeStylusPointer == null &&
+              _movingPinId == null &&
+              !_movingAnnotation,
           minScale: 1,
           maxScale: 10,
           minimumPointerCount: widget.pinModeEnabled ? 2 : 1,
@@ -281,6 +298,79 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                     : null,
                 child: GestureDetector(
                   behavior: HitTestBehavior.opaque,
+                  onDoubleTapDown:
+                      widget.selectionModeEnabled || widget.textModeEnabled
+                          ? (TapDownDetails details) {
+                              widget.onCanvasDoubleTap?.call(
+                                _normalize(
+                                  details.localPosition,
+                                  pageWidth,
+                                  pageHeight,
+                                ),
+                              );
+                            }
+                          : null,
+                  onPanStart:
+                      widget.selectionModeEnabled || widget.textModeEnabled
+                          ? (DragStartDetails details) {
+                              final Offset normalized = _normalize(
+                                details.localPosition,
+                                pageWidth,
+                                pageHeight,
+                              );
+                              final bool accepted =
+                                  widget.onAnnotationMoveStart?.call(
+                                        normalized,
+                                      ) ??
+                                      false;
+                              if (accepted) {
+                                setState(() {
+                                  _movingAnnotation = true;
+                                  _lastAnnotationPosition = normalized;
+                                });
+                              }
+                            }
+                          : null,
+                  onPanUpdate:
+                      widget.selectionModeEnabled || widget.textModeEnabled
+                          ? (DragUpdateDetails details) {
+                              if (!_movingAnnotation) return;
+                              final Offset normalized = _normalize(
+                                details.localPosition,
+                                pageWidth,
+                                pageHeight,
+                              );
+                              _lastAnnotationPosition = normalized;
+                              widget.onAnnotationMoveUpdate?.call(
+                                normalized,
+                              );
+                            }
+                          : null,
+                  onPanEnd:
+                      widget.selectionModeEnabled || widget.textModeEnabled
+                          ? (DragEndDetails _) {
+                              if (!_movingAnnotation) return;
+                              final Offset? position = _lastAnnotationPosition;
+                              setState(() {
+                                _movingAnnotation = false;
+                                _lastAnnotationPosition = null;
+                              });
+                              if (position != null) {
+                                widget.onAnnotationMoveEnd?.call(position);
+                              }
+                            }
+                          : null,
+                  onPanCancel:
+                      widget.selectionModeEnabled || widget.textModeEnabled
+                          ? () {
+                              if (!_movingAnnotation) return;
+                              setState(() {
+                                _movingAnnotation = false;
+                                _lastAnnotationPosition = null;
+                              });
+                              widget.onAnnotationMoveCancel?.call();
+                            }
+                          : null,
                   onTapUp: widget.pinModeEnabled ||
                           widget.selectionModeEnabled ||
                           widget.textModeEnabled
