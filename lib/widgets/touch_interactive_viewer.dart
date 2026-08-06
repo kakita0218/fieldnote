@@ -1,5 +1,101 @@
+import 'dart:math' as math;
+
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+
+@immutable
+class PdfVisibleRange {
+  const PdfVisibleRange(this.normalizedRect);
+
+  final Rect normalizedRect;
+}
+
+Rect fittedPdfContentRect({
+  required Size viewportSize,
+  required double pageAspectRatio,
+}) {
+  if (viewportSize.isEmpty || pageAspectRatio <= 0) return Rect.zero;
+  double width = viewportSize.width;
+  double height = width / pageAspectRatio;
+  if (height > viewportSize.height) {
+    height = viewportSize.height;
+    width = height * pageAspectRatio;
+  }
+  return Rect.fromLTWH(
+    (viewportSize.width - width) / 2,
+    (viewportSize.height - height) / 2,
+    width,
+    height,
+  );
+}
+
+PdfVisibleRange? capturePdfVisibleRange({
+  required Matrix4 matrix,
+  required Size viewportSize,
+  required Rect contentRect,
+}) {
+  if (viewportSize.isEmpty || contentRect.isEmpty) return null;
+  final double scale = matrix.getMaxScaleOnAxis();
+  if (!scale.isFinite || scale <= 0) return null;
+  final double tx = matrix.storage[12];
+  final double ty = matrix.storage[13];
+  final Rect sceneViewport = Rect.fromLTRB(
+    -tx / scale,
+    -ty / scale,
+    (viewportSize.width - tx) / scale,
+    (viewportSize.height - ty) / scale,
+  );
+  final Rect visible = sceneViewport.intersect(contentRect);
+  if (visible.isEmpty) return null;
+  return PdfVisibleRange(
+    Rect.fromLTRB(
+      (visible.left - contentRect.left) / contentRect.width,
+      (visible.top - contentRect.top) / contentRect.height,
+      (visible.right - contentRect.left) / contentRect.width,
+      (visible.bottom - contentRect.top) / contentRect.height,
+    ),
+  );
+}
+
+Matrix4 restorePdfVisibleRange({
+  required PdfVisibleRange visibleRange,
+  required Size viewportSize,
+  required Rect contentRect,
+  double minScale = 1,
+  double maxScale = 10,
+}) {
+  if (viewportSize.isEmpty || contentRect.isEmpty) return Matrix4.identity();
+  final Rect normalized = visibleRange.normalizedRect;
+  final Rect target = Rect.fromLTRB(
+    contentRect.left + normalized.left * contentRect.width,
+    contentRect.top + normalized.top * contentRect.height,
+    contentRect.left + normalized.right * contentRect.width,
+    contentRect.top + normalized.bottom * contentRect.height,
+  );
+  if (target.isEmpty) return Matrix4.identity();
+  final double scale = math
+      .min(
+        viewportSize.width / target.width,
+        viewportSize.height / target.height,
+      )
+      .clamp(minScale, maxScale)
+      .toDouble();
+  final Offset viewportCenter = viewportSize.center(Offset.zero);
+  final Offset targetCenter = target.center;
+  final Matrix4 restored = Matrix4.identity()
+    ..setEntry(0, 0, scale)
+    ..setEntry(1, 1, scale)
+    ..setTranslationRaw(
+      viewportCenter.dx - targetCenter.dx * scale,
+      viewportCenter.dy - targetCenter.dy * scale,
+      0,
+    );
+  return constrainPdfTransformation(
+    matrix: restored,
+    viewportSize: viewportSize,
+    contentRect: contentRect,
+  );
+}
 
 Matrix4 constrainPdfTransformation({
   required Matrix4 matrix,

@@ -3,6 +3,82 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('pin panel resize keeps the previously visible PDF range', () {
+    const Size beforeSize = Size(1000, 600);
+    const Size afterSize = Size(680, 600);
+    final Rect beforeContent = fittedPdfContentRect(
+      viewportSize: beforeSize,
+      pageAspectRatio: 1.5,
+    );
+    final Matrix4 zoomed = Matrix4.identity()
+      ..setEntry(0, 0, 2)
+      ..setEntry(1, 1, 2)
+      ..setTranslationRaw(-450, -300, 0);
+    final PdfVisibleRange before = capturePdfVisibleRange(
+      matrix: zoomed,
+      viewportSize: beforeSize,
+      contentRect: beforeContent,
+    )!;
+
+    final Rect afterContent = fittedPdfContentRect(
+      viewportSize: afterSize,
+      pageAspectRatio: 1.5,
+    );
+    final Matrix4 restored = restorePdfVisibleRange(
+      visibleRange: before,
+      viewportSize: afterSize,
+      contentRect: afterContent,
+    );
+    final Rect after = capturePdfVisibleRange(
+      matrix: restored,
+      viewportSize: afterSize,
+      contentRect: afterContent,
+    )!
+        .normalizedRect;
+
+    expect(after.left, lessThanOrEqualTo(before.normalizedRect.left + 0.0001));
+    expect(after.top, lessThanOrEqualTo(before.normalizedRect.top + 0.0001));
+    expect(
+      after.right,
+      greaterThanOrEqualTo(before.normalizedRect.right - 0.0001),
+    );
+    expect(
+      after.bottom,
+      greaterThanOrEqualTo(before.normalizedRect.bottom - 0.0001),
+    );
+  });
+
+  test('pin panel resize keeps a fully visible PDF fully visible', () {
+    const Size beforeSize = Size(1000, 600);
+    const Size afterSize = Size(680, 600);
+    final PdfVisibleRange before = capturePdfVisibleRange(
+      matrix: Matrix4.identity(),
+      viewportSize: beforeSize,
+      contentRect: fittedPdfContentRect(
+        viewportSize: beforeSize,
+        pageAspectRatio: 1.5,
+      ),
+    )!;
+    final Rect afterContent = fittedPdfContentRect(
+      viewportSize: afterSize,
+      pageAspectRatio: 1.5,
+    );
+    final PdfVisibleRange after = capturePdfVisibleRange(
+      matrix: restorePdfVisibleRange(
+        visibleRange: before,
+        viewportSize: afterSize,
+        contentRect: afterContent,
+      ),
+      viewportSize: afterSize,
+      contentRect: afterContent,
+    )!;
+
+    expect(after.normalizedRect.left, closeTo(0, 0.0001));
+    expect(after.normalizedRect.top, closeTo(0, 0.0001));
+    expect(after.normalizedRect.right, closeTo(1, 0.0001));
+    expect(after.normalizedRect.bottom, closeTo(1, 0.0001));
+  });
+
   test('縮小状態ではPDFを画面中央へ戻す', () {
     final Matrix4 input = Matrix4.identity()..setTranslationRaw(900, -700, 0);
     final Matrix4 constrained = constrainPdfTransformation(

@@ -21,6 +21,7 @@ import '../theme/app_colors.dart';
 import '../widgets/handwriting_layer.dart';
 import '../widgets/single_page_pdf_canvas.dart';
 import '../widgets/pin_side_panel.dart';
+import '../widgets/touch_interactive_viewer.dart';
 import '../services/native_project_service.dart';
 import '../services/drawing_serialization.dart';
 import '../services/export_layout.dart';
@@ -162,6 +163,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       <int, Future<Uint8List?>>{};
   final TransformationController _transformationController =
       TransformationController();
+  final GlobalKey _drawingAreaKey = GlobalKey();
+  int _viewportRestoreGeneration = 0;
 
   String? _pdfPath;
   Uint8List? _pdfBytes;
@@ -653,6 +656,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (index < 0) return;
     final PinData latest = _pins[index];
     if (latest.photoCount > beforeCount) {
+      final PdfVisibleRange? visibleRange = _captureCurrentPdfVisibleRange();
       setState(() {
         _suppressPinPanel = false;
         _selectedPinId = latest.id;
@@ -661,7 +665,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _pinSizeScale = latest.sizeScale;
         _setNoteController(latest.note);
       });
-      _transformationController.value = Matrix4.identity();
+      _restoreVisibleRangeAfterPanelResize(visibleRange);
       unawaited(_ensurePhotosLoadedForPin(latest));
     } else {
       setState(() {
@@ -801,6 +805,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   Future<void> _selectPin(PinData pin) async {
     final int loadGeneration = ++_photoLoadGeneration;
+    final bool panelWasClosed = _selectedPin == null || _suppressPinPanel;
+    final PdfVisibleRange? visibleRange =
+        panelWasClosed ? _captureCurrentPdfVisibleRange() : null;
     setState(() {
       if (_pendingDirectionPinId != pin.id) {
         _pendingDirectionPinId = null;
@@ -813,7 +820,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       _pinSizeScale = pin.sizeScale;
       _setNoteController(pin.note);
     });
-    _transformationController.value = Matrix4.identity();
+    if (panelWasClosed) {
+      _restoreVisibleRangeAfterPanelResize(visibleRange);
+    }
 
     try {
       final List<Map<String, dynamic>> rows =
@@ -872,6 +881,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   void _closePinPanel() {
     _endStroke();
     _saveSelectedPinNote();
+    final PdfVisibleRange? visibleRange = _captureCurrentPdfVisibleRange();
 
     setState(() {
       _selectedPinId = null;
@@ -882,6 +892,44 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     _noteController?.dispose();
     _noteController = null;
+    _restoreVisibleRangeAfterPanelResize(visibleRange);
+  }
+
+  PdfVisibleRange? _captureCurrentPdfVisibleRange() {
+    final BuildContext? drawingContext = _drawingAreaKey.currentContext;
+    final RenderObject? renderObject = drawingContext?.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) return null;
+    final Size viewportSize = renderObject.size;
+    final Rect contentRect = fittedPdfContentRect(
+      viewportSize: viewportSize,
+      pageAspectRatio: _pageAspectRatio,
+    );
+    return capturePdfVisibleRange(
+      matrix: _transformationController.value,
+      viewportSize: viewportSize,
+      contentRect: contentRect,
+    );
+  }
+
+  void _restoreVisibleRangeAfterPanelResize(PdfVisibleRange? visibleRange) {
+    if (visibleRange == null) return;
+    final int generation = ++_viewportRestoreGeneration;
+    unawaited(Future<void>.delayed(const Duration(milliseconds: 240), () {
+      if (!mounted || generation != _viewportRestoreGeneration) return;
+      final BuildContext? drawingContext = _drawingAreaKey.currentContext;
+      final RenderObject? renderObject = drawingContext?.findRenderObject();
+      if (renderObject is! RenderBox || !renderObject.hasSize) return;
+      final Size viewportSize = renderObject.size;
+      final Rect contentRect = fittedPdfContentRect(
+        viewportSize: viewportSize,
+        pageAspectRatio: _pageAspectRatio,
+      );
+      _transformationController.value = restorePdfVisibleRange(
+        visibleRange: visibleRange,
+        viewportSize: viewportSize,
+        contentRect: contentRect,
+      );
+    }));
   }
 
   void _setNoteController(String note) {
@@ -4884,6 +4932,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     final DrawingStroke? selectedAnnotation = _selectedAnnotation;
 
     return Stack(
+      key: _drawingAreaKey,
       children: [
         Positioned.fill(
           child: imageBytes == null
