@@ -77,6 +77,7 @@ void main() {
     expect(doubleTapCount, 1);
 
     final TestGesture gesture = await tester.startGesture(center);
+    await tester.pump(const Duration(milliseconds: 600));
     await gesture.moveBy(const Offset(30, 20));
     await tester.pump();
     await gesture.moveBy(const Offset(50, 40));

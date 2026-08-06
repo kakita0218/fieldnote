@@ -15,6 +15,8 @@ Map<String, dynamic> serializeDrawingStroke(DrawingStroke stroke) {
     if (stroke.kind == DrawingKind.text) 'fontSize': stroke.fontSize,
     if (stroke.kind == DrawingKind.text)
       'textBoxWidthRatio': stroke.textBoxWidthRatio,
+    if (stroke.kind == DrawingKind.rectangle)
+      'rotationDegrees': stroke.rotationDegrees,
     'points': stroke.points
         .map(
           (DrawingPoint point) => <String, dynamic>{
@@ -71,5 +73,9 @@ DrawingStroke? deserializeDrawingStroke(
     fontSize: ((map['fontSize'] as num?)?.toDouble() ?? 18).clamp(8, 96),
     textBoxWidthRatio: ((map['textBoxWidthRatio'] as num?)?.toDouble() ?? 0.45)
         .clamp(0.12, 0.8),
+    rotationDegrees:
+        ((map['rotationDegrees'] as num?)?.toDouble() ?? 0).isFinite
+            ? (map['rotationDegrees'] as num?)?.toDouble() ?? 0
+            : 0,
   );
 }

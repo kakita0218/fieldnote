@@ -10,6 +10,8 @@ void main() {
       xRatio: 0.2,
       yRatio: 0.3,
       opacity: 0.55,
+      sizeScale: 0.5,
+      showsDirection: false,
       photoCount: 4,
       boardEnabled: true,
       boardTemplateId: 'chipping',
@@ -24,6 +26,8 @@ void main() {
     expect(moved.yRatio, 0.8);
     expect(moved.photoCount, 4);
     expect(moved.opacity, 0.55);
+    expect(moved.sizeScale, 0.5);
+    expect(moved.showsDirection, isFalse);
     expect(moved.boardTemplateId, 'chipping');
     expect(moved.boardChippingStep, 4);
     expect(moved.boardPositionId, 'topRight');

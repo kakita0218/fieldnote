@@ -443,12 +443,15 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen>
         );
       }
 
-      final Future<void> saveOperation =
-          _queueOriginalSave(pendingId, bytes, captureBoard);
-      // Keep one full-resolution JPEG in flight. This also guarantees that
-      // board auto-advance and the thumbnail count reflect durable storage
-      // before another shutter press is accepted.
-      await saveOperation;
+      // Saving can take noticeably longer than AVCapturePhotoOutput becoming
+      // ready for the next shot. Queue the durable write, but release the
+      // shutter as soon as the captured image and thumbnail are prepared.
+      // _closeCamera still waits for the queue, so leaving the screen cannot
+      // discard an in-flight photo.
+      unawaited(_queueOriginalSave(pendingId, bytes, captureBoard));
+      if (captureBoard.enabled) {
+        _advanceBoardAfterSaved(captureBoard);
+      }
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -499,10 +502,6 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen>
           _photoCount = (_photoCount - 1).clamp(0, 1 << 30).toInt();
         }
       });
-      if (result != null && captureBoard.enabled) {
-        _advanceBoardAfterSaved(captureBoard);
-      }
-
       if (saveError != null) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('写真を保存できませんでした：$saveError')),

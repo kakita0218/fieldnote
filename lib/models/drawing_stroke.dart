@@ -52,6 +52,7 @@ class DrawingStroke {
     this.text = '',
     this.fontSize = 18,
     this.textBoxWidthRatio = 0.45,
+    this.rotationDegrees = 0,
   });
 
   final String id;
@@ -65,6 +66,7 @@ class DrawingStroke {
   final String text;
   final double fontSize;
   final double textBoxWidthRatio;
+  final double rotationDegrees;
 
   DrawingStroke copyWith({
     List<DrawingPoint>? points,
@@ -76,6 +78,7 @@ class DrawingStroke {
     String? text,
     double? fontSize,
     double? textBoxWidthRatio,
+    double? rotationDegrees,
   }) {
     return DrawingStroke(
       id: id,
@@ -89,6 +92,7 @@ class DrawingStroke {
       text: text ?? this.text,
       fontSize: fontSize ?? this.fontSize,
       textBoxWidthRatio: textBoxWidthRatio ?? this.textBoxWidthRatio,
+      rotationDegrees: rotationDegrees ?? this.rotationDegrees,
     );
   }
 }

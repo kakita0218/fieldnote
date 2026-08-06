@@ -44,7 +44,8 @@ class PinMarker extends StatelessWidget {
   final VoidCallback? onMoveCancel;
 
   double get _circleSize =>
-      selected || awaitingDirection ? selectedCircleSize : normalCircleSize;
+      (selected || awaitingDirection ? selectedCircleSize : normalCircleSize) *
+      pin.sizeScale.clamp(1 / 3, 1);
 
   double _directionFromCirclePosition(
     Offset localPosition,
@@ -94,6 +95,8 @@ class PinMarker extends StatelessWidget {
                     selected: selected,
                     awaitingDirection: awaitingDirection,
                     hasPhoto: pin.photoCount > 0,
+                    sizeScale: pin.sizeScale,
+                    showsDirection: pin.showsDirection,
                   ),
                 ),
               ),
@@ -167,6 +170,8 @@ class _PinMarkerPainter extends CustomPainter {
     required this.selected,
     required this.awaitingDirection,
     required this.hasPhoto,
+    required this.sizeScale,
+    required this.showsDirection,
   });
 
   final int number;
@@ -176,14 +181,19 @@ class _PinMarkerPainter extends CustomPainter {
   final bool selected;
   final bool awaitingDirection;
   final bool hasPhoto;
+  final double sizeScale;
+  final bool showsDirection;
 
   bool get _isYellow => color.computeLuminance() > 0.62;
 
   @override
   void paint(Canvas canvas, Size size) {
     final bool emphasized = selected || awaitingDirection;
-    final double diameter =
-        emphasized ? PinMarker.selectedCircleSize : PinMarker.normalCircleSize;
+    final double scale = sizeScale.clamp(1 / 3, 1);
+    final double diameter = (emphasized
+            ? PinMarker.selectedCircleSize
+            : PinMarker.normalCircleSize) *
+        scale;
     final double radius = diameter / 2;
     final Offset center = Offset(size.width / 2, PinMarker.markerCenterY);
     final double safeOpacity = opacity.clamp(0.1, 1.0);
@@ -212,44 +222,46 @@ class _PinMarkerPainter extends CustomPainter {
     if (hasPhoto) {
       canvas.drawCircle(
         center,
-        radius + 3.5,
+        radius + 3.5 * scale,
         Paint()
           ..color = const Color(0xFF49B7FF).withValues(alpha: safeOpacity)
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.2,
+          ..strokeWidth = math.max(1, 2.2 * scale),
       );
     }
 
-    final double angle = directionDegrees * math.pi / 180;
-    final double arrowDistance = radius + 5;
-    final Offset arrowCenter =
-        center + Offset(math.sin(angle), -math.cos(angle)) * arrowDistance;
-    final Offset forward = Offset(math.sin(angle), -math.cos(angle));
-    final Offset side = Offset(math.cos(angle), math.sin(angle));
-    final double arrowLength = emphasized ? 8 : 6;
-    final double arrowHalfWidth = emphasized ? 4.5 : 3.5;
-    final Offset tip = arrowCenter + forward * (arrowLength / 2);
-    final Offset baseCenter = arrowCenter - forward * (arrowLength / 2);
-    final Path arrow = Path()
-      ..moveTo(tip.dx, tip.dy)
-      ..lineTo(
-        baseCenter.dx + side.dx * arrowHalfWidth,
-        baseCenter.dy + side.dy * arrowHalfWidth,
-      )
-      ..lineTo(
-        baseCenter.dx - side.dx * arrowHalfWidth,
-        baseCenter.dy - side.dy * arrowHalfWidth,
-      )
-      ..close();
-    canvas.drawPath(
-      arrow,
-      Paint()
-        ..color = edgeColor
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.6
-        ..strokeJoin = StrokeJoin.round,
-    );
-    canvas.drawPath(arrow, Paint()..color = markerColor);
+    if (showsDirection || awaitingDirection) {
+      final double angle = directionDegrees * math.pi / 180;
+      final double arrowDistance = radius + 5 * scale;
+      final Offset arrowCenter =
+          center + Offset(math.sin(angle), -math.cos(angle)) * arrowDistance;
+      final Offset forward = Offset(math.sin(angle), -math.cos(angle));
+      final Offset side = Offset(math.cos(angle), math.sin(angle));
+      final double arrowLength = (emphasized ? 8 : 6) * scale;
+      final double arrowHalfWidth = (emphasized ? 4.5 : 3.5) * scale;
+      final Offset tip = arrowCenter + forward * (arrowLength / 2);
+      final Offset baseCenter = arrowCenter - forward * (arrowLength / 2);
+      final Path arrow = Path()
+        ..moveTo(tip.dx, tip.dy)
+        ..lineTo(
+          baseCenter.dx + side.dx * arrowHalfWidth,
+          baseCenter.dy + side.dy * arrowHalfWidth,
+        )
+        ..lineTo(
+          baseCenter.dx - side.dx * arrowHalfWidth,
+          baseCenter.dy - side.dy * arrowHalfWidth,
+        )
+        ..close();
+      canvas.drawPath(
+        arrow,
+        Paint()
+          ..color = edgeColor
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = math.max(1, 2.6 * scale)
+          ..strokeJoin = StrokeJoin.round,
+      );
+      canvas.drawPath(arrow, Paint()..color = markerColor);
+    }
 
     canvas.drawCircle(center, radius, Paint()..color = markerColor);
     canvas.drawCircle(
@@ -258,12 +270,13 @@ class _PinMarkerPainter extends CustomPainter {
       Paint()
         ..color = edgeColor
         ..style = PaintingStyle.stroke
-        ..strokeWidth = emphasized ? 2.1 : 1.6,
+        ..strokeWidth = math.max(1, (emphasized ? 2.1 : 1.6) * scale),
     );
 
     final String label = number.toString();
-    final double baseFontSize = emphasized ? 16 : 11;
-    final double fontSize = label.length >= 3 ? baseFontSize - 2 : baseFontSize;
+    final double baseFontSize = (emphasized ? 16 : 11) * scale;
+    final double fontSize = math.max(
+        4, label.length >= 3 ? baseFontSize - 2 * scale : baseFontSize);
     final TextPainter textPainter = TextPainter(
       text: TextSpan(
         text: label,
@@ -291,6 +304,8 @@ class _PinMarkerPainter extends CustomPainter {
         oldDelegate.opacity != opacity ||
         oldDelegate.selected != selected ||
         oldDelegate.awaitingDirection != awaitingDirection ||
-        oldDelegate.hasPhoto != hasPhoto;
+        oldDelegate.hasPhoto != hasPhoto ||
+        oldDelegate.sizeScale != sizeScale ||
+        oldDelegate.showsDirection != showsDirection;
   }
 }

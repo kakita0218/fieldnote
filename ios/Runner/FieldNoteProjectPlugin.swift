@@ -1,5 +1,6 @@
 import Flutter
 import ImageIO
+import CoreText
 import PDFKit
 import PencilKit
 import UIKit
@@ -33,6 +34,8 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
       endBackgroundSave(call, result: result)
     case "writeAnnotatedPdf":
       writeAnnotatedPdf(call, result: result)
+    case "buildExportPdf":
+      buildExportPdf(call, result: result)
     case "synchronizePencilDrawings":
       synchronizePencilDrawings(call, result: result)
     case "openPencilEditor":
@@ -605,6 +608,51 @@ final class FieldNoteProjectPlugin: NSObject, FlutterPlugin {
     }
   }
 
+  private func buildExportPdf(
+    _ call: FlutterMethodCall,
+    result: @escaping FlutterResult
+  ) {
+    guard let arguments = arguments(call, result: result) else { return }
+    guard
+      let sourcePath = arguments["sourcePath"] as? String,
+      let pins = arguments["pins"] as? [[String: Any]],
+      let strokes = arguments["strokes"] as? [[String: Any]],
+      let rawPageNumbers = arguments["pageNumbers"] as? [Any]
+    else {
+      result(FlutterError(
+        code: "invalid_export_arguments",
+        message: "PDF書き出しに必要な情報が不足しています。",
+        details: nil
+      ))
+      return
+    }
+    let pageNumbers = rawPageNumbers.compactMap { value -> Int? in
+      if let number = value as? NSNumber { return number.intValue }
+      return value as? Int
+    }
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        let data = try FieldNotePdfWriter.data(
+          sourceURL: URL(fileURLWithPath: sourcePath),
+          pins: pins,
+          strokes: strokes,
+          pageNumbers: pageNumbers
+        )
+        DispatchQueue.main.async {
+          result(FlutterStandardTypedData(bytes: data))
+        }
+      } catch {
+        DispatchQueue.main.async {
+          result(FlutterError(
+            code: "pdf_export_failed",
+            message: "PDFを書き出せませんでした。",
+            details: error.localizedDescription
+          ))
+        }
+      }
+    }
+  }
+
   private func openPencilEditor(
     _ call: FlutterMethodCall,
     result: @escaping FlutterResult
@@ -853,6 +901,25 @@ private enum FieldNotePdfWriter {
     pins: [[String: Any]],
     strokes: [[String: Any]]
   ) throws {
+    let outputData = try data(
+      sourceURL: sourceURL,
+      pins: pins,
+      strokes: strokes,
+      pageNumbers: nil
+    )
+    try FileManager.default.createDirectory(
+      at: outputURL.deletingLastPathComponent(),
+      withIntermediateDirectories: true
+    )
+    try outputData.write(to: outputURL, options: .atomic)
+  }
+
+  static func data(
+    sourceURL: URL,
+    pins: [[String: Any]],
+    strokes: [[String: Any]],
+    pageNumbers: [Int]?
+  ) throws -> Data {
     guard let document = PDFDocument(url: sourceURL) else {
       throw FieldNotePdfError.cannotOpenSource
     }
@@ -860,14 +927,31 @@ private enum FieldNotePdfWriter {
     addStrokes(strokes, to: document)
     addPins(pins, to: document)
 
-    guard let data = document.dataRepresentation() else {
+    let outputDocument: PDFDocument
+    if let pageNumbers {
+      guard
+        let annotatedData = document.dataRepresentation(),
+        let annotatedDocument = PDFDocument(data: annotatedData)
+      else {
+        throw FieldNotePdfError.cannotCreateData
+      }
+      outputDocument = PDFDocument()
+      for pageNumber in pageNumbers
+        where pageNumber > 0 && pageNumber <= annotatedDocument.pageCount
+      {
+        guard
+          let page = annotatedDocument.page(at: pageNumber - 1),
+          let copiedPage = page.copy() as? PDFPage
+        else { continue }
+        outputDocument.insert(copiedPage, at: outputDocument.pageCount)
+      }
+    } else {
+      outputDocument = document
+    }
+    guard let outputData = outputDocument.dataRepresentation() else {
       throw FieldNotePdfError.cannotCreateData
     }
-    try FileManager.default.createDirectory(
-      at: outputURL.deletingLastPathComponent(),
-      withIntermediateDirectories: true
-    )
-    try data.write(to: outputURL, options: .atomic)
+    return outputData
   }
 
   private static func removePreviousExportAnnotations(from document: PDFDocument) {
@@ -1001,6 +1085,24 @@ private enum FieldNotePdfWriter {
         {
           points = [points[0], topRight, points[points.count - 1], bottomLeft, points[0]]
           widths = Array(repeating: baseWidth, count: points.count)
+          let rotationDegrees = number(stroke["rotationDegrees"])?.doubleValue ?? 0
+          if rotationDegrees.isFinite && rotationDegrees.truncatingRemainder(dividingBy: 360) != 0 {
+            let center = CGPoint(
+              x: (points[0].x + points[2].x) / 2,
+              y: (points[0].y + points[2].y) / 2
+            )
+            let radians = -CGFloat(rotationDegrees) * .pi / 180
+            let cosine = cos(radians)
+            let sine = sin(radians)
+            points = points.map { point in
+              let deltaX = point.x - center.x
+              let deltaY = point.y - center.y
+              return CGPoint(
+                x: center.x + deltaX * cosine - deltaY * sine,
+                y: center.y + deltaX * sine + deltaY * cosine
+              )
+            }
+          }
         }
       }
 
@@ -1057,7 +1159,11 @@ private enum FieldNotePdfWriter {
       )
       let pinId = pin["id"] as? String ?? UUID().uuidString
       let numberText = "\(number(pin["number"])?.intValue ?? 0)"
-      let radius: CGFloat = 12
+      let rawSizeScale = number(pin["sizeScale"])?.doubleValue ?? 1
+      let sizeScale = rawSizeScale.isFinite
+        ? min(max(CGFloat(rawSizeScale), 1.0 / 3.0), 1)
+        : 1
+      let radius: CGFloat = 12 * sizeScale
       let circleBounds = CGRect(
         x: center.x - radius,
         y: center.y - radius,
@@ -1066,7 +1172,7 @@ private enum FieldNotePdfWriter {
       )
 
       if (number(pin["photoCount"])?.intValue ?? 0) > 0 {
-        let photoRingRadius = radius + 3.5
+        let photoRingRadius = radius + 3.5 * sizeScale
         let photoRing = PDFAnnotation(
           bounds: CGRect(
             x: center.x - photoRingRadius,
@@ -1086,45 +1192,48 @@ private enum FieldNotePdfWriter {
         )
         photoRing.interiorColor = .clear
         let photoRingBorder = PDFBorder()
-        photoRingBorder.lineWidth = 2.2
+        photoRingBorder.lineWidth = max(1, 2.2 * sizeScale)
         photoRing.border = photoRingBorder
         setName("\(exportPrefix)pin-photo-ring:\(pinId)", on: photoRing)
         page.addAnnotation(photoRing)
       }
 
-      let direction =
-        CGFloat(number(pin["directionDegrees"])?.doubleValue ?? 0)
-      let forward = geometry.direction(degrees: direction)
-      let side = CGPoint(x: forward.y, y: -forward.x)
-      let arrowCenter = CGPoint(
-        x: center.x + forward.x * (radius + 5),
-        y: center.y + forward.y * (radius + 5)
-      )
-      let arrowLength: CGFloat = 6
-      let arrowHalfWidth: CGFloat = 3.5
-      let tip = CGPoint(
-        x: arrowCenter.x + forward.x * (arrowLength / 2),
-        y: arrowCenter.y + forward.y * (arrowLength / 2)
-      )
-      let baseCenter = CGPoint(
-        x: arrowCenter.x - forward.x * (arrowLength / 2),
-        y: arrowCenter.y - forward.y * (arrowLength / 2)
-      )
-      let directionMarker = FieldNotePinDirectionAnnotation(
-        tip: tip,
-        firstBase: CGPoint(
-          x: baseCenter.x + side.x * arrowHalfWidth,
-          y: baseCenter.y + side.y * arrowHalfWidth
-        ),
-        secondBase: CGPoint(
-          x: baseCenter.x - side.x * arrowHalfWidth,
-          y: baseCenter.y - side.y * arrowHalfWidth
-        ),
-        fillColor: pinColor,
-        edgeColor: edgeColor
-      )
-      setName("\(exportPrefix)pin-direction:\(pinId)", on: directionMarker)
-      page.addAnnotation(directionMarker)
+      if pin["showsDirection"] as? Bool != false {
+        let direction =
+          CGFloat(number(pin["directionDegrees"])?.doubleValue ?? 0)
+        let forward = geometry.direction(degrees: direction)
+        let side = CGPoint(x: forward.y, y: -forward.x)
+        let arrowCenter = CGPoint(
+          x: center.x + forward.x * (radius + 5 * sizeScale),
+          y: center.y + forward.y * (radius + 5 * sizeScale)
+        )
+        let arrowLength: CGFloat = 6 * sizeScale
+        let arrowHalfWidth: CGFloat = 3.5 * sizeScale
+        let tip = CGPoint(
+          x: arrowCenter.x + forward.x * (arrowLength / 2),
+          y: arrowCenter.y + forward.y * (arrowLength / 2)
+        )
+        let baseCenter = CGPoint(
+          x: arrowCenter.x - forward.x * (arrowLength / 2),
+          y: arrowCenter.y - forward.y * (arrowLength / 2)
+        )
+        let directionMarker = FieldNotePinDirectionAnnotation(
+          tip: tip,
+          firstBase: CGPoint(
+            x: baseCenter.x + side.x * arrowHalfWidth,
+            y: baseCenter.y + side.y * arrowHalfWidth
+          ),
+          secondBase: CGPoint(
+            x: baseCenter.x - side.x * arrowHalfWidth,
+            y: baseCenter.y - side.y * arrowHalfWidth
+          ),
+          fillColor: pinColor,
+          edgeColor: edgeColor,
+          lineWidth: max(1, 2.6 * sizeScale)
+        )
+        setName("\(exportPrefix)pin-direction:\(pinId)", on: directionMarker)
+        page.addAnnotation(directionMarker)
+      }
 
       let circle = PDFAnnotation(
         bounds: circleBounds,
@@ -1135,28 +1244,25 @@ private enum FieldNotePdfWriter {
       circle.color = edgeColor
       circle.interiorColor = pinColor
       let circleBorder = PDFBorder()
-      circleBorder.lineWidth = 1.6
+      circleBorder.lineWidth = max(1, 1.6 * sizeScale)
       circle.border = circleBorder
       setName("\(exportPrefix)pin-circle:\(pinId)", on: circle)
       page.addAnnotation(circle)
 
-      let label = PDFAnnotation(
+      let baseFontSize: CGFloat = 11 * sizeScale
+      let label = FieldNotePinLabelAnnotation(
         bounds: circleBounds,
-        forType: .freeText,
-        withProperties: nil
+        text: numberText,
+        font: .boldSystemFont(
+          ofSize: max(4, numberText.count >= 3
+            ? baseFontSize - 2 * sizeScale
+            : baseFontSize)
+        ),
+        textColor: applyingOpacity(
+          pinOpacity,
+          to: readableTextColor(for: pinColor)
+        )
       )
-      label.shouldPrint = true
-      label.contents = numberText
-      label.font = .boldSystemFont(ofSize: numberText.count >= 3 ? 9 : 11)
-      label.fontColor = applyingOpacity(
-        pinOpacity,
-        to: readableTextColor(for: pinColor)
-      )
-      label.alignment = .center
-      label.color = .clear
-      let labelBorder = PDFBorder()
-      labelBorder.lineWidth = 0
-      label.border = labelBorder
       setName("\(exportPrefix)pin-label:\(pinId)", on: label)
       page.addAnnotation(label)
     }
@@ -1330,19 +1436,22 @@ private final class FieldNotePinDirectionAnnotation: PDFAnnotation {
   private let secondBase: CGPoint
   private let fillColor: UIColor
   private let edgeColor: UIColor
+  private let lineWidth: CGFloat
 
   init(
     tip: CGPoint,
     firstBase: CGPoint,
     secondBase: CGPoint,
     fillColor: UIColor,
-    edgeColor: UIColor
+    edgeColor: UIColor,
+    lineWidth: CGFloat
   ) {
     self.tip = tip
     self.firstBase = firstBase
     self.secondBase = secondBase
     self.fillColor = fillColor
     self.edgeColor = edgeColor
+    self.lineWidth = lineWidth
     let points = [tip, firstBase, secondBase]
     let inset: CGFloat = 2
     let minX = points.map(\.x).min() ?? 0
@@ -1378,12 +1487,57 @@ private final class FieldNotePinDirectionAnnotation: PDFAnnotation {
     UIGraphicsPushContext(context)
     context.saveGState()
     edgeColor.setStroke()
-    arrow.lineWidth = 2.6
+    arrow.lineWidth = lineWidth
     arrow.stroke()
     fillColor.setFill()
     arrow.fill()
     context.restoreGState()
     UIGraphicsPopContext()
+  }
+}
+
+private final class FieldNotePinLabelAnnotation: PDFAnnotation {
+  private let text: String
+  private let labelFont: UIFont
+  private let labelColor: UIColor
+
+  init(bounds: CGRect, text: String, font: UIFont, textColor: UIColor) {
+    self.text = text
+    self.labelFont = font
+    self.labelColor = textColor
+    super.init(bounds: bounds, forType: .stamp, withProperties: nil)
+    shouldPrint = true
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func draw(with box: PDFDisplayBox, in context: CGContext) {
+    let attributes: [NSAttributedString.Key: Any] = [
+      .font: labelFont,
+      .foregroundColor: labelColor,
+    ]
+    let attributed = NSAttributedString(string: text, attributes: attributes)
+    let line = CTLineCreateWithAttributedString(attributed)
+    var ascent: CGFloat = 0
+    var descent: CGFloat = 0
+    var leading: CGFloat = 0
+    let width = CGFloat(CTLineGetTypographicBounds(
+      line,
+      &ascent,
+      &descent,
+      &leading
+    ))
+    context.saveGState()
+    context.textMatrix = .identity
+    context.textPosition = CGPoint(
+      x: bounds.midX - width / 2,
+      y: bounds.midY - (ascent - descent) / 2
+    )
+    CTLineDraw(line, context)
+    context.restoreGState()
   }
 }
 

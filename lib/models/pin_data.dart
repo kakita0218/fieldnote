@@ -10,6 +10,8 @@ class PinData {
     this.note = '',
     this.colorValue = 0xFF1976D2,
     this.opacity = 1,
+    this.sizeScale = 1,
+    this.showsDirection = true,
     this.boardEnabled = false,
     this.boardTemplateId = 'core',
     this.boardShootingLocation = '',
@@ -35,6 +37,8 @@ class PinData {
   final int boardAsbestosStep;
   final String boardPositionId;
   final double opacity;
+  final double sizeScale;
+  final bool showsDirection;
 
   /// ARGB value of the pin color. Kept as an int so the model stays
   /// independent from Flutter UI classes and remains easy to serialize.
@@ -51,6 +55,8 @@ class PinData {
     String? note,
     int? colorValue,
     double? opacity,
+    double? sizeScale,
+    bool? showsDirection,
     bool? boardEnabled,
     String? boardTemplateId,
     String? boardShootingLocation,
@@ -70,6 +76,8 @@ class PinData {
       note: note ?? this.note,
       colorValue: colorValue ?? this.colorValue,
       opacity: opacity ?? this.opacity,
+      sizeScale: sizeScale ?? this.sizeScale,
+      showsDirection: showsDirection ?? this.showsDirection,
       boardEnabled: boardEnabled ?? this.boardEnabled,
       boardTemplateId: boardTemplateId ?? this.boardTemplateId,
       boardShootingLocation:

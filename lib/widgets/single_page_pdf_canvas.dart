@@ -22,6 +22,7 @@ class SinglePagePdfCanvas extends StatefulWidget {
     required this.penModeEnabled,
     this.selectionModeEnabled = false,
     this.textModeEnabled = false,
+    this.polylineModeEnabled = false,
     this.eraserEnabled = false,
     this.eraserRadiusNormalized = 0.025,
     this.selectedStrokeId,
@@ -30,6 +31,7 @@ class SinglePagePdfCanvas extends StatefulWidget {
     required this.onAddPin,
     required this.onPinTap,
     required this.onDirectionChanged,
+    this.onDirectionCleared,
     this.onDirectionChangeStart,
     this.onDirectionChangeEnd,
     this.onDirectionChangeCancel,
@@ -46,6 +48,10 @@ class SinglePagePdfCanvas extends StatefulWidget {
     this.onAnnotationMoveUpdate,
     this.onAnnotationMoveEnd,
     this.onAnnotationMoveCancel,
+    this.onAnnotationTransformStart,
+    this.onAnnotationTransformUpdate,
+    this.onAnnotationTransformEnd,
+    this.onAnnotationTransformCancel,
   });
 
   final Uint8List imageBytes;
@@ -57,6 +63,7 @@ class SinglePagePdfCanvas extends StatefulWidget {
   final bool penModeEnabled;
   final bool selectionModeEnabled;
   final bool textModeEnabled;
+  final bool polylineModeEnabled;
   final bool eraserEnabled;
   final double eraserRadiusNormalized;
   final String? selectedStrokeId;
@@ -65,6 +72,7 @@ class SinglePagePdfCanvas extends StatefulWidget {
   final ValueChanged<Offset> onAddPin;
   final ValueChanged<PinData> onPinTap;
   final void Function(PinData pin, double directionDegrees) onDirectionChanged;
+  final ValueChanged<PinData>? onDirectionCleared;
   final ValueChanged<PinData>? onDirectionChangeStart;
   final ValueChanged<PinData>? onDirectionChangeEnd;
   final ValueChanged<PinData>? onDirectionChangeCancel;
@@ -82,6 +90,10 @@ class SinglePagePdfCanvas extends StatefulWidget {
   final ValueChanged<Offset>? onAnnotationMoveUpdate;
   final ValueChanged<Offset>? onAnnotationMoveEnd;
   final VoidCallback? onAnnotationMoveCancel;
+  final bool Function(Offset normalizedPosition)? onAnnotationTransformStart;
+  final ValueChanged<Offset>? onAnnotationTransformUpdate;
+  final ValueChanged<Offset>? onAnnotationTransformEnd;
+  final VoidCallback? onAnnotationTransformCancel;
 
   @override
   State<SinglePagePdfCanvas> createState() => _SinglePagePdfCanvasState();
@@ -93,6 +105,7 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
   String? _movingPinId;
   Offset? _eraserCursor;
   bool _movingAnnotation = false;
+  bool _transformingAnnotation = false;
   Offset? _lastAnnotationPosition;
 
   @override
@@ -104,6 +117,7 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
     if (!widget.eraserEnabled) _eraserCursor = null;
     if (!widget.selectionModeEnabled && !widget.textModeEnabled) {
       _movingAnnotation = false;
+      _transformingAnnotation = false;
       _lastAnnotationPosition = null;
     }
   }
@@ -200,7 +214,8 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
           transformationController: widget.transformationController,
           interactionEnabled: _activeStylusPointer == null &&
               _movingPinId == null &&
-              !_movingAnnotation,
+              !_movingAnnotation &&
+              !_transformingAnnotation,
           minScale: 1,
           maxScale: 10,
           minimumPointerCount: widget.pinModeEnabled ? 2 : 1,
@@ -319,6 +334,67 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                                 pageHeight,
                               );
                               final bool accepted =
+                                  widget.onAnnotationTransformStart?.call(
+                                        normalized,
+                                      ) ??
+                                      false;
+                              if (accepted) {
+                                setState(() {
+                                  _transformingAnnotation = true;
+                                  _lastAnnotationPosition = normalized;
+                                });
+                              }
+                            }
+                          : null,
+                  onPanUpdate:
+                      widget.selectionModeEnabled || widget.textModeEnabled
+                          ? (DragUpdateDetails details) {
+                              if (!_transformingAnnotation) return;
+                              final Offset normalized = _normalize(
+                                details.localPosition,
+                                pageWidth,
+                                pageHeight,
+                              );
+                              _lastAnnotationPosition = normalized;
+                              widget.onAnnotationTransformUpdate?.call(
+                                normalized,
+                              );
+                            }
+                          : null,
+                  onPanEnd:
+                      widget.selectionModeEnabled || widget.textModeEnabled
+                          ? (DragEndDetails _) {
+                              if (!_transformingAnnotation) return;
+                              final Offset? position = _lastAnnotationPosition;
+                              setState(() {
+                                _transformingAnnotation = false;
+                                _lastAnnotationPosition = null;
+                              });
+                              if (position != null) {
+                                widget.onAnnotationTransformEnd?.call(position);
+                              }
+                            }
+                          : null,
+                  onPanCancel:
+                      widget.selectionModeEnabled || widget.textModeEnabled
+                          ? () {
+                              if (!_transformingAnnotation) return;
+                              setState(() {
+                                _transformingAnnotation = false;
+                                _lastAnnotationPosition = null;
+                              });
+                              widget.onAnnotationTransformCancel?.call();
+                            }
+                          : null,
+                  onLongPressStart:
+                      widget.selectionModeEnabled || widget.textModeEnabled
+                          ? (LongPressStartDetails details) {
+                              final Offset normalized = _normalize(
+                                details.localPosition,
+                                pageWidth,
+                                pageHeight,
+                              );
+                              final bool accepted =
                                   widget.onAnnotationMoveStart?.call(
                                         normalized,
                                       ) ??
@@ -331,9 +407,9 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                               }
                             }
                           : null,
-                  onPanUpdate:
+                  onLongPressMoveUpdate:
                       widget.selectionModeEnabled || widget.textModeEnabled
-                          ? (DragUpdateDetails details) {
+                          ? (LongPressMoveUpdateDetails details) {
                               if (!_movingAnnotation) return;
                               final Offset normalized = _normalize(
                                 details.localPosition,
@@ -341,26 +417,26 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                                 pageHeight,
                               );
                               _lastAnnotationPosition = normalized;
-                              widget.onAnnotationMoveUpdate?.call(
-                                normalized,
-                              );
+                              widget.onAnnotationMoveUpdate?.call(normalized);
                             }
                           : null,
-                  onPanEnd:
+                  onLongPressEnd:
                       widget.selectionModeEnabled || widget.textModeEnabled
-                          ? (DragEndDetails _) {
+                          ? (LongPressEndDetails details) {
                               if (!_movingAnnotation) return;
-                              final Offset? position = _lastAnnotationPosition;
+                              final Offset normalized = _normalize(
+                                details.localPosition,
+                                pageWidth,
+                                pageHeight,
+                              );
                               setState(() {
                                 _movingAnnotation = false;
                                 _lastAnnotationPosition = null;
                               });
-                              if (position != null) {
-                                widget.onAnnotationMoveEnd?.call(position);
-                              }
+                              widget.onAnnotationMoveEnd?.call(normalized);
                             }
                           : null,
-                  onPanCancel:
+                  onLongPressCancel:
                       widget.selectionModeEnabled || widget.textModeEnabled
                           ? () {
                               if (!_movingAnnotation) return;
@@ -373,7 +449,8 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                           : null,
                   onTapUp: widget.pinModeEnabled ||
                           widget.selectionModeEnabled ||
-                          widget.textModeEnabled
+                          widget.textModeEnabled ||
+                          widget.polylineModeEnabled
                       ? (details) {
                           final Offset local = details.localPosition;
 
@@ -442,11 +519,14 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                             selected: pin.id == widget.selectedPinId,
                             awaitingDirection:
                                 pin.id == widget.pendingDirectionPinId,
-                            onTap: widget.penModeEnabled ||
-                                    widget.selectionModeEnabled ||
-                                    widget.textModeEnabled
-                                ? null
-                                : () => widget.onPinTap(pin),
+                            onTap: pin.id == widget.pendingDirectionPinId &&
+                                    widget.onDirectionCleared != null
+                                ? () => widget.onDirectionCleared!(pin)
+                                : widget.penModeEnabled ||
+                                        widget.selectionModeEnabled ||
+                                        widget.textModeEnabled
+                                    ? null
+                                    : () => widget.onPinTap(pin),
                             onDirectionChanged:
                                 widget.pinModeEnabled && pendingPin == null
                                     ? (double direction) {

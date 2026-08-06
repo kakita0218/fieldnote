@@ -53,6 +53,30 @@ class NativeProjectService {
     );
   }
 
+  static Future<Uint8List> buildExportPdf({
+    required String sourcePath,
+    required List<Map<String, dynamic>> pins,
+    required List<Map<String, dynamic>> strokes,
+    required List<int> pageNumbers,
+  }) async {
+    if (!isAvailable) {
+      throw UnsupportedError('iOS PDF export is unavailable.');
+    }
+    final Uint8List? result = await _channel.invokeMethod<Uint8List>(
+      'buildExportPdf',
+      <String, dynamic>{
+        'sourcePath': sourcePath,
+        'pins': pins,
+        'strokes': strokes,
+        'pageNumbers': pageNumbers,
+      },
+    );
+    if (result == null || result.isEmpty) {
+      throw StateError('PDFを書き出せませんでした。');
+    }
+    return result;
+  }
+
   static Future<void> synchronizePencilDrawings(String sourcePath) async {
     if (!isAvailable) return;
     await _channel.invokeMethod<void>(

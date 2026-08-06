@@ -52,4 +52,20 @@ void main() {
     expect(restored.opacity, 1);
     expect(restored.textBoxWidthRatio, 0.45);
   });
+
+  test('矩形の回転角度を保存して復元できる', () {
+    const DrawingStroke original = DrawingStroke(
+      id: 'rectangle-1',
+      pageNumber: 2,
+      kind: DrawingKind.rectangle,
+      rotationDegrees: 37.5,
+      points: <DrawingPoint>[
+        DrawingPoint(position: Offset(0.1, 0.2)),
+        DrawingPoint(position: Offset(0.4, 0.6)),
+      ],
+    );
+    final DrawingStroke restored =
+        deserializeDrawingStroke(serializeDrawingStroke(original))!;
+    expect(restored.rotationDegrees, 37.5);
+  });
 }

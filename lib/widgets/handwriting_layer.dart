@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import '../models/drawing_stroke.dart';
@@ -52,11 +54,61 @@ Rect drawingStrokeBounds(DrawingStroke stroke, Size size) {
     )..layout(maxWidth: size.width * stroke.textBoxWidthRatio);
     right = left + painter.width;
     bottom = top + painter.height;
+  } else if (stroke.kind == DrawingKind.rectangle &&
+      stroke.points.length >= 2 &&
+      stroke.rotationDegrees % 360 != 0) {
+    final List<Offset> corners = drawingRectangleCorners(stroke, size);
+    left = corners.map((Offset point) => point.dx).reduce(math.min);
+    top = corners.map((Offset point) => point.dy).reduce(math.min);
+    right = corners.map((Offset point) => point.dx).reduce(math.max);
+    bottom = corners.map((Offset point) => point.dy).reduce(math.max);
   }
   final double padding = stroke.kind == DrawingKind.text
       ? 4
       : drawingStrokeWidth(stroke, 0.5) / 2 + 4;
   return Rect.fromLTRB(left, top, right, bottom).inflate(padding);
+}
+
+List<Offset> drawingRectangleCorners(DrawingStroke stroke, Size size) {
+  if (stroke.points.length < 2) return const <Offset>[];
+  final Rect rect = Rect.fromPoints(
+    Offset(
+      stroke.points.first.position.dx * size.width,
+      stroke.points.first.position.dy * size.height,
+    ),
+    Offset(
+      stroke.points.last.position.dx * size.width,
+      stroke.points.last.position.dy * size.height,
+    ),
+  );
+  final List<Offset> corners = <Offset>[
+    rect.topLeft,
+    rect.topRight,
+    rect.bottomRight,
+    rect.bottomLeft,
+  ];
+  final double radians = stroke.rotationDegrees * math.pi / 180;
+  if (radians == 0) return corners;
+  final double cosine = math.cos(radians);
+  final double sine = math.sin(radians);
+  return corners.map((Offset point) {
+    final Offset delta = point - rect.center;
+    return rect.center +
+        Offset(
+          delta.dx * cosine - delta.dy * sine,
+          delta.dx * sine + delta.dy * cosine,
+        );
+  }).toList(growable: false);
+}
+
+Offset drawingRectangleRotationHandle(DrawingStroke stroke, Size size) {
+  final List<Offset> corners = drawingRectangleCorners(stroke, size);
+  if (corners.length < 4) return Offset.zero;
+  final Offset topCenter = Offset.lerp(corners[0], corners[1], 0.5)!;
+  final Offset center = Offset.lerp(corners[0], corners[2], 0.5)!;
+  final Offset outward = topCenter - center;
+  if (outward.distance == 0) return topCenter;
+  return topCenter + outward / outward.distance * 28;
 }
 
 /// Paints normalized handwriting in the same way on screen and during PDF
@@ -110,8 +162,13 @@ void paintDrawingStrokes(
         stroke.points.last.position.dx * size.width,
         stroke.points.last.position.dy * size.height,
       );
+      final Rect rect = Rect.fromPoints(start, end);
+      canvas.save();
+      canvas.translate(rect.center.dx, rect.center.dy);
+      canvas.rotate(stroke.rotationDegrees * math.pi / 180);
+      canvas.translate(-rect.center.dx, -rect.center.dy);
       canvas.drawRect(
-        Rect.fromPoints(start, end),
+        rect,
         Paint()
           ..color = color
           ..strokeWidth = stroke.width * widthScale
@@ -119,6 +176,7 @@ void paintDrawingStrokes(
           ..strokeJoin = StrokeJoin.round
           ..isAntiAlias = true,
       );
+      canvas.restore();
     } else if (stroke.kind == DrawingKind.line && stroke.points.length >= 2) {
       final DrawingPoint start = stroke.points.first;
       final DrawingPoint end = stroke.points.last;
@@ -176,17 +234,71 @@ void paintDrawingStrokes(
     }
 
     if (selectedStrokeId == stroke.id) {
-      final Rect bounds = drawingStrokeBounds(stroke, size);
-      if (!bounds.isEmpty) {
-        canvas.drawRect(
-          bounds,
-          Paint()
-            ..color = const Color(0xFF42A5F5)
-            ..style = PaintingStyle.stroke
-            ..strokeWidth = 1.5,
-        );
-      }
+      _paintSelection(canvas, size, stroke);
     }
+  }
+}
+
+void _paintSelection(Canvas canvas, Size size, DrawingStroke stroke) {
+  const Color selectionColor = Color(0xFF42A5F5);
+  final Paint outline = Paint()
+    ..color = selectionColor
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 1.5;
+  final Paint handleFill = Paint()
+    ..color = Colors.white
+    ..style = PaintingStyle.fill;
+  final Paint handleEdge = Paint()
+    ..color = selectionColor
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 2;
+
+  void drawHandle(Offset point, {double radius = 6}) {
+    canvas.drawCircle(point, radius, handleFill);
+    canvas.drawCircle(point, radius, handleEdge);
+  }
+
+  if (stroke.kind == DrawingKind.rectangle && stroke.points.length >= 2) {
+    final List<Offset> corners = drawingRectangleCorners(stroke, size);
+    final Path path = Path()..moveTo(corners.first.dx, corners.first.dy);
+    for (final Offset corner in corners.skip(1)) {
+      path.lineTo(corner.dx, corner.dy);
+    }
+    path.close();
+    canvas.drawPath(path, outline);
+    for (final Offset corner in corners) {
+      drawHandle(corner);
+    }
+    final Offset topCenter = Offset.lerp(corners[0], corners[1], 0.5)!;
+    final Offset rotationHandle = drawingRectangleRotationHandle(stroke, size);
+    canvas.drawLine(topCenter, rotationHandle, outline);
+    drawHandle(rotationHandle, radius: 7);
+    return;
+  }
+
+  if (stroke.kind == DrawingKind.line || stroke.kind == DrawingKind.polyline) {
+    final List<Offset> points = stroke.points
+        .map(
+          (DrawingPoint point) => Offset(
+            point.position.dx * size.width,
+            point.position.dy * size.height,
+          ),
+        )
+        .toList(growable: false);
+    for (final Offset point in points) {
+      drawHandle(point);
+    }
+    return;
+  }
+
+  final Rect bounds = drawingStrokeBounds(stroke, size);
+  if (bounds.isEmpty) return;
+  canvas.drawRect(bounds, outline);
+  if (stroke.kind == DrawingKind.text) {
+    drawHandle(bounds.topLeft);
+    drawHandle(bounds.topRight);
+    drawHandle(bounds.bottomRight);
+    drawHandle(bounds.bottomLeft);
   }
 }
 
