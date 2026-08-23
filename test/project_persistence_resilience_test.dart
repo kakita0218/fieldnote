@@ -394,6 +394,12 @@ void main() {
       ).readAsBytes(),
       <int>[1, 1],
     );
+    expect(
+      (await ProjectFileStore.listProjects())
+          .singleWhere((project) => project.id == projectId)
+          .photoCount,
+      1,
+    );
 
     await ProjectFileStore.saveSnapshot(
       projectId: projectId,
@@ -418,6 +424,12 @@ void main() {
         '${photosRoot.path}${Platform.pathSeparator}.moving-pin-a',
       ).exists(),
       isFalse,
+    );
+    expect(
+      (await ProjectFileStore.listProjects())
+          .singleWhere((project) => project.id == projectId)
+          .photoCount,
+      2,
     );
 
     final List<Map<String, dynamic>> metadataAfterRedo =
@@ -621,6 +633,185 @@ void main() {
     expect(
       (await Hive.openBox<dynamic>('fieldnote_pdf_v5')).containsKey(projectId),
       isFalse,
+    );
+  });
+
+  test('複数PDFと同じピン番号の写真をPDF別に保存する', () async {
+    const String projectId = 'multiple-pdfs';
+    const String projectName = '複数図面';
+    const String firstDocument = '01_平面図';
+    const String secondDocument = '02_立面図';
+    final Uint8List firstPdf = Uint8List.fromList(<int>[1, 2, 3]);
+    final Uint8List secondPdf = Uint8List.fromList(<int>[4, 5, 6]);
+    await ProjectFileStore.createProject(
+      projectId: projectId,
+      projectName: projectName,
+    );
+    await ProjectFileStore.savePdfDocument(
+      projectId: projectId,
+      projectName: projectName,
+      documentId: firstDocument,
+      documentName: '平面図.pdf',
+      folderName: firstDocument,
+      pageCount: 3,
+      bytes: firstPdf,
+    );
+    await ProjectFileStore.savePdfDocument(
+      projectId: projectId,
+      projectName: projectName,
+      documentId: secondDocument,
+      documentName: '立面図.pdf',
+      folderName: secondDocument,
+      pageCount: 2,
+      bytes: secondPdf,
+    );
+    await ProjectFileStore.saveSnapshot(
+      projectId: projectId,
+      projectName: projectName,
+      metadata: const <String, dynamic>{},
+      pins: const <Map<String, dynamic>>[
+        <String, dynamic>{
+          'id': 'pin-plan',
+          'documentId': firstDocument,
+          'number': 1,
+        },
+        <String, dynamic>{
+          'id': 'pin-elevation',
+          'documentId': secondDocument,
+          'number': 1,
+        },
+      ],
+      strokes: const <Map<String, dynamic>>[],
+      photos: const <Map<String, dynamic>>[],
+    );
+    await ProjectFileStore.savePhoto(
+      projectId: projectId,
+      projectName: projectName,
+      pinId: 'pin-plan',
+      documentId: firstDocument,
+      pinNumber: 1,
+      photoId: 'photo-plan',
+      fileName: '001.jpg',
+      bytes: Uint8List.fromList(<int>[11]),
+    );
+    await ProjectFileStore.savePhoto(
+      projectId: projectId,
+      projectName: projectName,
+      pinId: 'pin-elevation',
+      documentId: secondDocument,
+      pinNumber: 1,
+      photoId: 'photo-elevation',
+      fileName: '001.jpg',
+      bytes: Uint8List.fromList(<int>[22]),
+    );
+
+    expect(
+      await ProjectFileStore.loadPdfDocument(
+        projectId: projectId,
+        documentId: firstDocument,
+      ),
+      firstPdf,
+    );
+    expect(
+      await ProjectFileStore.loadPdfDocument(
+        projectId: projectId,
+        documentId: secondDocument,
+      ),
+      secondPdf,
+    );
+    expect(
+      await File(
+        '${documents.path}${Platform.pathSeparator}$projectName'
+        '${Platform.pathSeparator}写真${Platform.pathSeparator}$firstDocument'
+        '${Platform.pathSeparator}001${Platform.pathSeparator}001.jpg',
+      ).readAsBytes(),
+      <int>[11],
+    );
+    expect(
+      await File(
+        '${documents.path}${Platform.pathSeparator}$projectName'
+        '${Platform.pathSeparator}写真${Platform.pathSeparator}$secondDocument'
+        '${Platform.pathSeparator}001${Platform.pathSeparator}001.jpg',
+      ).readAsBytes(),
+      <int>[22],
+    );
+    final List<Map<String, dynamic>> metadata =
+        (await ProjectFileStore.loadPhotoMetadata(projectId))!;
+    expect(
+      metadata.map((Map<String, dynamic> value) => value['documentId']).toSet(),
+      <String>{firstDocument, secondDocument},
+    );
+
+    // A project restored from Recently Deleted can rebuild its private source
+    // copy from the visible PDF kept in the project folder.
+    final String sourcePath = (await ProjectFileStore.sourcePdfPath(
+      projectId,
+      documentId: firstDocument,
+    ))!;
+    await File(sourcePath).delete();
+    expect(
+      await ProjectFileStore.loadPdfDocument(
+        projectId: projectId,
+        documentId: firstDocument,
+      ),
+      firstPdf,
+    );
+    expect(
+      await ProjectFileStore.sourcePdfPath(
+        projectId,
+        documentId: firstDocument,
+      ),
+      isNotNull,
+    );
+  });
+
+  test('旧形式の1枚目へPDFを追加すると1枚目もPDF別フォルダへ引き継ぐ', () async {
+    const String projectId = 'legacy-pdf-append';
+    const String projectName = '既存案件';
+    final Uint8List firstPdf = Uint8List.fromList(<int>[7, 7, 7]);
+    await ProjectFileStore.createProject(
+      projectId: projectId,
+      projectName: projectName,
+    );
+    await ProjectFileStore.saveOriginalPdf(
+      projectId: projectId,
+      projectName: projectName,
+      bytes: firstPdf,
+    );
+    await ProjectFileStore.saveSnapshot(
+      projectId: projectId,
+      projectName: projectName,
+      metadata: const <String, dynamic>{
+        'pageCount': 5,
+        'currentPage': 3,
+      },
+      pins: const <Map<String, dynamic>>[],
+      strokes: const <Map<String, dynamic>>[],
+      photos: const <Map<String, dynamic>>[],
+    );
+
+    await ProjectFileStore.savePdfDocument(
+      projectId: projectId,
+      projectName: projectName,
+      documentId: '02_追加図面',
+      documentName: '追加図面.pdf',
+      folderName: '02_追加図面',
+      pageCount: 2,
+      bytes: Uint8List.fromList(<int>[8, 8]),
+    );
+
+    final Map<String, dynamic> project =
+        (await ProjectFileStore.loadProject(projectId))!;
+    final List<dynamic> documents = project['documents'] as List<dynamic>;
+    expect(documents, hasLength(2));
+    expect((documents.first as Map<dynamic, dynamic>)['id'], 'main');
+    expect((documents.first as Map<dynamic, dynamic>)['currentPage'], 3);
+    expect(
+      await ProjectFileStore.loadOutputPdf(
+        projectId,
+        documentId: 'main',
+      ),
+      firstPdf,
     );
   });
 

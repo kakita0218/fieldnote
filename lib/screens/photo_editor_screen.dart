@@ -11,7 +11,7 @@ import '../services/project_repository.dart';
 import '../widgets/handwriting_layer.dart';
 import '../widgets/single_page_pdf_canvas.dart';
 
-enum _PhotoTool { select, pen, shape, text }
+enum _PhotoTool { select, pen, eraser, shape, text }
 
 enum _PhotoAnnotationTransformKind {
   textTopLeft,
@@ -30,6 +30,7 @@ class PhotoEditorScreen extends StatefulWidget {
   const PhotoEditorScreen({
     super.key,
     required this.projectId,
+    required this.documentId,
     required this.pinNumber,
     required this.photos,
     required this.initialPhotoId,
@@ -38,6 +39,7 @@ class PhotoEditorScreen extends StatefulWidget {
   });
 
   final String projectId;
+  final String documentId;
   final int pinNumber;
   final List<PhotoData> photos;
   final String initialPhotoId;
@@ -80,7 +82,6 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
   double _textBoxWidthRatio = 0.32;
   DrawingBrush _brush = DrawingBrush.fountain;
   DrawingKind _shapeKind = DrawingKind.line;
-  bool _eraserEnabled = false;
   DrawingStroke? _movingAnnotationOriginal;
   Offset? _movingAnnotationGrabOffset;
   DrawingStroke? _transformingAnnotationOriginal;
@@ -148,6 +149,7 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
     try {
       final Uint8List? bytes = await ProjectRepository.loadPhotoBytes(
         projectId: widget.projectId,
+        documentId: widget.documentId,
         photoId: _photo.id,
         pinNumber: widget.pinNumber,
         fileName: _photo.fileName,
@@ -186,7 +188,7 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
 
   void _startStroke(Offset position, double pressure) {
     if (_showOriginal) return;
-    if (_tool == _PhotoTool.pen && _eraserEnabled) {
+    if (_tool == _PhotoTool.eraser) {
       _gestureBefore ??= _snapshot();
       _eraseAt(position);
       return;
@@ -217,7 +219,7 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
   }
 
   void _updateStroke(Offset position, double pressure) {
-    if (_tool == _PhotoTool.pen && _eraserEnabled) {
+    if (_tool == _PhotoTool.eraser) {
       _eraseAt(position);
       return;
     }
@@ -927,12 +929,10 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
       builder: (BuildContext sheetContext) => StatefulBuilder(
         builder: (BuildContext context, StateSetter updateSheet) {
           final DrawingStroke? selected = _selectedStroke;
+          final bool eraserSelected = _tool == _PhotoTool.eraser;
           final double shownWidth = selected?.kind == DrawingKind.text
               ? selected!.fontSize
-              : selected?.width ??
-                  (_tool == _PhotoTool.pen && _eraserEnabled
-                      ? _eraserWidth
-                      : _width);
+              : selected?.width ?? (eraserSelected ? _eraserWidth : _width);
           final double shownOpacity = selected?.opacity ?? _opacity;
           final Color shownColor = selected?.color ?? _color;
           return SafeArea(
@@ -965,26 +965,9 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
                       ],
                       selected: <DrawingBrush>{_brush},
                       onSelectionChanged: (Set<DrawingBrush> values) {
-                        setState(() {
-                          _brush = values.first;
-                          _eraserEnabled = false;
-                        });
+                        setState(() => _brush = values.first);
                         updateSheet(() {});
                       },
-                    ),
-                    const SizedBox(height: 12),
-                    SizedBox(
-                      width: double.infinity,
-                      child: OutlinedButton.icon(
-                        onPressed: () {
-                          setState(() => _eraserEnabled = !_eraserEnabled);
-                          updateSheet(() {});
-                        },
-                        icon: const Icon(Icons.auto_fix_off_rounded),
-                        label: Text(
-                          _eraserEnabled ? '消しゴム：ON' : '消しゴム',
-                        ),
-                      ),
                     ),
                   ],
                   if (_tool == _PhotoTool.shape) ...<Widget>[
@@ -1005,7 +988,7 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
                       },
                     ),
                   ],
-                  if (!_eraserEnabled) ...<Widget>[
+                  if (!eraserSelected) ...<Widget>[
                     const SizedBox(height: 20),
                     Wrap(
                       spacing: 12,
@@ -1017,7 +1000,6 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
                             } else {
                               setState(() {
                                 _color = color;
-                                _eraserEnabled = false;
                               });
                             }
                             updateSheet(() {});
@@ -1042,7 +1024,7 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
                   ],
                   const SizedBox(height: 20),
                   Text(
-                    _eraserEnabled
+                    eraserSelected
                         ? '消しゴムの太さ ${shownWidth.toStringAsFixed(0)}'
                         : selected?.kind == DrawingKind.text
                             ? '文字サイズ ${shownWidth.toStringAsFixed(0)}'
@@ -1054,22 +1036,22 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
                       selected?.kind == DrawingKind.text ? 12 : 1,
                       selected?.kind == DrawingKind.text
                           ? 64
-                          : _eraserEnabled
+                          : eraserSelected
                               ? 80
                               : 24,
                     ),
                     min: selected?.kind == DrawingKind.text
                         ? 12
-                        : _eraserEnabled
+                        : eraserSelected
                             ? 6
                             : 1,
                     max: selected?.kind == DrawingKind.text
                         ? 64
-                        : _eraserEnabled
+                        : eraserSelected
                             ? 80
                             : 24,
                     onChanged: (double value) {
-                      if (_eraserEnabled) {
+                      if (eraserSelected) {
                         setState(() => _eraserWidth = value);
                       } else if (selected?.kind == DrawingKind.text) {
                         _updateSelected(fontSize: value);
@@ -1081,7 +1063,7 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
                       updateSheet(() {});
                     },
                   ),
-                  if (!_eraserEnabled) ...<Widget>[
+                  if (!eraserSelected) ...<Widget>[
                     Text(
                       '透過率 ${(shownOpacity * 100).round()}%',
                       style: const TextStyle(color: Colors.white),
@@ -1180,7 +1162,6 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
     setState(() {
       if (tool != _PhotoTool.text) _discardEmptyTextDrafts();
       _tool = tool;
-      if (tool != _PhotoTool.pen) _eraserEnabled = false;
       if (tool != _PhotoTool.select && tool != _PhotoTool.text) {
         _selectedId = null;
       }
@@ -1295,6 +1276,7 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
                         pinModeEnabled: false,
                         penModeEnabled: !_showOriginal &&
                             (_tool == _PhotoTool.pen ||
+                                _tool == _PhotoTool.eraser ||
                                 (_tool == _PhotoTool.shape &&
                                     _shapeKind != DrawingKind.polyline)),
                         selectionModeEnabled:
@@ -1304,9 +1286,8 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
                         polylineModeEnabled: !_showOriginal &&
                             _tool == _PhotoTool.shape &&
                             _shapeKind == DrawingKind.polyline,
-                        eraserEnabled: !_showOriginal &&
-                            _tool == _PhotoTool.pen &&
-                            _eraserEnabled,
+                        eraserEnabled:
+                            !_showOriginal && _tool == _PhotoTool.eraser,
                         eraserRadiusNormalized:
                             (_eraserWidth / 1120).clamp(0.006, 0.08),
                         selectedStrokeId: _showOriginal ? null : _selectedId,
@@ -1342,6 +1323,8 @@ class _PhotoEditorScreenState extends State<PhotoEditorScreen> {
               children: <Widget>[
                 _toolButton(_PhotoTool.select, Icons.select_all_rounded, '選択'),
                 _toolButton(_PhotoTool.pen, Icons.edit_rounded, 'ペン'),
+                _toolButton(
+                    _PhotoTool.eraser, Icons.auto_fix_off_rounded, '消しゴム'),
                 _toolButton(_PhotoTool.shape, Icons.category_outlined, '図形'),
                 _toolButton(_PhotoTool.text, Icons.text_fields_rounded, 'テキスト'),
                 if (_tool == _PhotoTool.shape &&

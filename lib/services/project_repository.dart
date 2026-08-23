@@ -99,12 +99,18 @@ class ProjectRepository {
     final Box<dynamic> pinsBox = await _pinsBox();
     final Box<dynamic> photoMetaBox = await _photoMetaBox();
 
-    final Map<String, int> photoCounts = <String, int>{};
+    final Map<String, Map<String, int>> photoCountsByProjectAndPin =
+        <String, Map<String, int>>{};
     for (final dynamic key in photoMetaBox.keys) {
       final Map<String, dynamic> record = _asMap(photoMetaBox.get(key));
       final String projectId = record['projectId']?.toString() ?? '';
-      if (projectId.isNotEmpty) {
-        photoCounts[projectId] = (photoCounts[projectId] ?? 0) + 1;
+      final String pinId = record['pinId']?.toString() ?? '';
+      if (projectId.isNotEmpty && pinId.isNotEmpty) {
+        final Map<String, int> counts = photoCountsByProjectAndPin.putIfAbsent(
+          projectId,
+          () => <String, int>{},
+        );
+        counts[pinId] = (counts[pinId] ?? 0) + 1;
       }
     }
 
@@ -126,6 +132,13 @@ class ProjectRepository {
           DateTime.tryParse(record['updatedAt']?.toString() ?? '') ??
               DateTime.fromMillisecondsSinceEpoch(0);
       final List<dynamic> pins = _asList(pinsBox.get(projectId));
+      final Set<String> activePinIds = pins
+          .whereType<Map>()
+          .map((Map<dynamic, dynamic> pin) => pin['id']?.toString() ?? '')
+          .where((String pinId) => pinId.isNotEmpty)
+          .toSet();
+      final Map<String, int> photoCounts =
+          photoCountsByProjectAndPin[projectId] ?? const <String, int>{};
       projectsById.putIfAbsent(
         projectId,
         () => ProjectSummary(
@@ -133,7 +146,10 @@ class ProjectRepository {
           name: record['projectName']?.toString() ?? '名称未設定',
           updatedAt: updatedAt,
           pageCount: (record['pageCount'] as num?)?.toInt() ?? 0,
-          photoCount: photoCounts[projectId] ?? 0,
+          photoCount: activePinIds.fold<int>(
+            0,
+            (int total, String pinId) => total + (photoCounts[pinId] ?? 0),
+          ),
           pinCount: pins.length,
         ),
       );
@@ -234,6 +250,57 @@ class ProjectRepository {
     }
   }
 
+  static String _documentPdfKey(String projectId, String documentId) =>
+      '$projectId::document::$documentId';
+
+  static Future<void> savePdfDocument({
+    required String projectId,
+    required String projectName,
+    required String documentId,
+    required String documentName,
+    required String folderName,
+    required int pageCount,
+    required Uint8List bytes,
+  }) async {
+    if (bytes.isEmpty) throw StateError('PDFデータが空です。');
+    await ProjectFileStore.savePdfDocument(
+      projectId: projectId,
+      projectName: projectName,
+      documentId: documentId,
+      documentName: documentName,
+      folderName: folderName,
+      pageCount: pageCount,
+      bytes: bytes,
+    );
+    if (!ProjectFileStore.isAuthoritative) {
+      final Box<dynamic> box = await _pdfBox();
+      await box.put(
+        _documentPdfKey(projectId, documentId),
+        Uint8List.fromList(bytes),
+      );
+      if (!box.containsKey(projectId)) {
+        await box.put(projectId, Uint8List.fromList(bytes));
+      }
+    }
+  }
+
+  static Future<Uint8List?> loadPdfDocument({
+    required String projectId,
+    required String documentId,
+  }) async {
+    final Uint8List? fileBytes = await ProjectFileStore.loadPdfDocument(
+      projectId: projectId,
+      documentId: documentId,
+    );
+    if (fileBytes != null && fileBytes.isNotEmpty) return fileBytes;
+    if (ProjectFileStore.isAuthoritative) return null;
+    final Box<dynamic> box = await _pdfBox();
+    return _asBytes(
+          box.get(_documentPdfKey(projectId, documentId)),
+        ) ??
+        (documentId == 'main' ? _asBytes(box.get(projectId)) : null);
+  }
+
   static Future<void> saveProjectSnapshot({
     required String projectId,
     required String projectName,
@@ -292,6 +359,7 @@ class ProjectRepository {
     required String projectId,
     required String projectName,
     required String pinId,
+    String documentId = 'main',
     required int pinNumber,
     required String photoId,
     required String fileName,
@@ -303,6 +371,7 @@ class ProjectRepository {
       projectId: projectId,
       projectName: projectName,
       pinId: pinId,
+      documentId: documentId,
       pinNumber: pinNumber,
       photoId: photoId,
       fileName: fileName,
@@ -327,6 +396,7 @@ class ProjectRepository {
       await metaBox.put(key, <String, dynamic>{
         'projectId': projectId,
         'pinId': pinId,
+        'documentId': documentId,
         'pinNumber': pinNumber,
         'photoId': photoId,
         'fileName': storedFileName,
@@ -370,12 +440,14 @@ class ProjectRepository {
 
   static Future<Uint8List?> loadPhotoBytes({
     required String projectId,
+    String documentId = 'main',
     required String photoId,
     required int pinNumber,
     required String fileName,
   }) async {
     final Uint8List? fileBytes = await ProjectFileStore.loadPhotoBytes(
       projectId: projectId,
+      documentId: documentId,
       photoId: photoId,
       pinNumber: pinNumber,
       fileName: fileName,
@@ -394,6 +466,7 @@ class ProjectRepository {
 
   static Future<void> saveEditedPhoto({
     required String projectId,
+    String documentId = 'main',
     required int pinNumber,
     required String photoId,
     required Uint8List bytes,
@@ -403,6 +476,7 @@ class ProjectRepository {
     }
     await ProjectFileStore.saveEditedPhoto(
       projectId: projectId,
+      documentId: documentId,
       pinNumber: pinNumber,
       photoId: photoId,
       bytes: bytes,
@@ -417,11 +491,13 @@ class ProjectRepository {
 
   static Future<Uint8List?> loadEditedPhotoBytes({
     required String projectId,
+    String documentId = 'main',
     required int pinNumber,
     required String photoId,
   }) async {
     final Uint8List? bytes = await ProjectFileStore.loadEditedPhotoBytes(
       projectId: projectId,
+      documentId: documentId,
       pinNumber: pinNumber,
       photoId: photoId,
     );
@@ -434,11 +510,13 @@ class ProjectRepository {
 
   static Future<void> deleteEditedPhoto({
     required String projectId,
+    String documentId = 'main',
     required int pinNumber,
     required String photoId,
   }) async {
     await ProjectFileStore.deleteEditedPhoto(
       projectId: projectId,
+      documentId: documentId,
       pinNumber: pinNumber,
       photoId: photoId,
     );
@@ -1023,7 +1101,15 @@ class ProjectRepository {
       }
       Future<void> clearCache() async {
         await (await _metaBox()).delete(id);
-        await (await _pdfBox()).delete(id);
+        final Box<dynamic> pdfBox = await _pdfBox();
+        final List<dynamic> pdfKeys = pdfBox.keys
+            .where(
+              (dynamic key) =>
+                  key.toString() == id ||
+                  key.toString().startsWith('$id::document::'),
+            )
+            .toList(growable: false);
+        await pdfBox.deleteAll(pdfKeys);
         await (await _pinsBox()).delete(id);
         await (await _drawingsBox()).delete(id);
 
@@ -1063,12 +1149,21 @@ class ProjectRepository {
     }
   }
 
-  static Future<String?> sourcePdfPath(String projectId) =>
-      ProjectFileStore.sourcePdfPath(projectId);
+  static Future<String?> sourcePdfPath(
+    String projectId, {
+    String documentId = 'main',
+  }) =>
+      ProjectFileStore.sourcePdfPath(projectId, documentId: documentId);
 
-  static Future<String?> outputPdfPath(String projectId) =>
-      ProjectFileStore.outputPdfPath(projectId);
+  static Future<String?> outputPdfPath(
+    String projectId, {
+    String documentId = 'main',
+  }) =>
+      ProjectFileStore.outputPdfPath(projectId, documentId: documentId);
 
-  static Future<Uint8List?> loadOutputPdf(String projectId) =>
-      ProjectFileStore.loadOutputPdf(projectId);
+  static Future<Uint8List?> loadOutputPdf(
+    String projectId, {
+    String documentId = 'main',
+  }) =>
+      ProjectFileStore.loadOutputPdf(projectId, documentId: documentId);
 }

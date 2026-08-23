@@ -95,4 +95,46 @@ void main() {
     expect(data.getUint8(borderPixel), greaterThan(200));
     expect(data.getUint8(borderPixel + 1), lessThan(100));
   });
+
+  test('半透明の連続線は継ぎ目でも濃くならない', () async {
+    const DrawingStroke translucent = DrawingStroke(
+      id: 'translucent-1',
+      pageNumber: 1,
+      width: 14,
+      color: Colors.red,
+      opacity: 0.5,
+      brush: DrawingBrush.ballpoint,
+      points: <DrawingPoint>[
+        DrawingPoint(position: Offset(0.2, 0.5)),
+        DrawingPoint(position: Offset(0.5, 0.5)),
+        DrawingPoint(position: Offset(0.5, 0.8)),
+      ],
+    );
+    final ui.PictureRecorder recorder = ui.PictureRecorder();
+    final Canvas canvas = Canvas(recorder);
+    canvas.drawRect(
+      const Rect.fromLTWH(0, 0, 100, 100),
+      Paint()..color = Colors.white,
+    );
+    paintDrawingStrokes(
+      canvas,
+      const Size(100, 100),
+      const <DrawingStroke>[translucent],
+    );
+
+    final ui.Image image = await recorder.endRecording().toImage(100, 100);
+    final ByteData data =
+        (await image.toByteData(format: ui.ImageByteFormat.rawRgba))!;
+    image.dispose();
+    int greenAt(int x, int y) => data.getUint8((y * 100 + x) * 4 + 1);
+    final int straightGreen = greenAt(35, 50);
+    final int jointGreen = greenAt(50, 50);
+
+    // Material red contains some green; at 50% opacity on white the expected
+    // green channel is about 161. The important invariant is that the joint
+    // has the same value instead of accumulating alpha from both segments.
+    expect(straightGreen, inInclusiveRange(150, 170));
+    expect(jointGreen, inInclusiveRange(150, 170));
+    expect((straightGreen - jointGreen).abs(), lessThanOrEqualTo(5));
+  });
 }

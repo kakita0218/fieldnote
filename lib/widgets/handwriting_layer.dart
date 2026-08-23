@@ -15,14 +15,16 @@ double drawingStrokeWidth(DrawingStroke stroke, double pressure) {
   };
 }
 
-Color _drawingColor(DrawingStroke stroke) {
-  final double effectiveOpacity = switch (stroke.brush) {
+double _drawingOpacity(DrawingStroke stroke) {
+  final double brushOpacity = switch (stroke.brush) {
     DrawingBrush.highlighter => stroke.opacity.clamp(0.05, 0.55),
     _ => stroke.opacity.clamp(0.05, 1.0),
   };
-  return stroke.color.withValues(
-    alpha: (stroke.color.a * effectiveOpacity).clamp(0.0, 1.0),
-  );
+  return (stroke.color.a * brushOpacity).clamp(0.0, 1.0);
+}
+
+Color _drawingColor(DrawingStroke stroke) {
+  return stroke.color.withValues(alpha: _drawingOpacity(stroke));
 }
 
 Rect drawingStrokeBounds(DrawingStroke stroke, Size size) {
@@ -125,7 +127,22 @@ void paintDrawingStrokes(
       continue;
     }
 
-    final Color color = _drawingColor(stroke);
+    final double opacity = _drawingOpacity(stroke);
+    final bool compositeAsSingleStroke = opacity < 0.999 &&
+        stroke.points.length > 1 &&
+        (stroke.kind == DrawingKind.freehand ||
+            stroke.kind == DrawingKind.polyline);
+    if (compositeAsSingleStroke) {
+      final double layerPadding =
+          drawingStrokeWidth(stroke, 1) * widthScale + 6;
+      canvas.saveLayer(
+        drawingStrokeBounds(stroke, size).inflate(layerPadding),
+        Paint()..color = Colors.white.withValues(alpha: opacity),
+      );
+    }
+    final Color color = compositeAsSingleStroke
+        ? stroke.color.withValues(alpha: 1)
+        : _drawingColor(stroke);
 
     if (stroke.kind == DrawingKind.text) {
       final DrawingPoint anchor = stroke.points.first;
@@ -231,6 +248,10 @@ void paintDrawingStrokes(
             ..isAntiAlias = true,
         );
       }
+    }
+
+    if (compositeAsSingleStroke) {
+      canvas.restore();
     }
 
     if (selectedStrokeId == stroke.id) {

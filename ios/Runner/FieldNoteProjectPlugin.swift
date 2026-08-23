@@ -997,9 +997,10 @@ private enum FieldNotePdfWriter {
       let effectiveOpacity = brush == "highlighter"
         ? min(opacity, 0.55)
         : opacity
+      let baseStrokeColor = color(from: stroke["color"])
       let strokeColor = applyingOpacity(
         effectiveOpacity,
-        to: color(from: stroke["color"])
+        to: baseStrokeColor
       )
       var points: [CGPoint] = []
       var widths: [CGFloat] = []
@@ -1109,7 +1110,8 @@ private enum FieldNotePdfWriter {
       let annotation = FieldNotePressureStrokeAnnotation(
         points: points,
         widths: widths,
-        strokeColor: strokeColor
+        strokeColor: baseStrokeColor,
+        opacity: effectiveOpacity
       )
       setName(
         "\(exportPrefix)stroke:\(stroke["id"] as? String ?? UUID().uuidString)",
@@ -1343,15 +1345,18 @@ private final class FieldNotePressureStrokeAnnotation: PDFAnnotation {
   private let points: [CGPoint]
   private let widths: [CGFloat]
   private let strokeColor: UIColor
+  private let opacity: CGFloat
 
   init(
     points: [CGPoint],
     widths: [CGFloat],
-    strokeColor: UIColor
+    strokeColor: UIColor,
+    opacity: CGFloat
   ) {
     self.points = points
     self.widths = widths
     self.strokeColor = strokeColor
+    self.opacity = opacity
 
     let maximumWidth = widths.max() ?? 3
     let inset = maximumWidth / 2 + 2
@@ -1382,6 +1387,9 @@ private final class FieldNotePressureStrokeAnnotation: PDFAnnotation {
     guard let firstPoint = points.first else { return }
     context.saveGState()
     defer { context.restoreGState() }
+    context.setAlpha(opacity)
+    context.beginTransparencyLayer(auxiliaryInfo: nil)
+    defer { context.endTransparencyLayer() }
     context.setAllowsAntialiasing(true)
     context.setShouldAntialias(true)
     context.setStrokeColor(strokeColor.cgColor)

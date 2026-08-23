@@ -225,6 +225,96 @@ void main() {
     );
   });
 
+  test('複数PDFの元データもまとめて最近削除から復元できる', () async {
+    const String projectId = 'multi-pdf-recovery';
+    const String projectName = '複数PDF復元';
+    const String firstDocument = '01_平面図';
+    const String secondDocument = '02_立面図';
+    final Uint8List firstBytes = Uint8List.fromList(<int>[1, 3, 5]);
+    final Uint8List secondBytes = Uint8List.fromList(<int>[2, 4, 6]);
+    final Uint8List secondPencil = Uint8List.fromList(<int>[9, 9]);
+    await ProjectFileStore.createProject(
+      projectId: projectId,
+      projectName: projectName,
+    );
+    await ProjectFileStore.savePdfDocument(
+      projectId: projectId,
+      projectName: projectName,
+      documentId: firstDocument,
+      documentName: '平面図.pdf',
+      folderName: firstDocument,
+      pageCount: 2,
+      bytes: firstBytes,
+    );
+    await ProjectFileStore.savePdfDocument(
+      projectId: projectId,
+      projectName: projectName,
+      documentId: secondDocument,
+      documentName: '立面図.pdf',
+      folderName: secondDocument,
+      pageCount: 3,
+      bytes: secondBytes,
+    );
+    final String firstSource = (await ProjectFileStore.sourcePdfPath(
+      projectId,
+      documentId: firstDocument,
+    ))!;
+    final String secondSource = (await ProjectFileStore.sourcePdfPath(
+      projectId,
+      documentId: secondDocument,
+    ))!;
+    await File('$secondSource.pencilkit')
+        .writeAsBytes(secondPencil, flush: true);
+
+    late Directory trashedProject;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(projectChannel, (MethodCall call) async {
+      final String path =
+          (call.arguments as Map<dynamic, dynamic>)['path'] as String;
+      trashedProject = await Directory(path).rename(
+        '${recentlyDeleted.path}${Platform.pathSeparator}$projectName',
+      );
+      return true;
+    });
+
+    await ProjectFileStore.deleteProject(projectId);
+    expect(await File(firstSource).exists(), isFalse);
+    expect(await File(secondSource).exists(), isFalse);
+    final Directory recovery = Directory(
+      '${trashedProject.path}${Platform.pathSeparator}.fieldnote-recovery',
+    );
+    final List<FileSystemEntity> recoveredPdfs = await recovery
+        .list(followLinks: false)
+        .where((FileSystemEntity entity) => entity.path.endsWith('.pdf'))
+        .toList();
+    expect(recoveredPdfs, hasLength(2));
+
+    await trashedProject.rename(
+      '${documents.path}${Platform.pathSeparator}$projectName',
+    );
+    expect(
+      await ProjectFileStore.sourcePdfPath(
+        projectId,
+        documentId: firstDocument,
+      ),
+      firstSource,
+    );
+    expect(
+      await ProjectFileStore.sourcePdfPath(
+        projectId,
+        documentId: secondDocument,
+      ),
+      secondSource,
+    );
+    expect(await File(firstSource).readAsBytes(), firstBytes);
+    expect(await File(secondSource).readAsBytes(), secondBytes);
+    expect(
+      await File('$secondSource.pencilkit').readAsBytes(),
+      secondPencil,
+    );
+    expect(await recovery.exists(), isFalse);
+  });
+
   test('最近削除への移動に失敗した場合は案件と元PDFを残す', () async {
     const String projectId = 'project-trash-failure-test';
     const String projectName = '削除失敗テスト';

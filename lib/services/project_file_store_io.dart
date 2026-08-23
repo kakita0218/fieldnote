@@ -69,11 +69,16 @@ class ProjectFileStore {
 
   static File _editedPhotoFile(
     Directory projectDirectory, {
+    String documentId = 'main',
     required int pinNumber,
     required String photoId,
   }) {
+    final String documentPath = documentId == 'main'
+        ? ''
+        : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}';
     return File(
       '${projectDirectory.path}${Platform.pathSeparator}$_photosDirectoryName'
+      '$documentPath'
       '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
       '${Platform.pathSeparator}書き込み済み'
       '${Platform.pathSeparator}${_photoEditToken(photoId)}.png',
@@ -316,32 +321,54 @@ class ProjectFileStore {
       '$_photosDirectoryName',
     );
     if (!await photos.exists()) return;
-    final Map<String, int> pinNumbers = <String, int>{
+    final Map<String, Map<String, dynamic>> pinsById =
+        <String, Map<String, dynamic>>{
       for (final dynamic raw in manifest['pins'] as List? ?? const <dynamic>[])
         if (raw is Map && raw['id'] != null && raw['number'] is num)
-          raw['id'].toString(): (raw['number'] as num).toInt(),
+          raw['id'].toString(): <String, dynamic>{
+            'number': (raw['number'] as num).toInt(),
+            'documentId': raw['documentId']?.toString() ?? 'main',
+          },
     };
+    Future<void> recoverFrom(Directory root) async {
+      if (!await root.exists()) return;
+      await for (final FileSystemEntity entity
+          in root.list(followLinks: false)) {
+        if (entity is! Directory) continue;
+        final String name = _entityName(entity);
+        if (!name.startsWith(_movingPhotoDirectoryPrefix)) continue;
+        final String pinId = name.substring(_movingPhotoDirectoryPrefix.length);
+        final Map<String, dynamic>? pin = pinsById[pinId];
+        // A removed pin may still be undoable in the editor.
+        if (pin == null) continue;
+        final int pinNumber = pin['number'] as int;
+        final String documentId = pin['documentId'] as String;
+        final String documentPath = documentId == 'main'
+            ? ''
+            : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}';
+        final Directory destination = Directory(
+          '${photos.path}$documentPath'
+          '${Platform.pathSeparator}${_threeDigits(pinNumber)}',
+        );
+        await destination.parent.create(recursive: true);
+        if (await destination.exists()) {
+          await _mergePhotoDirectoryWithoutOverwrite(
+            source: entity,
+            destination: destination,
+          );
+        } else {
+          await entity.rename(destination.path);
+        }
+      }
+    }
+
+    await recoverFrom(photos);
     await for (final FileSystemEntity entity
         in photos.list(followLinks: false)) {
       if (entity is! Directory) continue;
       final String name = _entityName(entity);
-      if (!name.startsWith(_movingPhotoDirectoryPrefix)) continue;
-      final String pinId = name.substring(_movingPhotoDirectoryPrefix.length);
-      final int? pinNumber = pinNumbers[pinId];
-      // A removed pin may still be redoable in the current editor session.
-      // Keep its staged folder until a manifest containing that pin returns.
-      if (pinNumber == null) continue;
-      final Directory destination = Directory(
-        '${photos.path}${Platform.pathSeparator}${_threeDigits(pinNumber)}',
-      );
-      if (await destination.exists()) {
-        await _mergePhotoDirectoryWithoutOverwrite(
-          source: entity,
-          destination: destination,
-        );
-      } else {
-        await entity.rename(destination.path);
-      }
+      if (int.tryParse(name) != null || name.startsWith('.')) continue;
+      await recoverFrom(entity);
     }
   }
 
@@ -441,11 +468,17 @@ class ProjectFileStore {
     return directory;
   }
 
-  static Future<File> _sourcePdfFile(String projectId) async {
+  static Future<File> _sourcePdfFile(
+    String projectId, {
+    String documentId = 'main',
+  }) async {
     final Directory directory = await _sourceDirectory();
+    final String projectToken = _safeName(projectId, fallback: 'project');
+    final String fileName = documentId == 'main'
+        ? '$projectToken.pdf'
+        : '$projectToken--${_safeName(documentId, fallback: 'document')}.pdf';
     final File source = File(
-      '${directory.path}${Platform.pathSeparator}'
-      '${_safeName(projectId, fallback: 'project')}.pdf',
+      '${directory.path}${Platform.pathSeparator}$fileName',
     );
     await _recoverAtomicFile(source);
     return source;
@@ -483,8 +516,25 @@ class ProjectFileStore {
     required String projectId,
     required Directory projectDirectory,
   }) async {
-    final File source = await _sourcePdfFile(projectId);
-    if (!await source.exists()) return null;
+    final Map<String, dynamic>? manifest =
+        await _readManifest(projectDirectory);
+    final Set<String> documentIds = <String>{};
+    for (final dynamic raw
+        in manifest?['documents'] as List? ?? const <dynamic>[]) {
+      if (raw is! Map) continue;
+      final String documentId = raw['id']?.toString() ?? '';
+      if (documentId.isNotEmpty) documentIds.add(documentId);
+    }
+    if (documentIds.isEmpty) documentIds.add('main');
+    final Map<String, File> sources = <String, File>{};
+    for (final String documentId in documentIds) {
+      final File source = await _sourcePdfFile(
+        projectId,
+        documentId: documentId,
+      );
+      if (await source.exists()) sources[documentId] = source;
+    }
+    if (sources.isEmpty) return null;
     if (!_stagingRecoveryProjectIds.add(projectId)) {
       throw StateError('案件を「最近削除した項目」へ移動中です。');
     }
@@ -497,16 +547,18 @@ class ProjectFileStore {
     );
     try {
       await staging.create(recursive: true);
-      await source.copy(
-        '${staging.path}${Platform.pathSeparator}$_recoverySourcePdfName',
-      );
-      for (final String suffix in _pencilKitSuffixes) {
-        final File sidecar = File('${source.path}$suffix');
-        if (await sidecar.exists()) {
-          await sidecar.copy(
-            '${staging.path}${Platform.pathSeparator}'
-            '$_recoverySourcePdfName$suffix',
-          );
+      for (final MapEntry<String, File> entry in sources.entries) {
+        final String recoveryName = _recoverySourceNameForDocument(entry.key);
+        await entry.value.copy(
+          '${staging.path}${Platform.pathSeparator}$recoveryName',
+        );
+        for (final String suffix in _pencilKitSuffixes) {
+          final File sidecar = File('${entry.value.path}$suffix');
+          if (await sidecar.exists()) {
+            await sidecar.copy(
+              '${staging.path}${Platform.pathSeparator}$recoveryName$suffix',
+            );
+          }
         }
       }
       if (await recovery.exists()) {
@@ -530,33 +582,91 @@ class ProjectFileStore {
     final Directory recovery = _recoveryDirectory(projectDirectory);
     if (!await recovery.exists()) return;
 
-    final File recoveredSource = File(
+    final Map<String, dynamic>? manifest =
+        await _readManifest(projectDirectory);
+    final Set<String> documentIds = <String>{};
+    for (final dynamic raw
+        in manifest?['documents'] as List? ?? const <dynamic>[]) {
+      if (raw is! Map) continue;
+      final String documentId = raw['id']?.toString() ?? '';
+      if (documentId.isNotEmpty) documentIds.add(documentId);
+    }
+    final File legacyRecovery = File(
       '${recovery.path}${Platform.pathSeparator}$_recoverySourcePdfName',
     );
-    final File source = await _sourcePdfFile(projectId);
-    if (await recoveredSource.exists() && !await source.exists()) {
-      await _copyFileAtomically(recoveredSource, source);
+    if (documentIds.isEmpty || await legacyRecovery.exists()) {
+      documentIds.add('main');
     }
-    if (!await source.exists()) {
-      throw StateError('復元用の元PDFを確認できませんでした。');
-    }
-    for (final String suffix in _pencilKitSuffixes) {
-      final File recoveredSidecar = File(
-        '${recovery.path}${Platform.pathSeparator}'
-        '$_recoverySourcePdfName$suffix',
+    bool hasReadableSource = false;
+    for (final String documentId in documentIds) {
+      final String recoveryName = _recoverySourceNameForDocument(documentId);
+      final File recoveredSource = File(
+        '${recovery.path}${Platform.pathSeparator}$recoveryName',
       );
-      final File sidecar = File('${source.path}$suffix');
-      if (await recoveredSidecar.exists() && !await sidecar.exists()) {
-        await _copyFileAtomically(recoveredSidecar, sidecar);
+      final File source = await _sourcePdfFile(
+        projectId,
+        documentId: documentId,
+      );
+      if (await recoveredSource.exists() && !await source.exists()) {
+        await _copyFileAtomically(recoveredSource, source);
       }
+      if (await source.exists()) hasReadableSource = true;
+      for (final String suffix in _pencilKitSuffixes) {
+        final File recoveredSidecar = File(
+          '${recovery.path}${Platform.pathSeparator}$recoveryName$suffix',
+        );
+        final File sidecar = File('${source.path}$suffix');
+        if (await recoveredSidecar.exists() && !await sidecar.exists()) {
+          await _copyFileAtomically(recoveredSidecar, sidecar);
+        }
+      }
+    }
+    if (!hasReadableSource) {
+      throw StateError('復元用の元PDFを確認できませんでした。');
     }
     await recovery.delete(recursive: true);
   }
 
-  static Future<File?> _outputPdfFile(String projectId) async {
+  static String _recoverySourceNameForDocument(String documentId) {
+    if (documentId == 'main') return _recoverySourcePdfName;
+    final String token =
+        base64Url.encode(utf8.encode(documentId)).replaceAll('=', '');
+    return 'source--$token.pdf';
+  }
+
+  static Future<File?> _outputPdfFile(
+    String projectId, {
+    String documentId = 'main',
+  }) async {
     final Directory? directory = await _findProjectDirectory(projectId);
     if (directory == null) return null;
     final Map<String, dynamic>? manifest = await _readManifest(directory);
+    final List<dynamic> documents =
+        manifest?['documents'] as List? ?? const <dynamic>[];
+    if (documents.isNotEmpty) {
+      Map<String, dynamic>? document;
+      for (final dynamic raw in documents) {
+        if (raw is Map && raw['id']?.toString() == documentId) {
+          document = raw.map<String, dynamic>(
+            (dynamic key, dynamic value) =>
+                MapEntry<String, dynamic>(key.toString(), value),
+          );
+          break;
+        }
+      }
+      if (document == null) return null;
+      final Directory outputs = Directory(
+        '${directory.path}${Platform.pathSeparator}PDF',
+      );
+      await outputs.create(recursive: true);
+      final String outputName = document['outputFileName']?.toString() ??
+          '${_safeName(document['folderName']?.toString() ?? document['name']?.toString() ?? 'document')}.pdf';
+      final File output = File(
+        '${outputs.path}${Platform.pathSeparator}$outputName',
+      );
+      await _recoverAtomicFile(output);
+      return output;
+    }
     final String name = manifest?['projectName']?.toString() ??
         directory.uri.pathSegments
             .where((String segment) => segment.isNotEmpty)
@@ -594,6 +704,18 @@ class ProjectFileStore {
         if (manifest['fileMigrationComplete'] == true) {
           completedMigrations.add(id);
         }
+        final Set<String> activePinIds = <String>{
+          for (final dynamic raw
+              in manifest['pins'] as List? ?? const <dynamic>[])
+            if (raw is Map && raw['id'] != null) raw['id'].toString(),
+        };
+        final int activePhotoCount = (manifest['photos'] as List? ??
+                const <dynamic>[])
+            .where(
+              (dynamic raw) =>
+                  raw is Map && activePinIds.contains(raw['pinId']?.toString()),
+            )
+            .length;
         discovered[id] = entity;
         projects.add(
           ProjectSummary(
@@ -605,9 +727,7 @@ class ProjectFileStore {
             pageCount: manifest['pageCount'] is num
                 ? (manifest['pageCount'] as num).toInt()
                 : 0,
-            photoCount: manifest['photos'] is List
-                ? (manifest['photos'] as List).length
-                : 0,
+            photoCount: activePhotoCount,
             pinCount: manifest['pins'] is List
                 ? (manifest['pins'] as List).length
                 : 0,
@@ -673,8 +793,20 @@ class ProjectFileStore {
     } catch (_) {
       // The visible PDF can still open even if an internal recovery copy fails.
     }
-    final File source = await _sourcePdfFile(projectId);
-    final File? output = await _outputPdfFile(projectId);
+    final List<dynamic> documents =
+        manifest['documents'] as List? ?? const <dynamic>[];
+    final String activeDocumentId = manifest['activeDocumentId']?.toString() ??
+        (documents.isNotEmpty && documents.first is Map
+            ? (documents.first as Map)['id']?.toString() ?? 'main'
+            : 'main');
+    final File source = await _sourcePdfFile(
+      projectId,
+      documentId: activeDocumentId,
+    );
+    final File? output = await _outputPdfFile(
+      projectId,
+      documentId: activeDocumentId,
+    );
     final File? readablePdf = await source.exists()
         ? source
         : output != null && await output.exists()
@@ -731,6 +863,133 @@ class ProjectFileStore {
           '${_manifestName(projectName)}',
         );
     await _writeJsonAtomically(target, manifest);
+  }
+
+  static Future<void> savePdfDocument({
+    required String projectId,
+    required String projectName,
+    required String documentId,
+    required String documentName,
+    required String folderName,
+    required int pageCount,
+    required Uint8List bytes,
+  }) async {
+    if (bytes.isEmpty) throw StateError('PDFデータが空です。');
+    final Directory directory = await _createProjectDirectory(
+      projectId: projectId,
+      projectName: projectName,
+    );
+    final File source = await _sourcePdfFile(
+      projectId,
+      documentId: documentId,
+    );
+    await _writeBytesAtomically(source, bytes);
+
+    final Directory outputs = Directory(
+      '${directory.path}${Platform.pathSeparator}PDF',
+    );
+    await outputs.create(recursive: true);
+    final String outputFileName = '${_safeName(folderName)}.pdf';
+    await _writeBytesAtomically(
+      File('${outputs.path}${Platform.pathSeparator}$outputFileName'),
+      bytes,
+    );
+
+    final File? existingManifest = await _manifestFile(directory);
+    final Map<String, dynamic> manifest =
+        await _readManifest(directory) ?? <String, dynamic>{};
+    final List<Map<String, dynamic>> documents =
+        (manifest['documents'] as List? ?? const <dynamic>[])
+            .whereType<Map>()
+            .map(
+              (Map<dynamic, dynamic> value) => value.map<String, dynamic>(
+                (dynamic key, dynamic value) =>
+                    MapEntry<String, dynamic>(key.toString(), value),
+              ),
+            )
+            .toList(growable: true);
+    if (documents.isEmpty && documentId != 'main') {
+      final File legacySource = await _sourcePdfFile(projectId);
+      if (await legacySource.exists()) {
+        final String legacyName = manifest['pdfName']?.toString() ??
+            '${manifest['projectName']?.toString() ?? projectName}.pdf';
+        final String legacyFolderName =
+            '01_${_safeName(legacyName.replaceFirst(RegExp(r'\.pdf$', caseSensitive: false), ''))}';
+        final String legacyOutputFileName = '$legacyFolderName.pdf';
+        final File separatedLegacyOutput = File(
+          '${outputs.path}${Platform.pathSeparator}$legacyOutputFileName',
+        );
+        if (!await separatedLegacyOutput.exists()) {
+          final File legacyVisibleOutput = File(
+            '${directory.path}${Platform.pathSeparator}'
+            '${_pdfName(manifest['projectName']?.toString() ?? projectName)}',
+          );
+          await _copyFileAtomically(
+            await legacyVisibleOutput.exists()
+                ? legacyVisibleOutput
+                : legacySource,
+            separatedLegacyOutput,
+          );
+        }
+        documents.add(<String, dynamic>{
+          'id': 'main',
+          'name': legacyName,
+          'folderName': legacyFolderName,
+          'outputFileName': legacyOutputFileName,
+          'pageCount': (manifest['pageCount'] as num?)?.toInt() ?? 0,
+          'currentPage': (manifest['currentPage'] as num?)?.toInt() ?? 1,
+        });
+      }
+    }
+    documents.removeWhere(
+      (Map<String, dynamic> value) => value['id']?.toString() == documentId,
+    );
+    documents.add(<String, dynamic>{
+      'id': documentId,
+      'name': documentName,
+      'folderName': folderName,
+      'outputFileName': outputFileName,
+      'pageCount': pageCount,
+      'currentPage': 1,
+    });
+    manifest
+      ..['schemaVersion'] = _schemaVersion
+      ..['projectId'] = projectId
+      ..['projectName'] = projectName
+      ..['documents'] = documents
+      ..['activeDocumentId'] = documentId
+      ..['updatedAt'] = DateTime.now().toIso8601String()
+      ..putIfAbsent('pins', () => <dynamic>[])
+      ..putIfAbsent('strokes', () => <dynamic>[])
+      ..putIfAbsent('photos', () => <dynamic>[]);
+    final File target = existingManifest ??
+        File(
+          '${directory.path}${Platform.pathSeparator}${_manifestName(projectName)}',
+        );
+    await _writeJsonAtomically(target, manifest);
+  }
+
+  static Future<Uint8List?> loadPdfDocument({
+    required String projectId,
+    required String documentId,
+  }) async {
+    final File source = await _sourcePdfFile(
+      projectId,
+      documentId: documentId,
+    );
+    if (await source.exists()) {
+      return Uint8List.fromList(await source.readAsBytes());
+    }
+    // The visible PDF lives inside the project folder and is restored together
+    // with that folder from Recently Deleted. Rehydrate the private editing
+    // source from it when a project was restored after its source copies were
+    // removed.
+    final File? output = await _outputPdfFile(
+      projectId,
+      documentId: documentId,
+    );
+    if (output == null || !await output.exists()) return null;
+    return Uint8List.fromList(await output.readAsBytes());
   }
 
   static Future<void> importProjectAtomically({
@@ -894,27 +1153,46 @@ class ProjectFileStore {
     );
     if (!await photos.exists()) return <String, Directory>{};
 
-    final Map<String, int> oldNumbers = <String, int>{
+    final Map<String, Map<String, dynamic>> oldPins =
+        <String, Map<String, dynamic>>{
       for (final dynamic raw
           in oldManifest['pins'] as List? ?? const <dynamic>[])
         if (raw is Map && raw['id'] != null && raw['number'] is num)
-          raw['id'].toString(): (raw['number'] as num).toInt(),
+          raw['id'].toString(): <String, dynamic>{
+            'number': (raw['number'] as num).toInt(),
+            'documentId': raw['documentId']?.toString() ?? 'main',
+          },
     };
-    final Map<String, int> newNumbers = <String, int>{
+    final Map<String, Map<String, dynamic>> newPinsById =
+        <String, Map<String, dynamic>>{
       for (final Map<String, dynamic> pin in newPins)
         if (pin['id'] != null && pin['number'] is num)
-          pin['id'].toString(): (pin['number'] as num).toInt(),
+          pin['id'].toString(): <String, dynamic>{
+            'number': (pin['number'] as num).toInt(),
+            'documentId': pin['documentId']?.toString() ?? 'main',
+          },
     };
 
     final Map<String, Directory> staged = <String, Directory>{};
-    for (final MapEntry<String, int> entry in oldNumbers.entries) {
-      final int? newNumber = newNumbers[entry.key];
-      if (newNumber == entry.value) continue;
+    for (final MapEntry<String, Map<String, dynamic>> entry
+        in oldPins.entries) {
+      final int oldNumber = entry.value['number'] as int;
+      final String oldDocumentId = entry.value['documentId'] as String;
+      final Map<String, dynamic>? newPin = newPinsById[entry.key];
+      if (newPin?['number'] == oldNumber &&
+          newPin?['documentId'] == oldDocumentId) {
+        continue;
+      }
+      final String documentPath = oldDocumentId == 'main'
+          ? ''
+          : '${Platform.pathSeparator}${_safeName(oldDocumentId, fallback: 'document')}';
       final Directory current = Directory(
-        '${photos.path}${Platform.pathSeparator}${_threeDigits(entry.value)}',
+        '${photos.path}$documentPath'
+        '${Platform.pathSeparator}${_threeDigits(oldNumber)}',
       );
       final Directory temporary = Directory(
-        '${photos.path}${Platform.pathSeparator}.moving-${entry.key}',
+        '${photos.path}$documentPath'
+        '${Platform.pathSeparator}.moving-${entry.key}',
       );
       if (await temporary.exists()) {
         // A previous save was interrupted after staging this folder.
@@ -935,20 +1213,31 @@ class ProjectFileStore {
     final Directory photos = Directory(
       '${directory.path}${Platform.pathSeparator}$_photosDirectoryName',
     );
-    final Map<String, int> newNumbers = <String, int>{
+    final Map<String, Map<String, dynamic>> newPinsById =
+        <String, Map<String, dynamic>>{
       for (final Map<String, dynamic> pin in newPins)
         if (pin['id'] != null && pin['number'] is num)
-          pin['id'].toString(): (pin['number'] as num).toInt(),
+          pin['id'].toString(): <String, dynamic>{
+            'number': (pin['number'] as num).toInt(),
+            'documentId': pin['documentId']?.toString() ?? 'main',
+          },
     };
     for (final MapEntry<String, Directory> entry in staged.entries) {
-      final int? number = newNumbers[entry.key];
-      if (number == null) {
+      final Map<String, dynamic>? pin = newPinsById[entry.key];
+      if (pin == null) {
         // Preserve data belonging to a temporarily undone pin.
         continue;
       }
+      final int number = pin['number'] as int;
+      final String documentId = pin['documentId'] as String;
+      final String documentPath = documentId == 'main'
+          ? ''
+          : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}';
       final Directory destination = Directory(
-        '${photos.path}${Platform.pathSeparator}${_threeDigits(number)}',
+        '${photos.path}$documentPath'
+        '${Platform.pathSeparator}${_threeDigits(number)}',
       );
+      await destination.parent.create(recursive: true);
       if (await destination.exists()) {
         await _mergePhotoDirectoryWithoutOverwrite(
           source: entry.value,
@@ -988,6 +1277,11 @@ class ProjectFileStore {
         if (pin['id'] != null && pin['number'] is num)
           pin['id'].toString(): (pin['number'] as num).toInt(),
     };
+    final Map<String, String> newPinDocuments = <String, String>{
+      for (final Map<String, dynamic> pin in pins)
+        if (pin['id'] != null)
+          pin['id'].toString(): pin['documentId']?.toString() ?? 'main',
+    };
     final List<Map<String, dynamic>> reconciledPhotos = photos.map(
       (Map<String, dynamic> photo) {
         final String pinId = photo['pinId']?.toString() ?? '';
@@ -995,6 +1289,8 @@ class ProjectFileStore {
         return <String, dynamic>{
           ...photo,
           if (newNumber != null) 'pinNumber': newNumber,
+          if (newPinDocuments[pinId] != null)
+            'documentId': newPinDocuments[pinId],
         };
       },
     ).toList(growable: false);
@@ -1049,6 +1345,7 @@ class ProjectFileStore {
     required String projectId,
     required String projectName,
     required String pinId,
+    String documentId = 'main',
     required int pinNumber,
     required String photoId,
     required String fileName,
@@ -1060,6 +1357,7 @@ class ProjectFileStore {
     );
     final Directory photos = Directory(
       '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
+      '${documentId == 'main' ? '' : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}'}'
       '${Platform.pathSeparator}${_threeDigits(pinNumber)}',
     );
     await photos.create(recursive: true);
@@ -1082,6 +1380,7 @@ class ProjectFileStore {
     records.add(<String, dynamic>{
       'projectId': projectId,
       'pinId': pinId,
+      'documentId': documentId,
       'pinNumber': pinNumber,
       'photoId': photoId,
       'fileName': storedFileName,
@@ -1121,61 +1420,112 @@ class ProjectFileStore {
             MapEntry<String, dynamic>(key.toString(), value),
       );
       final int? number = (record['pinNumber'] as num?)?.toInt();
+      final String documentId = record['documentId']?.toString() ?? 'main';
       final String fileName = record['fileName']?.toString() ?? '';
       if (number != null && fileName.isNotEmpty) {
-        byFile['${_threeDigits(number)}/$fileName'] = record;
+        byFile['$documentId/${_threeDigits(number)}/$fileName'] = record;
       }
     }
 
-    final Map<int, String> pinIds = <int, String>{
+    final Map<String, String> pinIds = <String, String>{
       for (final dynamic raw in manifest['pins'] as List? ?? const <dynamic>[])
         if (raw is Map && raw['number'] is num && raw['id'] != null)
-          (raw['number'] as num).toInt(): raw['id'].toString(),
+          '${raw['documentId']?.toString() ?? 'main'}/'
+              '${(raw['number'] as num).toInt()}': raw['id'].toString(),
     };
     final Directory photos = Directory(
       '${directory.path}${Platform.pathSeparator}$_photosDirectoryName',
     );
     if (!await photos.exists()) return result;
 
-    await for (final FileSystemEntity folder
+    Future<void> scanDocumentPhotos(
+      Directory documentPhotos,
+      String documentId,
+    ) async {
+      if (!await documentPhotos.exists()) return;
+      await for (final FileSystemEntity folder
+          in documentPhotos.list(followLinks: false)) {
+        if (folder is! Directory) continue;
+        final String folderName =
+            folder.uri.pathSegments.where((String e) => e.isNotEmpty).last;
+        final int? pinNumber = int.tryParse(folderName);
+        if (pinNumber == null) continue;
+        final Set<String> seenPhotoPaths = <String>{};
+        await for (final FileSystemEntity entity
+            in folder.list(followLinks: false)) {
+          if (entity is! File) continue;
+          File photo = entity;
+          final String lowerPath = photo.path.toLowerCase();
+          if (lowerPath.endsWith('.jpg.bak')) {
+            photo = File(
+              photo.path.substring(0, photo.path.length - '.bak'.length),
+            );
+            await _recoverAtomicFile(photo);
+          }
+          if (!photo.path.toLowerCase().endsWith('.jpg') ||
+              !await photo.exists() ||
+              !seenPhotoPaths.add(photo.path)) {
+            continue;
+          }
+          final String fileName =
+              photo.uri.pathSegments.where((String e) => e.isNotEmpty).last;
+          final String key = '$documentId/$folderName/$fileName';
+          final String pinKey = '$documentId/$pinNumber';
+          final Map<String, dynamic> stored = byFile[key] ??
+              <String, dynamic>{
+                'projectId': manifest['projectId'],
+                'documentId': documentId,
+                'pinId': pinIds[pinKey] ?? '',
+                'pinNumber': pinNumber,
+                'photoId': '${pinIds[pinKey] ?? pinNumber}::$fileName',
+                'fileName': fileName,
+                'createdAt': (await photo.stat()).modified.toIso8601String(),
+              };
+          result.add(stored);
+        }
+      }
+    }
+
+    await scanDocumentPhotos(photos, 'main');
+    await for (final FileSystemEntity entity
         in photos.list(followLinks: false)) {
-      if (folder is! Directory) continue;
-      final String folderName =
-          folder.uri.pathSegments.where((String e) => e.isNotEmpty).last;
-      final int? pinNumber = int.tryParse(folderName);
-      if (pinNumber == null) continue;
-      final Set<String> seenPhotoPaths = <String>{};
-      await for (final FileSystemEntity entity
-          in folder.list(followLinks: false)) {
-        if (entity is! File) {
-          continue;
-        }
-        File photo = entity;
-        final String lowerPath = photo.path.toLowerCase();
-        if (lowerPath.endsWith('.jpg.bak')) {
-          photo = File(
-            photo.path.substring(0, photo.path.length - '.bak'.length),
-          );
-          await _recoverAtomicFile(photo);
-        }
-        if (!photo.path.toLowerCase().endsWith('.jpg') ||
-            !await photo.exists() ||
-            !seenPhotoPaths.add(photo.path)) {
-          continue;
-        }
-        final String fileName =
-            photo.uri.pathSegments.where((String e) => e.isNotEmpty).last;
-        final String key = '$folderName/$fileName';
-        final Map<String, dynamic> stored = byFile[key] ??
-            <String, dynamic>{
-              'projectId': manifest['projectId'],
-              'pinId': pinIds[pinNumber] ?? '',
-              'pinNumber': pinNumber,
-              'photoId': '${pinIds[pinNumber] ?? pinNumber}::$fileName',
-              'fileName': fileName,
-              'createdAt': (await photo.stat()).modified.toIso8601String(),
-            };
-        result.add(stored);
+      if (entity is! Directory) continue;
+      final String name = _entityName(entity);
+      if (int.tryParse(name) != null || name.startsWith('.')) continue;
+      await scanDocumentPhotos(entity, name);
+    }
+    final Set<String> includedPhotoIds = result
+        .map((Map<String, dynamic> record) =>
+            record['photoId']?.toString() ?? '')
+        .where((String id) => id.isNotEmpty)
+        .toSet();
+    for (final dynamic raw
+        in manifest['photos'] as List? ?? const <dynamic>[]) {
+      if (raw is! Map) continue;
+      final Map<String, dynamic> record = raw.map<String, dynamic>(
+        (dynamic key, dynamic value) =>
+            MapEntry<String, dynamic>(key.toString(), value),
+      );
+      final String photoId = record['photoId']?.toString() ?? '';
+      final String pinId = record['pinId']?.toString() ?? '';
+      final String documentId = record['documentId']?.toString() ?? 'main';
+      final String fileName = record['fileName']?.toString() ?? '';
+      if (photoId.isEmpty ||
+          includedPhotoIds.contains(photoId) ||
+          pinId.isEmpty ||
+          fileName.isEmpty) {
+        continue;
+      }
+      final File stagedPhoto = File(
+        '${photos.path}'
+        '${documentId == 'main' ? '' : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}'}'
+        '${Platform.pathSeparator}'
+        '$_movingPhotoDirectoryPrefix$pinId'
+        '${Platform.pathSeparator}$fileName',
+      );
+      if (await stagedPhoto.exists()) {
+        result.add(record);
+        includedPhotoIds.add(photoId);
       }
     }
     result.sort(
@@ -1198,6 +1548,7 @@ class ProjectFileStore {
 
   static Future<Uint8List?> loadPhotoBytes({
     required String projectId,
+    String documentId = 'main',
     required String photoId,
     required int pinNumber,
     required String fileName,
@@ -1212,6 +1563,7 @@ class ProjectFileStore {
     }
     final File file = File(
       '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
+      '${documentId == 'main' ? '' : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}'}'
       '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
       '${Platform.pathSeparator}$fileName',
     );
@@ -1221,6 +1573,7 @@ class ProjectFileStore {
 
   static Future<void> saveEditedPhoto({
     required String projectId,
+    String documentId = 'main',
     required int pinNumber,
     required String photoId,
     required Uint8List bytes,
@@ -1235,6 +1588,7 @@ class ProjectFileStore {
     await _writeBytesAtomically(
       _editedPhotoFile(
         directory,
+        documentId: documentId,
         pinNumber: pinNumber,
         photoId: photoId,
       ),
@@ -1244,6 +1598,7 @@ class ProjectFileStore {
 
   static Future<Uint8List?> loadEditedPhotoBytes({
     required String projectId,
+    String documentId = 'main',
     required int pinNumber,
     required String photoId,
   }) async {
@@ -1252,6 +1607,7 @@ class ProjectFileStore {
     if (directory == null) return null;
     final File file = _editedPhotoFile(
       directory,
+      documentId: documentId,
       pinNumber: pinNumber,
       photoId: photoId,
     );
@@ -1262,6 +1618,7 @@ class ProjectFileStore {
 
   static Future<void> deleteEditedPhoto({
     required String projectId,
+    String documentId = 'main',
     required int pinNumber,
     required String photoId,
   }) async {
@@ -1270,6 +1627,7 @@ class ProjectFileStore {
     if (directory == null) return;
     final File file = _editedPhotoFile(
       directory,
+      documentId: documentId,
       pinNumber: pinNumber,
       photoId: photoId,
     );
@@ -1297,6 +1655,7 @@ class ProjectFileStore {
     for (int index = 0; index < photos.length; index++) {
       final Map<String, dynamic> photo = photos[index];
       final int? pinNumber = (photo['pinNumber'] as num?)?.toInt();
+      final String documentId = photo['documentId']?.toString() ?? 'main';
       final String fileName = photo['fileName']?.toString() ?? '';
       if (pinNumber == null ||
           pinNumber < 1 ||
@@ -1307,6 +1666,7 @@ class ProjectFileStore {
       }
       final File file = File(
         '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
+        '${documentId == 'main' ? '' : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}'}'
         '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
         '${Platform.pathSeparator}$fileName',
       );
@@ -1330,16 +1690,26 @@ class ProjectFileStore {
     for (final Map<String, dynamic> record in metadata) {
       if (record['pinId']?.toString() != pinId) continue;
       final int? pinNumber = (record['pinNumber'] as num?)?.toInt();
+      final String documentId = record['documentId']?.toString() ?? 'main';
       if (pinNumber == null) continue;
       final File file = File(
         '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
+        '${documentId == 'main' ? '' : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}'}'
         '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
         '${Platform.pathSeparator}${record['fileName']}',
       );
-      if (!await file.exists()) continue;
+      final File readable = await file.exists()
+          ? file
+          : File(
+              '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
+              '${documentId == 'main' ? '' : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}'}'
+              '${Platform.pathSeparator}$_movingPhotoDirectoryPrefix$pinId'
+              '${Platform.pathSeparator}${record['fileName']}',
+            );
+      if (!await readable.exists()) continue;
       result.add(<String, dynamic>{
         ...record,
-        'bytes': await file.readAsBytes(),
+        'bytes': await readable.readAsBytes(),
       });
     }
     return result;
@@ -1357,9 +1727,11 @@ class ProjectFileStore {
     final List<Map<String, dynamic>> result = <Map<String, dynamic>>[];
     for (final Map<String, dynamic> record in metadata) {
       final int? pinNumber = (record['pinNumber'] as num?)?.toInt();
+      final String documentId = record['documentId']?.toString() ?? 'main';
       if (pinNumber == null) continue;
       final File file = File(
         '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
+        '${documentId == 'main' ? '' : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}'}'
         '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
         '${Platform.pathSeparator}${record['fileName']}',
       );
@@ -1396,10 +1768,29 @@ class ProjectFileStore {
                   value?['id']?.toString() == pinId,
               orElse: () => null,
             );
-    final int? number = (pin?['number'] as num?)?.toInt();
+    Map<String, dynamic>? photoRecord;
+    for (final dynamic raw
+        in manifest['photos'] as List? ?? const <dynamic>[]) {
+      if (raw is Map && raw['pinId']?.toString() == pinId) {
+        photoRecord = raw.map<String, dynamic>(
+          (dynamic key, dynamic value) =>
+              MapEntry<String, dynamic>(key.toString(), value),
+        );
+        break;
+      }
+    }
+    final int? number = (pin?['number'] as num?)?.toInt() ??
+        (photoRecord?['pinNumber'] as num?)?.toInt();
+    final String documentId = pin?['documentId']?.toString() ??
+        photoRecord?['documentId']?.toString() ??
+        'main';
+    final String documentPath = documentId == 'main'
+        ? ''
+        : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}';
     if (number != null) {
       final Directory photos = Directory(
         '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
+        '$documentPath'
         '${Platform.pathSeparator}${_threeDigits(number)}',
       );
       if (await photos.exists()) await photos.delete(recursive: true);
@@ -1407,9 +1798,11 @@ class ProjectFileStore {
     final Directory photosRoot = Directory(
       '${directory.path}${Platform.pathSeparator}$_photosDirectoryName',
     );
-    if (await photosRoot.exists()) {
+    final Directory documentPhotos =
+        Directory('${photosRoot.path}$documentPath');
+    if (await documentPhotos.exists()) {
       await for (final FileSystemEntity entity
-          in photosRoot.list(followLinks: false)) {
+          in documentPhotos.list(followLinks: false)) {
         if (entity is! Directory) continue;
         // Compare an enumerated direct child instead of interpolating pinId
         // into a path, so a damaged user-visible manifest cannot traverse out
@@ -1489,6 +1882,16 @@ class ProjectFileStore {
 
   static Future<void> deleteProject(String projectId) async {
     final Directory? directory = await _findProjectDirectory(projectId);
+    final Set<String> sourceDocumentIds = <String>{'main'};
+    if (directory != null && await directory.exists()) {
+      final Map<String, dynamic>? manifest = await _readManifest(directory);
+      for (final dynamic raw
+          in manifest?['documents'] as List? ?? const <dynamic>[]) {
+        if (raw is! Map) continue;
+        final String documentId = raw['id']?.toString() ?? '';
+        if (documentId.isNotEmpty) sourceDocumentIds.add(documentId);
+      }
+    }
     if (NativeProjectService.isAvailable &&
         (directory == null || !await directory.exists())) {
       throw StateError(
@@ -1517,12 +1920,17 @@ class ProjectFileStore {
         await directory.delete(recursive: true);
       }
     }
-    final File source = await _sourcePdfFile(projectId);
     try {
-      if (await source.exists()) await source.delete();
-      for (final String suffix in _pencilKitSuffixes) {
-        final File sidecar = File('${source.path}$suffix');
-        if (await sidecar.exists()) await sidecar.delete();
+      for (final String documentId in sourceDocumentIds) {
+        final File source = await _sourcePdfFile(
+          projectId,
+          documentId: documentId,
+        );
+        if (await source.exists()) await source.delete();
+        for (final String suffix in _pencilKitSuffixes) {
+          final File sidecar = File('${source.path}$suffix');
+          if (await sidecar.exists()) await sidecar.delete();
+        }
       }
     } catch (_) {
       // The user-visible folder is already safely in Recently Deleted.
@@ -1530,7 +1938,10 @@ class ProjectFileStore {
     _projectDirectories.remove(projectId);
   }
 
-  static Future<String?> sourcePdfPath(String projectId) async {
+  static Future<String?> sourcePdfPath(
+    String projectId, {
+    String documentId = 'main',
+  }) async {
     final Directory? directory = await _findProjectDirectory(projectId);
     if (directory != null) {
       try {
@@ -1542,20 +1953,48 @@ class ProjectFileStore {
         // Keep the recovery bundle in place so opening can be retried later.
       }
     }
-    final File source = await _sourcePdfFile(projectId);
+    final File source = await _sourcePdfFile(
+      projectId,
+      documentId: documentId,
+    );
+    if (!await source.exists()) {
+      final File? output = await _outputPdfFile(
+        projectId,
+        documentId: documentId,
+      );
+      if (output != null && await output.exists()) {
+        try {
+          await _copyFileAtomically(output, source);
+        } catch (_) {
+          // The caller can still use the visible PDF through loadPdfDocument.
+        }
+      }
+    }
     return await source.exists() ? source.path : null;
   }
 
   static Future<bool> hasProject(String projectId) async =>
       await _findProjectDirectory(projectId) != null;
 
-  static Future<String?> outputPdfPath(String projectId) async {
-    final File? output = await _outputPdfFile(projectId);
+  static Future<String?> outputPdfPath(
+    String projectId, {
+    String documentId = 'main',
+  }) async {
+    final File? output = await _outputPdfFile(
+      projectId,
+      documentId: documentId,
+    );
     return output?.path;
   }
 
-  static Future<Uint8List?> loadOutputPdf(String projectId) async {
-    final File? output = await _outputPdfFile(projectId);
+  static Future<Uint8List?> loadOutputPdf(
+    String projectId, {
+    String documentId = 'main',
+  }) async {
+    final File? output = await _outputPdfFile(
+      projectId,
+      documentId: documentId,
+    );
     if (output == null || !await output.exists()) return null;
     return Uint8List.fromList(await output.readAsBytes());
   }

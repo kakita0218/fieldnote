@@ -5,6 +5,7 @@ class PinData {
     required this.pageNumber,
     required this.xRatio,
     required this.yRatio,
+    this.documentId = 'main',
     this.directionDegrees = 0,
     this.photoCount = 0,
     this.note = '',
@@ -22,6 +23,7 @@ class PinData {
   });
 
   final String id;
+  final String documentId;
   final int number;
   final int pageNumber;
   final double xRatio;
@@ -46,6 +48,7 @@ class PinData {
 
   PinData copyWith({
     String? id,
+    String? documentId,
     int? number,
     int? pageNumber,
     double? xRatio,
@@ -67,6 +70,7 @@ class PinData {
   }) {
     return PinData(
       id: id ?? this.id,
+      documentId: documentId ?? this.documentId,
       number: number ?? this.number,
       pageNumber: pageNumber ?? this.pageNumber,
       xRatio: xRatio ?? this.xRatio,

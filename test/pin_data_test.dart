@@ -5,6 +5,7 @@ void main() {
   test('ピンを移動しても写真・看板設定を保持する', () {
     const PinData original = PinData(
       id: 'pin-1',
+      documentId: '02_立面図',
       number: 1,
       pageNumber: 2,
       xRatio: 0.2,
@@ -24,6 +25,7 @@ void main() {
 
     expect(moved.xRatio, 0.75);
     expect(moved.yRatio, 0.8);
+    expect(moved.documentId, '02_立面図');
     expect(moved.photoCount, 4);
     expect(moved.opacity, 0.55);
     expect(moved.sizeScale, 0.5);

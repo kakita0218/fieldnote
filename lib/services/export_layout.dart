@@ -1,6 +1,19 @@
 import '../models/drawing_stroke.dart';
 import '../models/pin_data.dart';
 
+int nextPinNumberForDocument(
+  Iterable<PinData> pins,
+  String documentId,
+) {
+  int maximum = 0;
+  for (final PinData pin in pins) {
+    if (pin.documentId == documentId && pin.number > maximum) {
+      maximum = pin.number;
+    }
+  }
+  return maximum + 1;
+}
+
 List<PinData> pinsInExportOrder(Iterable<PinData> pins) {
   return List<PinData>.of(pins)
     ..sort((PinData first, PinData second) {
