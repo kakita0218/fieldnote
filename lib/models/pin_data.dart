@@ -8,6 +8,7 @@ class PinData {
     this.documentId = 'main',
     this.directionDegrees = 0,
     this.photoCount = 0,
+    this.name = '',
     this.note = '',
     this.colorValue = 0xFF1976D2,
     this.opacity = 1,
@@ -30,6 +31,7 @@ class PinData {
   final double yRatio;
   final double directionDegrees;
   final int photoCount;
+  final String name;
   final String note;
   final bool boardEnabled;
   final String boardTemplateId;
@@ -55,6 +57,7 @@ class PinData {
     double? yRatio,
     double? directionDegrees,
     int? photoCount,
+    String? name,
     String? note,
     int? colorValue,
     double? opacity,
@@ -77,6 +80,7 @@ class PinData {
       yRatio: yRatio ?? this.yRatio,
       directionDegrees: directionDegrees ?? this.directionDegrees,
       photoCount: photoCount ?? this.photoCount,
+      name: name ?? this.name,
       note: note ?? this.note,
       colorValue: colorValue ?? this.colorValue,
       opacity: opacity ?? this.opacity,

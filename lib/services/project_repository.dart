@@ -361,6 +361,7 @@ class ProjectRepository {
     required String pinId,
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
     required String fileName,
     required Uint8List bytes,
@@ -373,6 +374,7 @@ class ProjectRepository {
       pinId: pinId,
       documentId: documentId,
       pinNumber: pinNumber,
+      pinName: pinName,
       photoId: photoId,
       fileName: fileName,
       bytes: bytes,
@@ -398,6 +400,7 @@ class ProjectRepository {
         'pinId': pinId,
         'documentId': documentId,
         'pinNumber': pinNumber,
+        'pinName': pinName,
         'photoId': photoId,
         'fileName': storedFileName,
         'createdAt': DateTime.now().toIso8601String(),
@@ -443,6 +446,7 @@ class ProjectRepository {
     String documentId = 'main',
     required String photoId,
     required int pinNumber,
+    String pinName = '',
     required String fileName,
   }) async {
     final Uint8List? fileBytes = await ProjectFileStore.loadPhotoBytes(
@@ -450,6 +454,7 @@ class ProjectRepository {
       documentId: documentId,
       photoId: photoId,
       pinNumber: pinNumber,
+      pinName: pinName,
       fileName: fileName,
     );
     if (fileBytes != null && fileBytes.isNotEmpty) {
@@ -468,6 +473,7 @@ class ProjectRepository {
     required String projectId,
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
     required Uint8List bytes,
   }) async {
@@ -478,6 +484,7 @@ class ProjectRepository {
       projectId: projectId,
       documentId: documentId,
       pinNumber: pinNumber,
+      pinName: pinName,
       photoId: photoId,
       bytes: bytes,
     );
@@ -493,12 +500,14 @@ class ProjectRepository {
     required String projectId,
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
   }) async {
     final Uint8List? bytes = await ProjectFileStore.loadEditedPhotoBytes(
       projectId: projectId,
       documentId: documentId,
       pinNumber: pinNumber,
+      pinName: pinName,
       photoId: photoId,
     );
     if (bytes != null && bytes.isNotEmpty) return bytes;
@@ -512,12 +521,14 @@ class ProjectRepository {
     required String projectId,
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
   }) async {
     await ProjectFileStore.deleteEditedPhoto(
       projectId: projectId,
       documentId: documentId,
       pinNumber: pinNumber,
+      pinName: pinName,
       photoId: photoId,
     );
     try {

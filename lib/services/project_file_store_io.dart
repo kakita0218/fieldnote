@@ -64,6 +64,26 @@ class ProjectFileStore {
 
   static String _threeDigits(int value) => value.toString().padLeft(3, '0');
 
+  static String _pinPhotoFolderName(int pinNumber, String pinName) {
+    final String safeName = _safeName(pinName, fallback: '');
+    return safeName.isEmpty
+        ? _threeDigits(pinNumber)
+        : '${_threeDigits(pinNumber)} $safeName';
+  }
+
+  static String _photoFolderFromRecord(
+    Map<String, dynamic> record,
+    int pinNumber,
+  ) =>
+      record['folderName']?.toString() ??
+      _pinPhotoFolderName(
+        pinNumber,
+        record['pinName']?.toString() ?? '',
+      );
+
+  static bool _isPinPhotoFolderName(String value) =>
+      RegExp(r'^\d+(?:\s.*)?$').hasMatch(value);
+
   static String _photoEditToken(String photoId) =>
       base64Url.encode(utf8.encode(photoId)).replaceAll('=', '');
 
@@ -71,7 +91,9 @@ class ProjectFileStore {
     Directory projectDirectory, {
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
+    String extension = 'jpg',
   }) {
     final String documentPath = documentId == 'main'
         ? ''
@@ -79,9 +101,9 @@ class ProjectFileStore {
     return File(
       '${projectDirectory.path}${Platform.pathSeparator}$_photosDirectoryName'
       '$documentPath'
-      '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
+      '${Platform.pathSeparator}${_pinPhotoFolderName(pinNumber, pinName)}'
       '${Platform.pathSeparator}書き込み済み'
-      '${Platform.pathSeparator}${_photoEditToken(photoId)}.png',
+      '${Platform.pathSeparator}${_photoEditToken(photoId)}.$extension',
     );
   }
 
@@ -328,6 +350,7 @@ class ProjectFileStore {
           raw['id'].toString(): <String, dynamic>{
             'number': (raw['number'] as num).toInt(),
             'documentId': raw['documentId']?.toString() ?? 'main',
+            'name': raw['name']?.toString() ?? '',
           },
     };
     Future<void> recoverFrom(Directory root) async {
@@ -343,12 +366,13 @@ class ProjectFileStore {
         if (pin == null) continue;
         final int pinNumber = pin['number'] as int;
         final String documentId = pin['documentId'] as String;
+        final String pinName = pin['name'] as String;
         final String documentPath = documentId == 'main'
             ? ''
             : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}';
         final Directory destination = Directory(
           '${photos.path}$documentPath'
-          '${Platform.pathSeparator}${_threeDigits(pinNumber)}',
+          '${Platform.pathSeparator}${_pinPhotoFolderName(pinNumber, pinName)}',
         );
         await destination.parent.create(recursive: true);
         if (await destination.exists()) {
@@ -367,7 +391,7 @@ class ProjectFileStore {
         in photos.list(followLinks: false)) {
       if (entity is! Directory) continue;
       final String name = _entityName(entity);
-      if (int.tryParse(name) != null || name.startsWith('.')) continue;
+      if (_isPinPhotoFolderName(name) || name.startsWith('.')) continue;
       await recoverFrom(entity);
     }
   }
@@ -1024,6 +1048,11 @@ class ProjectFileStore {
           if (pin['id'] != null && pin['number'] is num)
             pin['id'].toString(): (pin['number'] as num).toInt(),
       };
+      final Map<String, String> pinNames = <String, String>{
+        for (final Map<String, dynamic> pin in pins)
+          if (pin['id'] != null)
+            pin['id'].toString(): pin['name']?.toString() ?? '',
+      };
       final List<Map<String, dynamic>> photoRecords = <Map<String, dynamic>>[];
       for (final Map<String, dynamic> rawPhoto in photos) {
         final dynamic rawBytes = rawPhoto['bytes'];
@@ -1041,7 +1070,7 @@ class ProjectFileStore {
         if (pinNumber == null) continue;
         final Directory photoDirectory = Directory(
           '${staging.path}${Platform.pathSeparator}$_photosDirectoryName'
-          '${Platform.pathSeparator}${_threeDigits(pinNumber)}',
+          '${Platform.pathSeparator}${_pinPhotoFolderName(pinNumber, pinNames[pinId] ?? '')}',
         );
         await photoDirectory.create(recursive: true);
         final String storedFileName = await _availablePhotoFileName(
@@ -1058,6 +1087,8 @@ class ProjectFileStore {
           'projectId': projectId,
           'pinId': pinId,
           'pinNumber': pinNumber,
+          'pinName': pinNames[pinId] ?? '',
+          'folderName': _pinPhotoFolderName(pinNumber, pinNames[pinId] ?? ''),
           'photoId': rawPhoto['photoId']?.toString() ??
               '$pinId-$storedFileName-$nonce',
           'fileName': storedFileName,
@@ -1161,6 +1192,7 @@ class ProjectFileStore {
           raw['id'].toString(): <String, dynamic>{
             'number': (raw['number'] as num).toInt(),
             'documentId': raw['documentId']?.toString() ?? 'main',
+            'name': raw['name']?.toString() ?? '',
           },
     };
     final Map<String, Map<String, dynamic>> newPinsById =
@@ -1170,6 +1202,7 @@ class ProjectFileStore {
           pin['id'].toString(): <String, dynamic>{
             'number': (pin['number'] as num).toInt(),
             'documentId': pin['documentId']?.toString() ?? 'main',
+            'name': pin['name']?.toString() ?? '',
           },
     };
 
@@ -1178,9 +1211,11 @@ class ProjectFileStore {
         in oldPins.entries) {
       final int oldNumber = entry.value['number'] as int;
       final String oldDocumentId = entry.value['documentId'] as String;
+      final String oldName = entry.value['name'] as String;
       final Map<String, dynamic>? newPin = newPinsById[entry.key];
       if (newPin?['number'] == oldNumber &&
-          newPin?['documentId'] == oldDocumentId) {
+          newPin?['documentId'] == oldDocumentId &&
+          newPin?['name'] == oldName) {
         continue;
       }
       final String documentPath = oldDocumentId == 'main'
@@ -1188,7 +1223,7 @@ class ProjectFileStore {
           : '${Platform.pathSeparator}${_safeName(oldDocumentId, fallback: 'document')}';
       final Directory current = Directory(
         '${photos.path}$documentPath'
-        '${Platform.pathSeparator}${_threeDigits(oldNumber)}',
+        '${Platform.pathSeparator}${_pinPhotoFolderName(oldNumber, oldName)}',
       );
       final Directory temporary = Directory(
         '${photos.path}$documentPath'
@@ -1220,6 +1255,7 @@ class ProjectFileStore {
           pin['id'].toString(): <String, dynamic>{
             'number': (pin['number'] as num).toInt(),
             'documentId': pin['documentId']?.toString() ?? 'main',
+            'name': pin['name']?.toString() ?? '',
           },
     };
     for (final MapEntry<String, Directory> entry in staged.entries) {
@@ -1230,12 +1266,13 @@ class ProjectFileStore {
       }
       final int number = pin['number'] as int;
       final String documentId = pin['documentId'] as String;
+      final String pinName = pin['name'] as String;
       final String documentPath = documentId == 'main'
           ? ''
           : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}';
       final Directory destination = Directory(
         '${photos.path}$documentPath'
-        '${Platform.pathSeparator}${_threeDigits(number)}',
+        '${Platform.pathSeparator}${_pinPhotoFolderName(number, pinName)}',
       );
       await destination.parent.create(recursive: true);
       if (await destination.exists()) {
@@ -1282,6 +1319,11 @@ class ProjectFileStore {
         if (pin['id'] != null)
           pin['id'].toString(): pin['documentId']?.toString() ?? 'main',
     };
+    final Map<String, String> newPinNames = <String, String>{
+      for (final Map<String, dynamic> pin in pins)
+        if (pin['id'] != null)
+          pin['id'].toString(): pin['name']?.toString() ?? '',
+    };
     final List<Map<String, dynamic>> reconciledPhotos = photos.map(
       (Map<String, dynamic> photo) {
         final String pinId = photo['pinId']?.toString() ?? '';
@@ -1289,6 +1331,12 @@ class ProjectFileStore {
         return <String, dynamic>{
           ...photo,
           if (newNumber != null) 'pinNumber': newNumber,
+          if (newNumber != null)
+            'folderName': _pinPhotoFolderName(
+              newNumber,
+              newPinNames[pinId] ?? '',
+            ),
+          if (newPinNames[pinId] != null) 'pinName': newPinNames[pinId],
           if (newPinDocuments[pinId] != null)
             'documentId': newPinDocuments[pinId],
         };
@@ -1347,6 +1395,7 @@ class ProjectFileStore {
     required String pinId,
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
     required String fileName,
     required Uint8List bytes,
@@ -1358,7 +1407,7 @@ class ProjectFileStore {
     final Directory photos = Directory(
       '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
       '${documentId == 'main' ? '' : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}'}'
-      '${Platform.pathSeparator}${_threeDigits(pinNumber)}',
+      '${Platform.pathSeparator}${_pinPhotoFolderName(pinNumber, pinName)}',
     );
     await photos.create(recursive: true);
     final String storedFileName = await _availablePhotoFileName(
@@ -1382,6 +1431,8 @@ class ProjectFileStore {
       'pinId': pinId,
       'documentId': documentId,
       'pinNumber': pinNumber,
+      'pinName': pinName,
+      'folderName': _pinPhotoFolderName(pinNumber, pinName),
       'photoId': photoId,
       'fileName': storedFileName,
       'createdAt': DateTime.now().toIso8601String(),
@@ -1423,7 +1474,12 @@ class ProjectFileStore {
       final String documentId = record['documentId']?.toString() ?? 'main';
       final String fileName = record['fileName']?.toString() ?? '';
       if (number != null && fileName.isNotEmpty) {
-        byFile['$documentId/${_threeDigits(number)}/$fileName'] = record;
+        final String folderName = record['folderName']?.toString() ??
+            _pinPhotoFolderName(
+              number,
+              record['pinName']?.toString() ?? '',
+            );
+        byFile['$documentId/$folderName/$fileName'] = record;
       }
     }
 
@@ -1448,7 +1504,10 @@ class ProjectFileStore {
         if (folder is! Directory) continue;
         final String folderName =
             folder.uri.pathSegments.where((String e) => e.isNotEmpty).last;
-        final int? pinNumber = int.tryParse(folderName);
+        final RegExpMatch? folderMatch =
+            RegExp(r'^(\d+)(?:\s.*)?$').firstMatch(folderName);
+        final int? pinNumber =
+            folderMatch == null ? null : int.tryParse(folderMatch.group(1)!);
         if (pinNumber == null) continue;
         final Set<String> seenPhotoPaths = <String>{};
         await for (final FileSystemEntity entity
@@ -1477,11 +1536,15 @@ class ProjectFileStore {
                 'documentId': documentId,
                 'pinId': pinIds[pinKey] ?? '',
                 'pinNumber': pinNumber,
+                'folderName': folderName,
                 'photoId': '${pinIds[pinKey] ?? pinNumber}::$fileName',
                 'fileName': fileName,
                 'createdAt': (await photo.stat()).modified.toIso8601String(),
               };
-          result.add(stored);
+          result.add(<String, dynamic>{
+            ...stored,
+            'folderName': folderName,
+          });
         }
       }
     }
@@ -1491,7 +1554,7 @@ class ProjectFileStore {
         in photos.list(followLinks: false)) {
       if (entity is! Directory) continue;
       final String name = _entityName(entity);
-      if (int.tryParse(name) != null || name.startsWith('.')) continue;
+      if (_isPinPhotoFolderName(name) || name.startsWith('.')) continue;
       await scanDocumentPhotos(entity, name);
     }
     final Set<String> includedPhotoIds = result
@@ -1551,6 +1614,7 @@ class ProjectFileStore {
     String documentId = 'main',
     required String photoId,
     required int pinNumber,
+    String pinName = '',
     required String fileName,
   }) async {
     final Directory? directory = await _findProjectDirectory(projectId);
@@ -1564,7 +1628,7 @@ class ProjectFileStore {
     final File file = File(
       '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
       '${documentId == 'main' ? '' : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}'}'
-      '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
+      '${Platform.pathSeparator}${_pinPhotoFolderName(pinNumber, pinName)}'
       '${Platform.pathSeparator}$fileName',
     );
     if (!await file.exists()) return null;
@@ -1575,6 +1639,7 @@ class ProjectFileStore {
     required String projectId,
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
     required Uint8List bytes,
   }) async {
@@ -1590,16 +1655,27 @@ class ProjectFileStore {
         directory,
         documentId: documentId,
         pinNumber: pinNumber,
+        pinName: pinName,
         photoId: photoId,
       ),
       bytes,
     );
+    final File legacy = _editedPhotoFile(
+      directory,
+      documentId: documentId,
+      pinNumber: pinNumber,
+      pinName: pinName,
+      photoId: photoId,
+      extension: 'png',
+    );
+    if (await legacy.exists()) await legacy.delete();
   }
 
   static Future<Uint8List?> loadEditedPhotoBytes({
     required String projectId,
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
   }) async {
     if (pinNumber < 1 || photoId.isEmpty) return null;
@@ -1609,31 +1685,46 @@ class ProjectFileStore {
       directory,
       documentId: documentId,
       pinNumber: pinNumber,
+      pinName: pinName,
       photoId: photoId,
     );
     await _recoverAtomicFile(file);
-    if (!await file.exists()) return null;
-    return file.readAsBytes();
+    if (await file.exists()) return file.readAsBytes();
+    final File legacy = _editedPhotoFile(
+      directory,
+      documentId: documentId,
+      pinNumber: pinNumber,
+      pinName: pinName,
+      photoId: photoId,
+      extension: 'png',
+    );
+    await _recoverAtomicFile(legacy);
+    return await legacy.exists() ? legacy.readAsBytes() : null;
   }
 
   static Future<void> deleteEditedPhoto({
     required String projectId,
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
   }) async {
     if (pinNumber < 1 || photoId.isEmpty) return;
     final Directory? directory = await _findProjectDirectory(projectId);
     if (directory == null) return;
-    final File file = _editedPhotoFile(
-      directory,
-      documentId: documentId,
-      pinNumber: pinNumber,
-      photoId: photoId,
-    );
-    if (await file.exists()) await file.delete();
-    final File backup = File('${file.path}.bak');
-    if (await backup.exists()) await backup.delete();
+    for (final String extension in <String>['jpg', 'png']) {
+      final File file = _editedPhotoFile(
+        directory,
+        documentId: documentId,
+        pinNumber: pinNumber,
+        pinName: pinName,
+        photoId: photoId,
+        extension: extension,
+      );
+      if (await file.exists()) await file.delete();
+      final File backup = File('${file.path}.bak');
+      if (await backup.exists()) await backup.delete();
+    }
   }
 
   /// Visits full-resolution photos one at a time after resolving the project
@@ -1667,7 +1758,7 @@ class ProjectFileStore {
       final File file = File(
         '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
         '${documentId == 'main' ? '' : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}'}'
-        '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
+        '${Platform.pathSeparator}${_photoFolderFromRecord(photo, pinNumber)}'
         '${Platform.pathSeparator}$fileName',
       );
       if (!await file.exists()) continue;
@@ -1695,7 +1786,7 @@ class ProjectFileStore {
       final File file = File(
         '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
         '${documentId == 'main' ? '' : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}'}'
-        '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
+        '${Platform.pathSeparator}${_photoFolderFromRecord(record, pinNumber)}'
         '${Platform.pathSeparator}${record['fileName']}',
       );
       final File readable = await file.exists()
@@ -1732,7 +1823,7 @@ class ProjectFileStore {
       final File file = File(
         '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
         '${documentId == 'main' ? '' : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}'}'
-        '${Platform.pathSeparator}${_threeDigits(pinNumber)}'
+        '${Platform.pathSeparator}${_photoFolderFromRecord(record, pinNumber)}'
         '${Platform.pathSeparator}${record['fileName']}',
       );
       if (await file.exists()) {
@@ -1784,6 +1875,8 @@ class ProjectFileStore {
     final String documentId = pin?['documentId']?.toString() ??
         photoRecord?['documentId']?.toString() ??
         'main';
+    final String pinName =
+        pin?['name']?.toString() ?? photoRecord?['pinName']?.toString() ?? '';
     final String documentPath = documentId == 'main'
         ? ''
         : '${Platform.pathSeparator}${_safeName(documentId, fallback: 'document')}';
@@ -1791,7 +1884,7 @@ class ProjectFileStore {
       final Directory photos = Directory(
         '${directory.path}${Platform.pathSeparator}$_photosDirectoryName'
         '$documentPath'
-        '${Platform.pathSeparator}${_threeDigits(number)}',
+        '${Platform.pathSeparator}${_pinPhotoFolderName(number, pinName)}',
       );
       if (await photos.exists()) await photos.delete(recursive: true);
     }

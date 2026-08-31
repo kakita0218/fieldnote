@@ -12,6 +12,7 @@ class PinSidePanel extends StatelessWidget {
     required this.noteController,
     required this.onClose,
     required this.onDelete,
+    required this.onNameChanged,
     required this.onNoteChanged,
     required this.onAddPhotos,
     required this.onShowAllPhotos,
@@ -25,6 +26,7 @@ class PinSidePanel extends StatelessWidget {
   final TextEditingController noteController;
   final VoidCallback onClose;
   final VoidCallback onDelete;
+  final ValueChanged<String> onNameChanged;
   final ValueChanged<String> onNoteChanged;
   final VoidCallback onAddPhotos;
   final VoidCallback onShowAllPhotos;
@@ -57,13 +59,34 @@ class PinSidePanel extends StatelessWidget {
             ),
             child: Row(
               children: [
+                Text(
+                  'ピン $pinNumber',
+                  style: const TextStyle(
+                    color: AppColors.textPrimary,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(width: 10),
                 Expanded(
-                  child: Text(
-                    'ピン $pinNumber',
-                    style: const TextStyle(
-                      color: AppColors.textPrimary,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w800,
+                  child: TextFormField(
+                    key: ValueKey<String>('pin-name-${pin.id}'),
+                    initialValue: pin.name,
+                    onChanged: onNameChanged,
+                    maxLength: 40,
+                    buildCounter: (
+                      BuildContext context, {
+                      required int currentLength,
+                      required bool isFocused,
+                      required int? maxLength,
+                    }) =>
+                        null,
+                    decoration: const InputDecoration(
+                      hintText: '名前',
+                      isDense: true,
+                      contentPadding:
+                          EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+                      border: OutlineInputBorder(),
                     ),
                   ),
                 ),

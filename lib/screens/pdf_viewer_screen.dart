@@ -264,6 +264,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   String? _selectedPinId;
   String? _selectedAnnotationId;
+  Set<String> _selectedAnnotationIds = <String>{};
+  Offset? _selectionDragStart;
+  Rect? _selectionRect;
   bool _suppressPinPanel = false;
   String? _pendingDirectionPinId;
   String? _captureAfterDirectionPinId;
@@ -494,6 +497,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _refreshNextPinNumber();
         _selectedPinId = null;
         _selectedAnnotationId = null;
+        _selectedAnnotationIds = <String>{};
+        _selectionDragStart = null;
+        _selectionRect = null;
         _suppressPinPanel = false;
         _pendingDirectionPinId = null;
         _captureAfterDirectionPinId = null;
@@ -554,7 +560,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         removedDraft = _discardEmptyTextDrafts(_currentPage);
       }
       _selectedTool = tool;
-      if (tool != FieldTool.select) _selectedAnnotationId = null;
+      if (tool != FieldTool.select) {
+        _selectedAnnotationId = null;
+        _selectedAnnotationIds = <String>{};
+        _selectionRect = null;
+      }
       if (tool != FieldTool.pin) {
         _pendingDirectionPinId = null;
         _captureAfterDirectionPinId = null;
@@ -590,6 +600,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (draftIds.contains(_selectedAnnotationId)) {
       _selectedAnnotationId = null;
     }
+    _selectedAnnotationIds.removeAll(draftIds);
     return true;
   }
 
@@ -1101,6 +1112,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       note: controller.text,
     );
     _scheduleSave();
+  }
+
+  void _updateSelectedPinName(String value) {
+    final String? selectedId = _selectedPinId;
+    if (selectedId == null) return;
+    final int index = _pins.indexWhere((PinData pin) => pin.id == selectedId);
+    if (index < 0 || _pins[index].name == value) return;
+    _discardPinRedoHistory();
+    setState(() => _pins[index] = _pins[index].copyWith(name: value));
+    _scheduleSave(pins: true, drawings: false, meta: true);
   }
 
   Future<void> _deleteSelectedPin() async {
@@ -1819,6 +1840,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           projectId: widget.projectId,
           documentId: pin.documentId,
           pinNumber: pin.number,
+          pinName: pin.name,
           photoId: photo.id,
         );
         if (edited == null || edited.isEmpty) continue;
@@ -1867,6 +1889,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           pinId: pin.id,
           documentId: pin.documentId,
           pinNumber: pin.number,
+          pinName: pin.name,
           photoId: photoId,
           fileName: fileName,
           bytes: bytes,
@@ -2028,6 +2051,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           projectId: widget.projectId,
           documentId: pin.documentId,
           pinNumber: pin.number,
+          pinName: pin.name,
           photos: photos,
           initialPhotoId: photo.id,
           annotations: <String, List<DrawingStroke>>{
@@ -2047,6 +2071,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   projectId: widget.projectId,
                   documentId: pin.documentId,
                   pinNumber: pin.number,
+                  pinName: pin.name,
                   photoId: photoId,
                 ),
               );
@@ -2056,6 +2081,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   projectId: widget.projectId,
                   documentId: pin.documentId,
                   pinNumber: pin.number,
+                  pinName: pin.name,
                   photoId: photoId,
                   bytes: renderedImage,
                 ),
@@ -2080,6 +2106,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   documentId: pin.documentId,
                   photoId: photoId,
                   pinNumber: pin.number,
+                  pinName: pin.name,
                   fileName: originalPhoto.fileName,
                 );
                 if (originalBytes != null && originalBytes.isNotEmpty) {
@@ -2341,6 +2368,23 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   String _threeDigits(int value) => value.toString().padLeft(3, '0');
+
+  String _pinPhotoFolderName(int number, String name) {
+    final String safeName = name
+        .trim()
+        .replaceAll(RegExp(r'[\\/:*?"<>|\u0000-\u001F]'), '_')
+        .replaceAll(RegExp(r'[. ]+$'), '');
+    return safeName.isEmpty
+        ? _threeDigits(number)
+        : '${_threeDigits(number)} $safeName';
+  }
+
+  bool _isPng(Uint8List bytes) =>
+      bytes.length >= 4 &&
+      bytes[0] == 0x89 &&
+      bytes[1] == 0x50 &&
+      bytes[2] == 0x4E &&
+      bytes[3] == 0x47;
 
   String _safeProjectFileName() {
     final String sanitized = _projectName
@@ -2908,7 +2952,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           final String documentFolder =
               documentsById[pin.documentId]?.folderName ?? '01_図面';
           final String folder =
-              '写真/$documentFolder/${_threeDigits(exportNumber)}/';
+              '写真/$documentFolder/${_pinPhotoFolderName(exportNumber, pin.name)}/';
           final String number = _threeDigits(photoCount);
           if (hasAnnotations) {
             zipEncoder.add(
@@ -2924,12 +2968,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
               projectId: widget.projectId,
               documentId: pin.documentId,
               pinNumber: pin.number,
+              pinName: pin.name,
               photoId: photoId,
             );
             if (edited != null && edited.isNotEmpty) {
+              final String editedExtension = _isPng(edited) ? 'png' : 'jpg';
               zipEncoder.add(
                 ArchiveFile.noCompress(
-                  '$folder${number}_書き込み済み.png',
+                  '$folder${number}_書き込み済み.$editedExtension',
                   edited.length,
                   edited,
                 ),
@@ -2955,7 +3001,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           zipEncoder.add(
             ArchiveFile.directory(
               '写真/$documentFolder/'
-              '${_threeDigits(exportNumbers[pin.id] ?? pin.number)}/',
+              '${_pinPhotoFolderName(exportNumbers[pin.id] ?? pin.number, pin.name)}/',
             ),
             autoClose: true,
           );
@@ -3071,6 +3117,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         'yRatio': pin.yRatio,
         'directionDegrees': pin.directionDegrees,
         'photoCount': pin.photoCount,
+        'name': pin.name,
         'note': pin.note,
         'colorValue': pin.colorValue,
         'opacity': pin.opacity,
@@ -3116,6 +3163,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       yRatio: (map['yRatio'] as num?)?.toDouble() ?? 0,
       directionDegrees: (map['directionDegrees'] as num?)?.toDouble() ?? 0,
       photoCount: (map['photoCount'] as num?)?.toInt() ?? 0,
+      name: map['name']?.toString() ?? '',
       note: map['note']?.toString() ?? '',
       colorValue: (map['colorValue'] as num?)?.toInt() ?? 0xFF1976D2,
       opacity: ((map['opacity'] as num?)?.toDouble() ?? 1).clamp(0.1, 1),
@@ -4204,7 +4252,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   Future<void> _handleCanvasTap(Offset position) async {
     if (_selectedTool == FieldTool.select) {
       final DrawingStroke? selected = _annotationAt(position);
-      setState(() => _selectedAnnotationId = selected?.id);
+      setState(() {
+        _selectedAnnotationId = selected?.id;
+        _selectedAnnotationIds =
+            selected == null ? <String>{} : <String>{selected.id};
+      });
       return;
     }
     if (_selectedTool == FieldTool.shape &&
@@ -4319,7 +4371,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   Future<void> _handleCanvasDoubleTap(Offset position) async {
     final DrawingStroke? hit = _annotationAt(position);
     if (hit?.kind != DrawingKind.text) return;
-    setState(() => _selectedAnnotationId = hit!.id);
+    setState(() {
+      _selectedAnnotationId = hit!.id;
+      _selectedAnnotationIds = <String>{hit.id};
+    });
     await _editSelectedText();
   }
 
@@ -4375,7 +4430,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     }
     _movingTextOriginal = hit;
     _movingTextGrabOffset = hit.points.first.position - position;
-    setState(() => _selectedAnnotationId = hit.id);
+    setState(() {
+      _selectedAnnotationId = hit.id;
+      _selectedAnnotationIds = <String>{hit.id};
+    });
     return true;
   }
 
@@ -4478,6 +4536,66 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     return null;
   }
 
+  Rect _rectFromNormalizedPoints(Offset first, Offset second) => Rect.fromLTRB(
+        math.min(first.dx, second.dx),
+        math.min(first.dy, second.dy),
+        math.max(first.dx, second.dx),
+        math.max(first.dy, second.dy),
+      );
+
+  void _startSelectionDrag(Offset position) {
+    if (_selectedTool != FieldTool.select) return;
+    setState(() {
+      _selectionDragStart = position;
+      _selectionRect = Rect.fromPoints(position, position);
+      _selectedAnnotationId = null;
+      _selectedAnnotationIds = <String>{};
+    });
+  }
+
+  void _updateSelectionDrag(Offset position) {
+    final Offset? start = _selectionDragStart;
+    if (start == null) return;
+    setState(() => _selectionRect = _rectFromNormalizedPoints(start, position));
+  }
+
+  void _finishSelectionDrag(Offset position) {
+    final Offset? start = _selectionDragStart;
+    if (start == null) return;
+    final Rect normalized = _rectFromNormalizedPoints(start, position);
+    final Size pageSize = Size(_pageAspectRatio * 1000, 1000);
+    final Rect pixelRect = Rect.fromLTRB(
+      normalized.left * pageSize.width,
+      normalized.top * pageSize.height,
+      normalized.right * pageSize.width,
+      normalized.bottom * pageSize.height,
+    );
+    final Set<String> selected = pixelRect.width < 3 || pixelRect.height < 3
+        ? <String>{}
+        : (_strokesByPage[_currentPage] ?? const <DrawingStroke>[])
+            .where(
+              (DrawingStroke stroke) =>
+                  stroke.points.isNotEmpty &&
+                  drawingStrokeBounds(stroke, pageSize).overlaps(pixelRect),
+            )
+            .map((DrawingStroke stroke) => stroke.id)
+            .toSet();
+    setState(() {
+      _selectionDragStart = null;
+      _selectionRect = null;
+      _selectedAnnotationIds = selected;
+      _selectedAnnotationId = selected.length == 1 ? selected.first : null;
+    });
+  }
+
+  void _cancelSelectionDrag() {
+    if (_selectionDragStart == null && _selectionRect == null) return;
+    setState(() {
+      _selectionDragStart = null;
+      _selectionRect = null;
+    });
+  }
+
   void _changeSelectedAnnotation({
     Color? color,
     double? width,
@@ -4522,23 +4640,26 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   void _deleteSelectedAnnotation() {
-    final DrawingStroke? selected = _selectedAnnotation;
     final List<DrawingStroke>? strokes = _strokesByPage[_currentPage];
-    final int index = strokes?.indexWhere(
-          (DrawingStroke stroke) => stroke.id == selected?.id,
-        ) ??
-        -1;
-    if (selected == null || strokes == null || index < 0) return;
+    final Set<String> ids = _selectedAnnotationIds.isNotEmpty
+        ? _selectedAnnotationIds
+        : <String>{if (_selectedAnnotationId != null) _selectedAnnotationId!};
+    if (strokes == null || ids.isEmpty) return;
+    final List<_IndexedDrawingStroke> removed = <_IndexedDrawingStroke>[
+      for (int index = 0; index < strokes.length; index++)
+        if (ids.contains(strokes[index].id))
+          _IndexedDrawingStroke(stroke: strokes[index], index: index),
+    ];
+    if (removed.isEmpty) return;
     setState(() {
-      strokes.removeAt(index);
+      strokes.removeWhere((DrawingStroke stroke) => ids.contains(stroke.id));
       _selectedAnnotationId = null;
+      _selectedAnnotationIds = <String>{};
       _undoDrawingEditsByPage
           .putIfAbsent(_currentPage, () => <_DrawingEdit>[])
           .add(
             _DrawingEdit(
-              removedStrokes: <_IndexedDrawingStroke>[
-                _IndexedDrawingStroke(stroke: selected, index: index),
-              ],
+              removedStrokes: removed,
               addedStrokes: const <_IndexedDrawingStroke>[],
             ),
           );
@@ -4548,9 +4669,44 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   Future<void> _showSelectionSettings() async {
-    if (_selectedAnnotation == null) {
+    if (_selectedAnnotationIds.isEmpty && _selectedAnnotation == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('変更する線・図形・テキストを選択してください。')),
+      );
+      return;
+    }
+    if (_selectedAnnotationIds.length > 1) {
+      await showModalBottomSheet<void>(
+        context: context,
+        backgroundColor: AppColors.panel,
+        builder: (BuildContext context) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                Text(
+                  '${_selectedAnnotationIds.length}件を選択中',
+                  style: const TextStyle(
+                    color: AppColors.textPrimary,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.pop(context);
+                    _deleteSelectedAnnotation();
+                  },
+                  icon: const Icon(Icons.delete_outline_rounded),
+                  label: const Text('選択した注釈を削除'),
+                ),
+              ],
+            ),
+          ),
+        ),
       );
       return;
     }
@@ -5454,6 +5610,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                                 noteController: _noteController!,
                                 onClose: _closePinPanel,
                                 onDelete: _deleteSelectedPin,
+                                onNameChanged: _updateSelectedPinName,
                                 onAddPhotos: _addPhotosToSelectedPin,
                                 onShowAllPhotos: _showAllPhotosForSelectedPin,
                                 onPhotoTap: (PhotoData photo) =>
@@ -5585,6 +5742,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   eraserRadiusNormalized:
                       (_eraserWidth / 1120).clamp(0.006, 0.08),
                   selectedStrokeId: _selectedAnnotationId,
+                  selectedStrokeIds: _selectedAnnotationIds,
+                  selectionRect: _selectionRect,
                   selectedPinId: _selectedPinId,
                   pendingDirectionPinId: _pendingDirectionPinId,
                   onAddPin: _addPin,
@@ -5611,6 +5770,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   onAnnotationTransformUpdate: _updateAnnotationTransform,
                   onAnnotationTransformEnd: _finishAnnotationTransform,
                   onAnnotationTransformCancel: _cancelAnnotationTransform,
+                  onSelectionDragStart: _startSelectionDrag,
+                  onSelectionDragUpdate: _updateSelectionDrag,
+                  onSelectionDragEnd: _finishSelectionDrag,
+                  onSelectionDragCancel: _cancelSelectionDrag,
                 ),
         ),
         if (imageBytes != null)

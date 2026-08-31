@@ -121,6 +121,7 @@ void paintDrawingStrokes(
   Iterable<DrawingStroke> strokes, {
   double widthScale = 1,
   String? selectedStrokeId,
+  Set<String> selectedStrokeIds = const <String>{},
 }) {
   for (final DrawingStroke stroke in strokes) {
     if (stroke.points.isEmpty) {
@@ -146,8 +147,9 @@ void paintDrawingStrokes(
 
     if (stroke.kind == DrawingKind.text) {
       final DrawingPoint anchor = stroke.points.first;
-      final bool showPlaceholder =
-          stroke.text.isEmpty && selectedStrokeId == stroke.id;
+      final bool showPlaceholder = stroke.text.isEmpty &&
+          (selectedStrokeId == stroke.id ||
+              selectedStrokeIds.contains(stroke.id));
       if (stroke.text.isNotEmpty || showPlaceholder) {
         final TextPainter painter = TextPainter(
           text: TextSpan(
@@ -254,7 +256,8 @@ void paintDrawingStrokes(
       canvas.restore();
     }
 
-    if (selectedStrokeId == stroke.id) {
+    if (selectedStrokeId == stroke.id ||
+        selectedStrokeIds.contains(stroke.id)) {
       _paintSelection(canvas, size, stroke);
     }
   }
@@ -328,16 +331,22 @@ class HandwritingLayer extends StatelessWidget {
     super.key,
     required this.strokes,
     this.selectedStrokeId,
+    this.selectedStrokeIds = const <String>{},
   });
 
   final List<DrawingStroke> strokes;
   final String? selectedStrokeId;
+  final Set<String> selectedStrokeIds;
 
   @override
   Widget build(BuildContext context) {
     return IgnorePointer(
       child: CustomPaint(
-        painter: _HandwritingPainter(strokes, selectedStrokeId),
+        painter: _HandwritingPainter(
+          strokes,
+          selectedStrokeId,
+          selectedStrokeIds,
+        ),
         size: Size.infinite,
       ),
     );
@@ -345,10 +354,15 @@ class HandwritingLayer extends StatelessWidget {
 }
 
 class _HandwritingPainter extends CustomPainter {
-  const _HandwritingPainter(this.strokes, this.selectedStrokeId);
+  const _HandwritingPainter(
+    this.strokes,
+    this.selectedStrokeId,
+    this.selectedStrokeIds,
+  );
 
   final List<DrawingStroke> strokes;
   final String? selectedStrokeId;
+  final Set<String> selectedStrokeIds;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -357,12 +371,14 @@ class _HandwritingPainter extends CustomPainter {
       size,
       strokes,
       selectedStrokeId: selectedStrokeId,
+      selectedStrokeIds: selectedStrokeIds,
     );
   }
 
   @override
   bool shouldRepaint(covariant _HandwritingPainter oldDelegate) {
     return oldDelegate.strokes != strokes ||
-        oldDelegate.selectedStrokeId != selectedStrokeId;
+        oldDelegate.selectedStrokeId != selectedStrokeId ||
+        oldDelegate.selectedStrokeIds != selectedStrokeIds;
   }
 }

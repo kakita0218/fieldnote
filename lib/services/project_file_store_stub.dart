@@ -63,6 +63,7 @@ class ProjectFileStore {
     required String pinId,
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
     required String fileName,
     required Uint8List bytes,
@@ -79,6 +80,7 @@ class ProjectFileStore {
     String documentId = 'main',
     required String photoId,
     required int pinNumber,
+    String pinName = '',
     required String fileName,
   }) async =>
       null;
@@ -87,6 +89,7 @@ class ProjectFileStore {
     required String projectId,
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
     required Uint8List bytes,
   }) async {}
@@ -95,6 +98,7 @@ class ProjectFileStore {
     required String projectId,
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
   }) async =>
       null;
@@ -103,6 +107,7 @@ class ProjectFileStore {
     required String projectId,
     String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
   }) async {}
 

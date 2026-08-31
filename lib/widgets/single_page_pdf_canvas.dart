@@ -26,6 +26,8 @@ class SinglePagePdfCanvas extends StatefulWidget {
     this.eraserEnabled = false,
     this.eraserRadiusNormalized = 0.025,
     this.selectedStrokeId,
+    this.selectedStrokeIds = const <String>{},
+    this.selectionRect,
     required this.selectedPinId,
     required this.pendingDirectionPinId,
     required this.onAddPin,
@@ -52,6 +54,10 @@ class SinglePagePdfCanvas extends StatefulWidget {
     this.onAnnotationTransformUpdate,
     this.onAnnotationTransformEnd,
     this.onAnnotationTransformCancel,
+    this.onSelectionDragStart,
+    this.onSelectionDragUpdate,
+    this.onSelectionDragEnd,
+    this.onSelectionDragCancel,
   });
 
   final Uint8List imageBytes;
@@ -67,6 +73,8 @@ class SinglePagePdfCanvas extends StatefulWidget {
   final bool eraserEnabled;
   final double eraserRadiusNormalized;
   final String? selectedStrokeId;
+  final Set<String> selectedStrokeIds;
+  final Rect? selectionRect;
   final String? selectedPinId;
   final String? pendingDirectionPinId;
   final ValueChanged<Offset> onAddPin;
@@ -94,6 +102,10 @@ class SinglePagePdfCanvas extends StatefulWidget {
   final ValueChanged<Offset>? onAnnotationTransformUpdate;
   final ValueChanged<Offset>? onAnnotationTransformEnd;
   final VoidCallback? onAnnotationTransformCancel;
+  final ValueChanged<Offset>? onSelectionDragStart;
+  final ValueChanged<Offset>? onSelectionDragUpdate;
+  final ValueChanged<Offset>? onSelectionDragEnd;
+  final VoidCallback? onSelectionDragCancel;
 
   @override
   State<SinglePagePdfCanvas> createState() => _SinglePagePdfCanvasState();
@@ -106,6 +118,7 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
   Offset? _eraserCursor;
   bool _movingAnnotation = false;
   bool _transformingAnnotation = false;
+  bool _draggingSelection = false;
   Offset? _lastAnnotationPosition;
 
   @override
@@ -118,6 +131,7 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
     if (!widget.selectionModeEnabled && !widget.textModeEnabled) {
       _movingAnnotation = false;
       _transformingAnnotation = false;
+      _draggingSelection = false;
       _lastAnnotationPosition = null;
     }
   }
@@ -343,49 +357,78 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                                   _transformingAnnotation = true;
                                   _lastAnnotationPosition = normalized;
                                 });
+                              } else if (widget.selectionModeEnabled &&
+                                  widget.onSelectionDragStart != null) {
+                                setState(() {
+                                  _draggingSelection = true;
+                                  _lastAnnotationPosition = normalized;
+                                });
+                                widget.onSelectionDragStart!(normalized);
                               }
                             }
                           : null,
-                  onPanUpdate:
-                      widget.selectionModeEnabled || widget.textModeEnabled
-                          ? (DragUpdateDetails details) {
-                              if (!_transformingAnnotation) return;
-                              final Offset normalized = _normalize(
-                                details.localPosition,
-                                pageWidth,
-                                pageHeight,
-                              );
-                              _lastAnnotationPosition = normalized;
-                              widget.onAnnotationTransformUpdate?.call(
-                                normalized,
-                              );
+                  onPanUpdate: widget.selectionModeEnabled ||
+                          widget.textModeEnabled
+                      ? (DragUpdateDetails details) {
+                          if (!_transformingAnnotation && !_draggingSelection) {
+                            return;
+                          }
+                          final Offset normalized = _normalize(
+                            details.localPosition,
+                            pageWidth,
+                            pageHeight,
+                          );
+                          _lastAnnotationPosition = normalized;
+                          if (_transformingAnnotation) {
+                            widget.onAnnotationTransformUpdate?.call(
+                              normalized,
+                            );
+                          } else {
+                            widget.onSelectionDragUpdate?.call(normalized);
+                          }
+                        }
+                      : null,
+                  onPanEnd: widget.selectionModeEnabled ||
+                          widget.textModeEnabled
+                      ? (DragEndDetails _) {
+                          if (!_transformingAnnotation && !_draggingSelection) {
+                            return;
+                          }
+                          final Offset? position = _lastAnnotationPosition;
+                          final bool wasTransforming = _transformingAnnotation;
+                          setState(() {
+                            _transformingAnnotation = false;
+                            _draggingSelection = false;
+                            _lastAnnotationPosition = null;
+                          });
+                          if (position != null) {
+                            if (wasTransforming) {
+                              widget.onAnnotationTransformEnd?.call(position);
+                            } else {
+                              widget.onSelectionDragEnd?.call(position);
                             }
-                          : null,
-                  onPanEnd:
-                      widget.selectionModeEnabled || widget.textModeEnabled
-                          ? (DragEndDetails _) {
-                              if (!_transformingAnnotation) return;
-                              final Offset? position = _lastAnnotationPosition;
-                              setState(() {
-                                _transformingAnnotation = false;
-                                _lastAnnotationPosition = null;
-                              });
-                              if (position != null) {
-                                widget.onAnnotationTransformEnd?.call(position);
-                              }
-                            }
-                          : null,
-                  onPanCancel:
-                      widget.selectionModeEnabled || widget.textModeEnabled
-                          ? () {
-                              if (!_transformingAnnotation) return;
-                              setState(() {
-                                _transformingAnnotation = false;
-                                _lastAnnotationPosition = null;
-                              });
-                              widget.onAnnotationTransformCancel?.call();
-                            }
-                          : null,
+                          }
+                        }
+                      : null,
+                  onPanCancel: widget.selectionModeEnabled ||
+                          widget.textModeEnabled
+                      ? () {
+                          if (!_transformingAnnotation && !_draggingSelection) {
+                            return;
+                          }
+                          final bool wasTransforming = _transformingAnnotation;
+                          setState(() {
+                            _transformingAnnotation = false;
+                            _draggingSelection = false;
+                            _lastAnnotationPosition = null;
+                          });
+                          if (wasTransforming) {
+                            widget.onAnnotationTransformCancel?.call();
+                          } else {
+                            widget.onSelectionDragCancel?.call();
+                          }
+                        }
+                      : null,
                   onLongPressStart:
                       widget.selectionModeEnabled || widget.textModeEnabled
                           ? (LongPressStartDetails details) {
@@ -494,8 +537,20 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
                         child: HandwritingLayer(
                           strokes: widget.strokes,
                           selectedStrokeId: widget.selectedStrokeId,
+                          selectedStrokeIds: widget.selectedStrokeIds,
                         ),
                       ),
+                      if (widget.selectionModeEnabled &&
+                          widget.selectionRect != null)
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: CustomPaint(
+                              painter: _SelectionRectPainter(
+                                widget.selectionRect!,
+                              ),
+                            ),
+                          ),
+                        ),
                       if (widget.eraserEnabled && _eraserCursor != null)
                         Positioned.fill(
                           child: IgnorePointer(
@@ -579,6 +634,37 @@ class _SinglePagePdfCanvasState extends State<SinglePagePdfCanvas> {
       },
     );
   }
+}
+
+class _SelectionRectPainter extends CustomPainter {
+  const _SelectionRectPainter(this.normalizedRect);
+
+  final Rect normalizedRect;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Rect rect = Rect.fromLTRB(
+      normalizedRect.left * size.width,
+      normalizedRect.top * size.height,
+      normalizedRect.right * size.width,
+      normalizedRect.bottom * size.height,
+    );
+    canvas.drawRect(
+      rect,
+      Paint()..color = const Color(0x2442A5F5),
+    );
+    canvas.drawRect(
+      rect,
+      Paint()
+        ..color = const Color(0xFF42A5F5)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.5,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _SelectionRectPainter oldDelegate) =>
+      oldDelegate.normalizedRect != normalizedRect;
 }
 
 class _EraserCursorPainter extends CustomPainter {

@@ -14,6 +14,7 @@ void main() {
       sizeScale: 0.5,
       showsDirection: false,
       photoCount: 4,
+      name: '西側外壁',
       boardEnabled: true,
       boardTemplateId: 'chipping',
       boardShootingLocation: 'J2F-2',
@@ -27,6 +28,7 @@ void main() {
     expect(moved.yRatio, 0.8);
     expect(moved.documentId, '02_立面図');
     expect(moved.photoCount, 4);
+    expect(moved.name, '西側外壁');
     expect(moved.opacity, 0.55);
     expect(moved.sizeScale, 0.5);
     expect(moved.showsDirection, isFalse);
