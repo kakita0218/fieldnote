@@ -150,6 +150,13 @@ class ProjectFileStore {
   }) async =>
       null;
 
+  static Future<String?> saveMobileExportPdf({
+    required String projectId,
+    required String fileName,
+    required Uint8List bytes,
+  }) async =>
+      null;
+
   static Future<String?> outputPdfPath(
     String projectId, {
     String documentId = 'main',

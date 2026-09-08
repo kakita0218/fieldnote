@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:path_provider/path_provider.dart';
 
 import '../models/project_summary.dart';
+import 'android_external_storage_service.dart';
 import 'native_project_service.dart';
 
 /// Stores the user-visible project as ordinary files in the app's Documents
@@ -180,17 +181,26 @@ class ProjectFileStore {
   }
 
   static Future<void> _writeJsonAtomically(
-    File target,
-    Map<String, dynamic> value,
-  ) =>
-      _writeBytesAtomically(
-        target,
-        Uint8List.fromList(
-          utf8.encode(
-            const JsonEncoder.withIndent('  ').convert(value),
-          ),
+      File target, Map<String, dynamic> value,
+      {bool syncExternal = true}) async {
+    await _writeBytesAtomically(
+      target,
+      Uint8List.fromList(
+        utf8.encode(
+          const JsonEncoder.withIndent('  ').convert(value),
         ),
+      ),
+    );
+    final String projectId = value['projectId']?.toString() ?? '';
+    if (syncExternal &&
+        projectId.isNotEmpty &&
+        !_isInternalProjectDirectory(target.parent)) {
+      await AndroidExternalStorageService.syncProject(
+        projectId: projectId,
+        localPath: target.parent.path,
       );
+    }
+  }
 
   static Future<void> _copyFileAtomically(File source, File target) async {
     await target.parent.create(recursive: true);
@@ -1363,7 +1373,7 @@ class ProjectFileStore {
       // Commit the new pin mapping before finalizing staged photo directories.
       // Recovery can then use whichever manifest survived a process stop to
       // roll the folders forward or back to a consistent numbering scheme.
-      await _writeJsonAtomically(target, manifest);
+      await _writeJsonAtomically(target, manifest, syncExternal: false);
     } catch (_) {
       await _recoverStagedPhotoDirectories(
         projectDirectory: directory,
@@ -1387,6 +1397,10 @@ class ProjectFileStore {
         await oldFile.exists()) {
       await oldFile.delete();
     }
+    await AndroidExternalStorageService.syncProject(
+      projectId: projectId,
+      localPath: directory.path,
+    );
   }
 
   static Future<String> savePhoto({
@@ -1971,10 +1985,15 @@ class ProjectFileStore {
         ? oldDirectory
         : await oldDirectory.rename(destination.path);
     _projectDirectories[projectId] = renamed;
+    await AndroidExternalStorageService.syncProject(
+      projectId: projectId,
+      localPath: renamed.path,
+    );
   }
 
   static Future<void> deleteProject(String projectId) async {
     final Directory? directory = await _findProjectDirectory(projectId);
+    await AndroidExternalStorageService.deleteProject(projectId);
     final Set<String> sourceDocumentIds = <String>{'main'};
     if (directory != null && await directory.exists()) {
       final Map<String, dynamic>? manifest = await _readManifest(directory);
@@ -2064,6 +2083,29 @@ class ProjectFileStore {
       }
     }
     return await source.exists() ? source.path : null;
+  }
+
+  static Future<String?> saveMobileExportPdf({
+    required String projectId,
+    required String fileName,
+    required Uint8List bytes,
+  }) async {
+    if (bytes.isEmpty) return null;
+    final Directory? directory = await _findProjectDirectory(projectId);
+    if (directory == null) return null;
+    final Directory exports = Directory(
+      '${directory.path}${Platform.pathSeparator}PDF書き出し',
+    );
+    final String safeFileName =
+        '${_safeName(fileName.replaceFirst(RegExp(r'\.pdf$', caseSensitive: false), ''), fallback: 'PDF書き出し')}.pdf';
+    final File target =
+        File('${exports.path}${Platform.pathSeparator}$safeFileName');
+    await _writeBytesAtomically(target, bytes);
+    await AndroidExternalStorageService.syncProject(
+      projectId: projectId,
+      localPath: directory.path,
+    );
+    return target.path;
   }
 
   static Future<bool> hasProject(String projectId) async =>

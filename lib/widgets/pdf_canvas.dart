@@ -28,8 +28,7 @@ class PdfCanvas extends StatelessWidget {
   final bool pinMode;
   final ValueChanged<Offset> onAddPin;
   final ValueChanged<PinData> onSelectPin;
-  final void Function(PinData pin, double directionDegrees)
-      onDirectionChanged;
+  final void Function(PinData pin, double directionDegrees) onDirectionChanged;
   final void Function(PdfDocument document) onDocumentLoaded;
   final ValueChanged<int> onPageChanged;
 

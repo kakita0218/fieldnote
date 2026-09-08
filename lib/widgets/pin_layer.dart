@@ -28,8 +28,7 @@ class PinLayer extends StatelessWidget {
   final String? pendingDirectionPinId;
   final ValueChanged<Offset> onAddPin;
   final ValueChanged<PinData> onPinTap;
-  final void Function(PinData pin, double directionDegrees)
-      onDirectionChanged;
+  final void Function(PinData pin, double directionDegrees) onDirectionChanged;
 
   double _directionFromPoints(Offset from, Offset to) {
     final Offset vector = to - from;

@@ -147,12 +147,14 @@ class PdfViewerScreen extends StatefulWidget {
     required this.projectName,
     this.isNewProject = false,
     this.exportOnOpen = false,
+    this.simplifiedMobile = false,
   });
 
   final String projectId;
   final String projectName;
   final bool isNewProject;
   final bool exportOnOpen;
+  final bool simplifiedMobile;
 
   @override
   State<PdfViewerScreen> createState() => _PdfViewerScreenState();
@@ -273,6 +275,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   TextEditingController? _noteController;
 
   String get _activeDocumentId => _currentDocumentId ?? 'main';
+
+  ProjectPdfDocument? get _activeDocument {
+    for (final ProjectPdfDocument document in _documents) {
+      if (document.id == _activeDocumentId) return document;
+    }
+    return _documents.isEmpty ? null : _documents.first;
+  }
 
   Map<int, List<DrawingStroke>> get _strokesByPage =>
       _strokesByDocumentPage.putIfAbsent(
@@ -466,7 +475,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _currentPage = 1;
         _pageCount = nextDocument.pagesCount;
 
-        _selectedTool = null;
+        _selectedTool = widget.simplifiedMobile ? FieldTool.pin : null;
 
         if (!append) {
           _pins.clear();
@@ -534,6 +543,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   void _selectTool(FieldTool tool) {
+    if (widget.simplifiedMobile && tool != FieldTool.pin) return;
     _endStroke();
 
     if (_selectedTool == tool) {
@@ -1666,6 +1676,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       MaterialPageRoute<void>(
         fullscreenDialog: true,
         builder: (_) => CameraCaptureScreen(
+          simplifiedMobile: widget.simplifiedMobile,
           pinNumber: currentPin.number,
           initialPhotoCount: currentPin.photoCount,
           initialPhotos: _photosForPin(currentPin.id),
@@ -1680,7 +1691,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
               (PhotoData photo) => photo.id == photoId,
             );
             if (index >= 0) {
-              _openPhotoEditor(currentPin, photos[index]);
+              if (widget.simplifiedMobile) {
+                _openPhotoReadOnly(currentPin, photos[index]);
+              } else {
+                _openPhotoEditor(currentPin, photos[index]);
+              }
             }
           },
         ),
@@ -2007,7 +2022,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                       return InkWell(
                         onTap: () {
                           Navigator.of(context).pop();
-                          _openPhotoEditor(pin, photo);
+                          if (widget.simplifiedMobile) {
+                            _openPhotoReadOnly(pin, photo);
+                          } else {
+                            _openPhotoEditor(pin, photo);
+                          }
                         },
                         borderRadius: BorderRadius.circular(10),
                         child: ClipRRect(
@@ -2141,6 +2160,42 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             });
             _scheduleSave(pins: false, drawings: false, meta: true);
           },
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openPhotoReadOnly(PinData pin, PhotoData photo) async {
+    final Uint8List? bytes = await ProjectRepository.loadPhotoBytes(
+      projectId: widget.projectId,
+      documentId: pin.documentId,
+      photoId: photo.id,
+      pinNumber: pin.number,
+      pinName: pin.name,
+      fileName: photo.fileName,
+    );
+    if (!mounted) return;
+    if (bytes == null || bytes.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('写真を読み込めませんでした。')),
+      );
+      return;
+    }
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (BuildContext context) => Scaffold(
+          backgroundColor: Colors.black,
+          appBar: AppBar(
+            backgroundColor: Colors.black,
+            title: Text('ピン ${pin.number} ${pin.name}'.trim()),
+          ),
+          body: Center(
+            child: InteractiveViewer(
+              minScale: 0.5,
+              maxScale: 8,
+              child: Image.memory(bytes),
+            ),
+          ),
         ),
       ),
     );
@@ -3039,6 +3094,132 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     }
   }
 
+  Future<void> _exportPinsOnlyMobile() async {
+    if (_pdfDocument == null || _isExporting) return;
+    if (_pins.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('書き出すピンがありません。')),
+      );
+      return;
+    }
+    final Set<_ExportContent> contents = <_ExportContent>{_ExportContent.pins};
+    final _ExportPageMode? pageMode = await _chooseExportPageMode(contents);
+    if (pageMode == null || !mounted) return;
+    _saveSelectedPinNote();
+    setState(() {
+      _isExporting = true;
+      _errorMessage = null;
+    });
+    int exportedCount = 0;
+    try {
+      _saveDebounce?.cancel();
+      await _enqueueSave();
+      final List<PinData> orderedPins = _documents
+          .expand(
+            (ProjectPdfDocument document) => pinsInExportOrder(
+              _pins.where(
+                (PinData pin) => pin.documentId == document.id,
+              ),
+            ),
+          )
+          .toList(growable: false);
+      final Map<String, int> exportNumbers = <String, int>{};
+      for (final ProjectPdfDocument document in _documents) {
+        exportNumbers.addAll(
+          buildExportPinNumbers(
+            orderedPins.where(
+              (PinData pin) => pin.documentId == document.id,
+            ),
+          ),
+        );
+      }
+      final List<PinData> exportPins = orderedPins
+          .map(
+            (PinData pin) => pin.copyWith(number: exportNumbers[pin.id]),
+          )
+          .toList(growable: false);
+
+      for (final ProjectPdfDocument document in _documents) {
+        final List<PinData> documentPins = exportPins
+            .where((PinData pin) => pin.documentId == document.id)
+            .toList(growable: false);
+        if (documentPins.isEmpty) continue;
+        final List<int> pageNumbers = pageMode == _ExportPageMode.allPages
+            ? <int>[
+                for (int page = 1; page <= document.pageCount; page++) page,
+              ]
+            : (_annotatedPagesForContents(
+                contents,
+                documentId: document.id,
+              ).toList()
+              ..sort());
+        if (pageNumbers.isEmpty) continue;
+
+        final Uint8List exportedPdf;
+        if (NativeProjectService.isAvailable) {
+          final String? sourcePath = await ProjectRepository.sourcePdfPath(
+            widget.projectId,
+            documentId: document.id,
+          );
+          if (sourcePath == null) {
+            throw StateError('${document.name}の元PDFが見つかりません。');
+          }
+          exportedPdf = await NativeProjectService.buildExportPdf(
+            sourcePath: sourcePath,
+            pins: documentPins.map(_serializePin).toList(growable: false),
+            strokes: const <Map<String, dynamic>>[],
+            pageNumbers: pageNumbers,
+          );
+        } else {
+          final Uint8List? sourceBytes =
+              await ProjectRepository.loadPdfDocument(
+            projectId: widget.projectId,
+            documentId: document.id,
+          );
+          if (sourceBytes == null || sourceBytes.isEmpty) {
+            throw StateError('${document.name}の元PDFが見つかりません。');
+          }
+          final pdfx.PdfDocument sourceDocument =
+              await pdfx.PdfDocument.openData(sourceBytes);
+          try {
+            exportedPdf = await _buildAnnotatedPdf(
+              document: sourceDocument,
+              strokesByPage: const <int, List<DrawingStroke>>{},
+              pageNumbers: pageNumbers,
+              pins: documentPins,
+              includeDrawings: false,
+            );
+          } finally {
+            await sourceDocument.close();
+          }
+        }
+        await ProjectRepository.saveMobileExportPdf(
+          projectId: widget.projectId,
+          fileName: '${document.folderName}_ピン付き.pdf',
+          bytes: exportedPdf,
+        );
+        exportedCount++;
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            exportedCount == 0
+                ? '書き出し対象のPDFがありません。'
+                : 'ピン付きPDFを$exportedCount件書き出しました。',
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('ピン付きPDFを書き出せませんでした。\n$error')),
+      );
+    } finally {
+      if (mounted) setState(() => _isExporting = false);
+    }
+  }
+
   void _scheduleSave({
     bool pins = true,
     bool drawings = true,
@@ -3643,7 +3824,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _boardBusinessName =
             data['boardBusinessName']?.toString() ?? _projectName;
         _boardFacilityName = data['boardFacilityName']?.toString() ?? '';
-        _selectedTool = null;
+        _selectedTool = widget.simplifiedMobile ? FieldTool.pin : null;
         _penWidth = (data['penWidth'] as num?)?.toDouble() ?? 3;
         _penOpacity =
             ((data['penOpacity'] as num?)?.toDouble() ?? 1).clamp(0.1, 1);
@@ -5399,6 +5580,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   @override
   Widget build(BuildContext context) {
     final PinData? selectedPin = _selectedPin;
+    final bool mobile = widget.simplifiedMobile;
+    final ProjectPdfDocument? activeDocument = _activeDocument;
 
     return PopScope<void>(
       canPop: _allowPop,
@@ -5418,48 +5601,74 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           backgroundColor: AppColors.panel,
           foregroundColor: AppColors.textPrimary,
           titleSpacing: 8,
-          title: Row(
-            children: <Widget>[
-              Expanded(
-                child: Text(
-                  _projectName,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontWeight: FontWeight.w700),
-                ),
-              ),
-              if (_documents.isNotEmpty)
-                ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 260),
-                  child: DropdownButtonHideUnderline(
-                    child: DropdownButton<String>(
-                      value: _activeDocumentId,
-                      isExpanded: true,
-                      items: _documents
-                          .map(
-                            (ProjectPdfDocument document) =>
-                                DropdownMenuItem<String>(
-                              value: document.id,
-                              child: Text(
-                                document.name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                          )
-                          .toList(growable: false),
-                      onChanged: _isPickingFile
-                          ? null
-                          : (String? value) {
-                              if (value != null) {
-                                unawaited(_switchDocument(value));
-                              }
-                            },
+          title: mobile
+              ? Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Text(
+                      _projectName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
-                  ),
+                    if (activeDocument != null)
+                      Text(
+                        activeDocument.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: AppColors.textSecondary,
+                        ),
+                      ),
+                  ],
+                )
+              : Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: Text(
+                        _projectName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    if (_documents.isNotEmpty)
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 260),
+                        child: DropdownButtonHideUnderline(
+                          child: DropdownButton<String>(
+                            value: _activeDocumentId,
+                            isExpanded: true,
+                            items: _documents
+                                .map(
+                                  (ProjectPdfDocument document) =>
+                                      DropdownMenuItem<String>(
+                                    value: document.id,
+                                    child: Text(
+                                      document.name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                )
+                                .toList(growable: false),
+                            onChanged: _isPickingFile
+                                ? null
+                                : (String? value) {
+                                    if (value != null) {
+                                      unawaited(_switchDocument(value));
+                                    }
+                                  },
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
-            ],
-          ),
           actions: [
             if (_pdfDocument != null)
               IconButton(
@@ -5467,7 +5676,24 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                 onPressed: _isPickingFile ? null : () => _pickPdf(append: true),
                 icon: const Icon(Icons.note_add_rounded),
               ),
-            if (_pdfDocument != null)
+            if (mobile && _documents.length > 1)
+              PopupMenuButton<String>(
+                tooltip: 'PDFを切り替え',
+                icon: const Icon(Icons.picture_as_pdf_rounded),
+                initialValue: _activeDocumentId,
+                onSelected: (String documentId) {
+                  unawaited(_switchDocument(documentId));
+                },
+                itemBuilder: (BuildContext context) => _documents
+                    .map(
+                      (ProjectPdfDocument document) => PopupMenuItem<String>(
+                        value: document.id,
+                        child: Text(document.name),
+                      ),
+                    )
+                    .toList(growable: false),
+              ),
+            if (_pdfDocument != null && !mobile)
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 8),
                 child: Center(
@@ -5525,7 +5751,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                 onPressed: _isRenderingPage ? null : _showPageList,
                 icon: const Icon(Icons.grid_view_rounded),
               ),
-            if (_pdfDocument != null)
+            if (_pdfDocument != null && !mobile)
               Center(
                 child: Container(
                   margin: const EdgeInsets.only(right: 8),
@@ -5570,7 +5796,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   ),
                 ),
               ),
-            const SizedBox(width: 6),
+            if (!mobile) const SizedBox(width: 6),
           ],
         ),
         body: AbsorbPointer(
@@ -5587,43 +5813,81 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                         left: 0,
                         bottom: 0,
                         right:
-                            selectedPin != null && !_suppressPinPanel ? 320 : 0,
+                            !mobile && selectedPin != null && !_suppressPinPanel
+                                ? 320
+                                : 0,
                         child: _buildDrawingArea(),
                       ),
-                      AnimatedPositioned(
-                        duration: const Duration(
-                          milliseconds: 220,
+                      if (!mobile)
+                        AnimatedPositioned(
+                          duration: const Duration(
+                            milliseconds: 220,
+                          ),
+                          curve: Curves.easeOut,
+                          top: 0,
+                          right: selectedPin == null || _suppressPinPanel
+                              ? -320
+                              : 0,
+                          bottom: 0,
+                          width: 320,
+                          child: selectedPin == null ||
+                                  _suppressPinPanel ||
+                                  _noteController == null
+                              ? const SizedBox.shrink()
+                              : PinSidePanel(
+                                  pin: selectedPin,
+                                  photos: _photosForPin(selectedPin.id),
+                                  noteController: _noteController!,
+                                  onClose: _closePinPanel,
+                                  onDelete: _deleteSelectedPin,
+                                  onNameChanged: _updateSelectedPinName,
+                                  onAddPhotos: _addPhotosToSelectedPin,
+                                  onShowAllPhotos: _showAllPhotosForSelectedPin,
+                                  onPhotoTap: (PhotoData photo) =>
+                                      _openPhotoEditor(selectedPin, photo),
+                                  directionEditing:
+                                      _pendingDirectionPinId == selectedPin.id,
+                                  onChangeDirection:
+                                      _toggleSelectedPinDirectionEditing,
+                                  onNoteChanged: (_) {
+                                    _saveSelectedPinNote();
+                                  },
+                                ),
                         ),
-                        curve: Curves.easeOut,
-                        top: 0,
-                        right:
-                            selectedPin == null || _suppressPinPanel ? -320 : 0,
-                        bottom: 0,
-                        width: 320,
-                        child: selectedPin == null ||
-                                _suppressPinPanel ||
-                                _noteController == null
-                            ? const SizedBox.shrink()
-                            : PinSidePanel(
-                                pin: selectedPin,
-                                photos: _photosForPin(selectedPin.id),
-                                noteController: _noteController!,
-                                onClose: _closePinPanel,
-                                onDelete: _deleteSelectedPin,
-                                onNameChanged: _updateSelectedPinName,
-                                onAddPhotos: _addPhotosToSelectedPin,
-                                onShowAllPhotos: _showAllPhotosForSelectedPin,
-                                onPhotoTap: (PhotoData photo) =>
-                                    _openPhotoEditor(selectedPin, photo),
-                                directionEditing:
-                                    _pendingDirectionPinId == selectedPin.id,
-                                onChangeDirection:
-                                    _toggleSelectedPinDirectionEditing,
-                                onNoteChanged: (_) {
-                                  _saveSelectedPinNote();
-                                },
-                              ),
-                      ),
+                      if (mobile &&
+                          selectedPin != null &&
+                          !_suppressPinPanel &&
+                          _noteController != null)
+                        Positioned(
+                          left: 8,
+                          right: 8,
+                          bottom: 8,
+                          height: MediaQuery.sizeOf(context).height * 0.52,
+                          child: Material(
+                            elevation: 20,
+                            borderRadius: BorderRadius.circular(16),
+                            clipBehavior: Clip.antiAlias,
+                            child: PinSidePanel(
+                              pin: selectedPin,
+                              photos: _photosForPin(selectedPin.id),
+                              noteController: _noteController!,
+                              onClose: _closePinPanel,
+                              onDelete: _deleteSelectedPin,
+                              onNameChanged: _updateSelectedPinName,
+                              onAddPhotos: _addPhotosToSelectedPin,
+                              onShowAllPhotos: _showAllPhotosForSelectedPin,
+                              onPhotoTap: (PhotoData photo) =>
+                                  _openPhotoReadOnly(selectedPin, photo),
+                              directionEditing:
+                                  _pendingDirectionPinId == selectedPin.id,
+                              onChangeDirection:
+                                  _toggleSelectedPinDirectionEditing,
+                              onNoteChanged: (_) {
+                                _saveSelectedPinNote();
+                              },
+                            ),
+                          ),
+                        ),
                     ],
                   ),
           ),
@@ -5978,6 +6242,79 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   Widget _buildBottomToolbar() {
     final bool pageInteractionAvailable =
         _pageImageBytes != null && !_isRenderingPage;
+    if (widget.simplifiedMobile) {
+      return Material(
+        color: AppColors.panel,
+        elevation: 12,
+        child: SafeArea(
+          top: false,
+          child: SizedBox(
+            height: 72,
+            child: Row(
+              children: <Widget>[
+                Expanded(
+                  child: _ToolbarButton(
+                    icon: Icons.chevron_left_rounded,
+                    label: '前へ',
+                    selected: null,
+                    enabled: pageInteractionAvailable && _currentPage > 1,
+                    onPressed: () => _goToPage(_currentPage - 1),
+                  ),
+                ),
+                Expanded(
+                  child: _ToolbarButton(
+                    icon: Icons.location_on_rounded,
+                    iconColor: _pinColor,
+                    label: 'ピン',
+                    selected: _selectedTool == FieldTool.pin,
+                    enabled: pageInteractionAvailable,
+                    onPressed: () => _selectTool(FieldTool.pin),
+                  ),
+                ),
+                Expanded(
+                  child: _ToolbarButton(
+                    icon: Icons.undo_rounded,
+                    label: '戻す',
+                    selected: null,
+                    enabled: pageInteractionAvailable && _canUndoCurrentTool,
+                    onPressed: _undo,
+                  ),
+                ),
+                Expanded(
+                  child: _ToolbarButton(
+                    icon: Icons.redo_rounded,
+                    label: 'やり直す',
+                    selected: null,
+                    enabled: pageInteractionAvailable && _canRedoCurrentTool,
+                    onPressed: _redo,
+                  ),
+                ),
+                Expanded(
+                  child: _ToolbarButton(
+                    icon: Icons.chevron_right_rounded,
+                    label: '次へ',
+                    selected: null,
+                    enabled: pageInteractionAvailable &&
+                        _pageCount > 0 &&
+                        _currentPage < _pageCount,
+                    onPressed: () => _goToPage(_currentPage + 1),
+                  ),
+                ),
+                Expanded(
+                  child: _ToolbarButton(
+                    icon: Icons.picture_as_pdf_rounded,
+                    label: _isExporting ? '作成中' : 'PDF出力',
+                    selected: null,
+                    enabled: !_isExporting,
+                    onPressed: _exportPinsOnlyMobile,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
     return Material(
       color: AppColors.panel,
       elevation: 12,

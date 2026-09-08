@@ -1166,6 +1166,17 @@ class ProjectRepository {
   }) =>
       ProjectFileStore.sourcePdfPath(projectId, documentId: documentId);
 
+  static Future<String?> saveMobileExportPdf({
+    required String projectId,
+    required String fileName,
+    required Uint8List bytes,
+  }) =>
+      ProjectFileStore.saveMobileExportPdf(
+        projectId: projectId,
+        fileName: fileName,
+        bytes: bytes,
+      );
+
   static Future<String?> outputPdfPath(
     String projectId, {
     String documentId = 'main',
