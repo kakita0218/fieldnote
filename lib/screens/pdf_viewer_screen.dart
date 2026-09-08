@@ -24,6 +24,7 @@ import '../widgets/single_page_pdf_canvas.dart';
 import '../widgets/pin_side_panel.dart';
 import '../widgets/touch_interactive_viewer.dart';
 import '../services/native_project_service.dart';
+import '../services/pdf_page_compression.dart';
 import '../services/drawing_serialization.dart';
 import '../services/export_layout.dart';
 import '../services/project_export_zip_sink.dart';
@@ -2616,7 +2617,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       if (pngData == null) {
         throw StateError('$pageNumberページ目の出力画像を作成できませんでした。');
       }
-      return pngData.buffer.asUint8List();
+      return compute<Uint8List, Uint8List>(
+        encodePdfPageForEmbedding,
+        pngData.buffer.asUint8List(),
+      );
     } finally {
       output?.dispose();
       background?.dispose();
@@ -2633,19 +2637,19 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }) async {
     final pw.Document outputPdf = pw.Document();
     for (final int pageNumber in pageNumbers) {
-      final Uint8List pagePng = await _buildAnnotatedPageImage(
+      final Uint8List pageImageBytes = await _buildAnnotatedPageImage(
         pageNumber,
         document: document,
         strokesByPage: strokesByPage,
         pins: pins,
         includeDrawings: includeDrawings,
       );
-      final ui.Image decoded = await _decodeUiImage(pagePng);
+      final ui.Image decoded = await _decodeUiImage(pageImageBytes);
       final double aspectRatio = decoded.width / decoded.height;
       decoded.dispose();
       const double pdfWidth = 595.28;
       final double pdfHeight = pdfWidth / aspectRatio;
-      final pw.MemoryImage pageImage = pw.MemoryImage(pagePng);
+      final pw.MemoryImage pageImage = pw.MemoryImage(pageImageBytes);
       outputPdf.addPage(
         pw.Page(
           pageFormat: pdf.PdfPageFormat(pdfWidth, pdfHeight, marginAll: 0),
