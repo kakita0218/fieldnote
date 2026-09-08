@@ -7,6 +7,7 @@ void main() {
   test('図形・文字・ペン種別・透過率を保存して復元できる', () {
     const DrawingStroke original = DrawingStroke(
       id: 'text-1',
+      documentId: '02_立面図',
       pageNumber: 3,
       points: <DrawingPoint>[
         DrawingPoint(position: Offset(0.25, 0.4), pressure: 0.8),
@@ -25,6 +26,7 @@ void main() {
         deserializeDrawingStroke(serializeDrawingStroke(original))!;
 
     expect(restored.id, original.id);
+    expect(restored.documentId, '02_立面図');
     expect(restored.pageNumber, original.pageNumber);
     expect(restored.kind, DrawingKind.text);
     expect(restored.brush, DrawingBrush.highlighter);
@@ -50,6 +52,7 @@ void main() {
     expect(restored.kind, DrawingKind.freehand);
     expect(restored.brush, DrawingBrush.fountain);
     expect(restored.opacity, 1);
+    expect(restored.documentId, 'main');
     expect(restored.textBoxWidthRatio, 0.45);
   });
 

@@ -14,6 +14,7 @@ import '../services/native_project_service.dart';
 class CameraCaptureScreen extends StatefulWidget {
   const CameraCaptureScreen({
     super.key,
+    this.simplifiedMobile = false,
     required this.pinNumber,
     required this.initialPhotoCount,
     required this.initialPhotos,
@@ -22,6 +23,8 @@ class CameraCaptureScreen extends StatefulWidget {
     required this.onCaptured,
     required this.onPhotoTap,
   });
+
+  final bool simplifiedMobile;
 
   final int pinNumber;
   final int initialPhotoCount;
@@ -1235,8 +1238,10 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen>
               : const Icon(Icons.arrow_back_rounded, size: 30),
         ),
         const Spacer(),
-        _buildBoardSelector(),
-        const SizedBox(width: 12),
+        if (!widget.simplifiedMobile) ...<Widget>[
+          _buildBoardSelector(),
+          const SizedBox(width: 12),
+        ],
         if (_flashAvailable) ...[
           _buildFlashSelector(),
           const SizedBox(width: 12),

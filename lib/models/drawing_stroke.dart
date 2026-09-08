@@ -44,6 +44,7 @@ class DrawingStroke {
     required this.id,
     required this.pageNumber,
     required this.points,
+    this.documentId = 'main',
     this.width = 3.0,
     this.color = const Color(0xFFE53935),
     this.opacity = 1,
@@ -56,6 +57,7 @@ class DrawingStroke {
   });
 
   final String id;
+  final String documentId;
   final int pageNumber;
   final List<DrawingPoint> points;
   final double width;
@@ -69,6 +71,7 @@ class DrawingStroke {
   final double rotationDegrees;
 
   DrawingStroke copyWith({
+    String? documentId,
     List<DrawingPoint>? points,
     double? width,
     Color? color,
@@ -82,6 +85,7 @@ class DrawingStroke {
   }) {
     return DrawingStroke(
       id: id,
+      documentId: documentId ?? this.documentId,
       pageNumber: pageNumber,
       points: points ?? this.points,
       width: width ?? this.width,

@@ -12,6 +12,32 @@ PinData _pin(String id, int number, int page) => PinData(
     );
 
 void main() {
+  test('ピン番号はPDFごとの既存最大番号から続け、欠番は詰めない', () {
+    final List<PinData> pins = <PinData>[
+      _pin('a-1', 1, 1).copyWith(documentId: 'pdf-a'),
+      _pin('a-2', 2, 1).copyWith(documentId: 'pdf-a'),
+      _pin('a-3', 3, 1).copyWith(documentId: 'pdf-a'),
+      _pin('b-1', 1, 1).copyWith(documentId: 'pdf-b'),
+    ];
+
+    expect(nextPinNumberForDocument(pins, 'pdf-a'), 4);
+    expect(
+      nextPinNumberForDocument(
+        pins.where((PinData pin) => pin.id != 'a-1'),
+        'pdf-a',
+      ),
+      4,
+    );
+    expect(
+      nextPinNumberForDocument(
+        pins.where((PinData pin) => pin.id != 'a-3'),
+        'pdf-a',
+      ),
+      3,
+    );
+    expect(nextPinNumberForDocument(pins, 'pdf-b'), 2);
+  });
+
   test('書き出し時だけページ順と元番号順でピン番号を整理する', () {
     final List<PinData> pins = <PinData>[
       _pin('p1-1', 1, 1),
@@ -31,6 +57,27 @@ void main() {
       'p3-3': 6,
     });
     expect(pins.map((PinData pin) => pin.number), <int>[1, 2, 5, 6, 4, 3]);
+  });
+
+  test('書き出し番号もPDFごとに1から振り直す', () {
+    final List<PinData> pins = <PinData>[
+      _pin('a-page-2', 5, 2).copyWith(documentId: 'pdf-a'),
+      _pin('a-page-1', 8, 1).copyWith(documentId: 'pdf-a'),
+      _pin('b-page-3', 4, 3).copyWith(documentId: 'pdf-b'),
+    ];
+
+    expect(
+      buildExportPinNumbers(
+        pins.where((PinData pin) => pin.documentId == 'pdf-a'),
+      ),
+      <String, int>{'a-page-1': 1, 'a-page-2': 2},
+    );
+    expect(
+      buildExportPinNumbers(
+        pins.where((PinData pin) => pin.documentId == 'pdf-b'),
+      ),
+      <String, int>{'b-page-3': 1},
+    );
   });
 
   test('ピン・図形・手書き・入力済み文字のページだけを抽出する', () {

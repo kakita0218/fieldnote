@@ -17,6 +17,7 @@ import 'camera_capture_screen.dart';
 import '../models/photo_board.dart';
 import '../models/photo_data.dart';
 import '../models/pin_data.dart';
+import '../models/project_pdf_document.dart';
 import '../theme/app_colors.dart';
 import '../widgets/handwriting_layer.dart';
 import '../widgets/single_page_pdf_canvas.dart';
@@ -33,6 +34,7 @@ enum FieldTool {
   select,
   pin,
   pen,
+  eraser,
   shape,
   text,
 }
@@ -68,6 +70,13 @@ class _IndexedDrawingStroke {
   final int index;
 }
 
+class _PickedPdfDocument {
+  const _PickedPdfDocument({required this.document, required this.bytes});
+
+  final ProjectPdfDocument document;
+  final Uint8List bytes;
+}
+
 class _DrawingEdit {
   const _DrawingEdit({
     required this.removedStrokes,
@@ -80,6 +89,7 @@ class _DrawingEdit {
 
 enum _PinEditKind {
   add,
+  delete,
   move,
   direction,
 }
@@ -98,6 +108,8 @@ enum _AnnotationTransformKind {
 }
 
 enum _ExportPageMode { allPages, annotatedPages }
+
+enum _ExportContent { pins, drawings, both }
 
 class _PinEdit {
   const _PinEdit({
@@ -135,12 +147,14 @@ class PdfViewerScreen extends StatefulWidget {
     required this.projectName,
     this.isNewProject = false,
     this.exportOnOpen = false,
+    this.simplifiedMobile = false,
   });
 
   final String projectId;
   final String projectName;
   final bool isNewProject;
   final bool exportOnOpen;
+  final bool simplifiedMobile;
 
   @override
   State<PdfViewerScreen> createState() => _PdfViewerScreenState();
@@ -187,6 +201,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   int _currentPage = 1;
   int _pageCount = 0;
   int _nextPinNumber = 1;
+  final List<ProjectPdfDocument> _documents = <ProjectPdfDocument>[];
+  String? _currentDocumentId;
 
   bool _isPickingFile = false;
   int _pickOperationSequence = 0;
@@ -204,7 +220,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   double _eraserWidth = 28;
   double _textFontSize = 22;
   double _textBoxWidthRatio = 0.45;
-  bool _eraserEnabled = false;
   late String _boardBusinessName;
   String _boardFacilityName = '';
 
@@ -212,11 +227,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   final List<_PinEdit> _undoPinEdits = <_PinEdit>[];
   final List<_PinEdit> _redoPinEdits = <_PinEdit>[];
   final Set<String> _pendingPhotoCleanupPinIds = <String>{};
-  final Map<int, List<DrawingStroke>> _strokesByPage = {};
+  final Map<String, Map<int, List<DrawingStroke>>> _strokesByDocumentPage =
+      <String, Map<int, List<DrawingStroke>>>{};
   final Map<String, List<DrawingStroke>> _photoAnnotationsById =
       <String, List<DrawingStroke>>{};
-  final Map<int, List<_DrawingEdit>> _undoDrawingEditsByPage = {};
-  final Map<int, List<_DrawingEdit>> _redoDrawingEditsByPage = {};
+  final Map<String, Map<int, List<_DrawingEdit>>>
+      _undoDrawingEditsByDocumentPage =
+      <String, Map<int, List<_DrawingEdit>>>{};
+  final Map<String, Map<int, List<_DrawingEdit>>>
+      _redoDrawingEditsByDocumentPage =
+      <String, Map<int, List<_DrawingEdit>>>{};
   DrawingStroke? _activeStroke;
   int? _activeStrokeIndex;
   DrawingStroke? _movingTextOriginal;
@@ -246,10 +266,40 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   String? _selectedPinId;
   String? _selectedAnnotationId;
+  Set<String> _selectedAnnotationIds = <String>{};
+  Offset? _selectionDragStart;
+  Rect? _selectionRect;
   bool _suppressPinPanel = false;
   String? _pendingDirectionPinId;
   String? _captureAfterDirectionPinId;
   TextEditingController? _noteController;
+
+  String get _activeDocumentId => _currentDocumentId ?? 'main';
+
+  ProjectPdfDocument? get _activeDocument {
+    for (final ProjectPdfDocument document in _documents) {
+      if (document.id == _activeDocumentId) return document;
+    }
+    return _documents.isEmpty ? null : _documents.first;
+  }
+
+  Map<int, List<DrawingStroke>> get _strokesByPage =>
+      _strokesByDocumentPage.putIfAbsent(
+        _activeDocumentId,
+        () => <int, List<DrawingStroke>>{},
+      );
+
+  Map<int, List<_DrawingEdit>> get _undoDrawingEditsByPage =>
+      _undoDrawingEditsByDocumentPage.putIfAbsent(
+        _activeDocumentId,
+        () => <int, List<_DrawingEdit>>{},
+      );
+
+  Map<int, List<_DrawingEdit>> get _redoDrawingEditsByPage =>
+      _redoDrawingEditsByDocumentPage.putIfAbsent(
+        _activeDocumentId,
+        () => <int, List<_DrawingEdit>>{},
+      );
 
   @override
   void initState() {
@@ -292,7 +342,30 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     _enqueueSaveInBackground();
   }
 
-  Future<void> _pickPdf() async {
+  String _documentStem(String fileName) {
+    final int extension = fileName.toLowerCase().lastIndexOf('.pdf');
+    final String stem =
+        extension > 0 ? fileName.substring(0, extension) : fileName;
+    final String sanitized = stem
+        .trim()
+        .replaceAll(RegExp(r'[\\/:*?"<>|\u0000-\u001F]'), '_')
+        .replaceAll(RegExp(r'[. ]+$'), '');
+    return sanitized.isEmpty ? '図面' : sanitized;
+  }
+
+  String _documentFolderName(String fileName, int order) =>
+      '${order.toString().padLeft(2, '0')}_${_documentStem(fileName)}';
+
+  void _rememberCurrentDocumentPage() {
+    final int index = _documents.indexWhere(
+      (ProjectPdfDocument document) => document.id == _currentDocumentId,
+    );
+    if (index >= 0) {
+      _documents[index] = _documents[index].copyWith(currentPage: _currentPage);
+    }
+  }
+
+  Future<void> _pickPdf({bool append = false}) async {
     if (_isPickingFile) {
       return;
     }
@@ -307,10 +380,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     });
 
     try {
+      if (append) {
+        _saveSelectedPinNote();
+        _rememberCurrentDocumentPage();
+        _saveDebounce?.cancel();
+        await _enqueueSave();
+        if (!operationIsActive()) return;
+      }
       final FilePickerResult? result = await FilePicker.pickFiles(
         type: FileType.custom,
         allowedExtensions: const ['pdf'],
-        allowMultiple: false,
+        allowMultiple: true,
         withData: kIsWeb,
       );
 
@@ -318,33 +398,60 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         return;
       }
 
-      final PlatformFile selectedFile = result.files.single;
-
-      final pdfx.PdfDocument nextDocument;
-      final String pdfIdentity;
-      Uint8List? selectedBytes = selectedFile.bytes;
-      if (selectedBytes == null && selectedFile.path != null) {
-        selectedBytes = await XFile(selectedFile.path!).readAsBytes();
+      final List<_PickedPdfDocument> picked = <_PickedPdfDocument>[];
+      for (int index = 0; index < result.files.length; index++) {
+        final PlatformFile selectedFile = result.files[index];
+        Uint8List? selectedBytes = selectedFile.bytes;
+        if (selectedBytes == null && selectedFile.path != null) {
+          selectedBytes = await XFile(selectedFile.path!).readAsBytes();
+        }
         if (!operationIsActive()) return;
+        if (selectedBytes == null || selectedBytes.isEmpty) continue;
+        final Uint8List persistentBytes = Uint8List.fromList(selectedBytes);
+        final pdfx.PdfDocument inspected = await pdfx.PdfDocument.openData(
+          Uint8List.fromList(persistentBytes),
+        );
+        final int pagesCount = inspected.pagesCount;
+        await inspected.close();
+        final int order = _documents.length + picked.length + 1;
+        final String folderName = _documentFolderName(selectedFile.name, order);
+        final String documentId = folderName;
+        picked.add(
+          _PickedPdfDocument(
+            document: ProjectPdfDocument(
+              id: documentId,
+              name: selectedFile.name,
+              folderName: folderName,
+              pageCount: pagesCount,
+            ),
+            bytes: persistentBytes,
+          ),
+        );
       }
-      if (selectedBytes == null || selectedBytes.isEmpty) {
-        setState(() {
-          _errorMessage = '選択したPDFのデータを読み込めませんでした。';
-        });
+      if (picked.isEmpty) {
+        setState(() => _errorMessage = '選択したPDFのデータを読み込めませんでした。');
         return;
       }
-      // pdfxのWeb実装ではopenDataに渡したUint8Listのバッファが
-      // PDF表示側へ移され、元のリストが空になる場合がある。
-      // 保存用と表示用を別のバッファにして、保存用PDFを保持する。
-      final Uint8List persistentBytes = Uint8List.fromList(selectedBytes);
-      nextDocument = await pdfx.PdfDocument.openData(
-        Uint8List.fromList(persistentBytes),
+      for (final _PickedPdfDocument item in picked) {
+        await ProjectRepository.savePdfDocument(
+          projectId: widget.projectId,
+          projectName: _projectName,
+          documentId: item.document.id,
+          documentName: item.document.name,
+          folderName: item.document.folderName,
+          pageCount: item.document.pageCount,
+          bytes: item.bytes,
+        );
+        if (!operationIsActive()) return;
+      }
+      final _PickedPdfDocument selected = picked.first;
+      final pdfx.PdfDocument nextDocument = await pdfx.PdfDocument.openData(
+        Uint8List.fromList(selected.bytes),
       );
       if (!operationIsActive()) {
         await nextDocument.close();
         return;
       }
-      pdfIdentity = '${selectedFile.name}-${persistentBytes.length}';
 
       final pdfx.PdfDocument? previousDocument = _pdfDocument;
 
@@ -352,29 +459,38 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       _noteController = null;
 
       setState(() {
+        if (!append) {
+          _documents.clear();
+        }
+        _documents.addAll(
+          picked.map((_PickedPdfDocument item) => item.document),
+        );
+        _currentDocumentId = selected.document.id;
         _pdfDocument = nextDocument;
         _pageImageBytes = null;
         _thumbnailFutures.clear();
-        _pdfPath = pdfIdentity;
-        _pdfBytes = persistentBytes;
+        _pdfPath = '${selected.document.id}-${selected.bytes.length}';
+        _pdfBytes = selected.bytes;
 
         _currentPage = 1;
         _pageCount = nextDocument.pagesCount;
 
-        _selectedTool = null;
+        _selectedTool = widget.simplifiedMobile ? FieldTool.pin : null;
 
-        _pins.clear();
-        _undoPinEdits.clear();
-        _redoPinEdits.clear();
-        _pendingPhotoCleanupPinIds.clear();
-        _photosByPinId.clear();
-        _photoStorageVerifiedPinIds.clear();
-        _photoStorageNeedsRescanPinIds.clear();
-        _photoSavesInProgressByPinId.clear();
-        _strokesByPage.clear();
-        _photoAnnotationsById.clear();
-        _undoDrawingEditsByPage.clear();
-        _redoDrawingEditsByPage.clear();
+        if (!append) {
+          _pins.clear();
+          _undoPinEdits.clear();
+          _redoPinEdits.clear();
+          _pendingPhotoCleanupPinIds.clear();
+          _photosByPinId.clear();
+          _photoStorageVerifiedPinIds.clear();
+          _photoStorageNeedsRescanPinIds.clear();
+          _photoSavesInProgressByPinId.clear();
+          _strokesByDocumentPage.clear();
+          _photoAnnotationsById.clear();
+          _undoDrawingEditsByDocumentPage.clear();
+          _redoDrawingEditsByDocumentPage.clear();
+        }
         _activeStroke = null;
         _activeStrokeIndex = null;
         _activeEraserPage = null;
@@ -387,9 +503,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _activeEraserBoundsCache = null;
         _activeEraserSamplesCache = null;
 
-        _nextPinNumber = 1;
+        _refreshNextPinNumber();
         _selectedPinId = null;
         _selectedAnnotationId = null;
+        _selectedAnnotationIds = <String>{};
+        _selectionDragStart = null;
+        _selectionRect = null;
         _suppressPinPanel = false;
         _pendingDirectionPinId = null;
         _captureAfterDirectionPinId = null;
@@ -401,13 +520,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       await _renderPage(_currentPage);
       if (!operationIsActive()) return;
 
-      // PDF is written once. Later edits never rewrite this binary.
-      await ProjectRepository.savePdfOnce(
-        projectId: widget.projectId,
-        projectName: _projectName,
-        bytes: persistentBytes,
-      );
-      if (!operationIsActive()) return;
       _pinsDirty = true;
       _drawingsDirty = true;
       _metaDirty = true;
@@ -431,6 +543,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   void _selectTool(FieldTool tool) {
+    if (widget.simplifiedMobile && tool != FieldTool.pin) return;
     _endStroke();
 
     if (_selectedTool == tool) {
@@ -439,6 +552,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           _showPinSettings();
         case FieldTool.pen:
           _showPenSettings();
+        case FieldTool.eraser:
+          _showEraserSettings();
         case FieldTool.shape:
           _showShapeSettings();
         case FieldTool.text:
@@ -455,8 +570,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         removedDraft = _discardEmptyTextDrafts(_currentPage);
       }
       _selectedTool = tool;
-      if (tool != FieldTool.select) _selectedAnnotationId = null;
-      if (tool != FieldTool.pen) _eraserEnabled = false;
+      if (tool != FieldTool.select) {
+        _selectedAnnotationId = null;
+        _selectedAnnotationIds = <String>{};
+        _selectionRect = null;
+      }
       if (tool != FieldTool.pin) {
         _pendingDirectionPinId = null;
         _captureAfterDirectionPinId = null;
@@ -492,6 +610,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (draftIds.contains(_selectedAnnotationId)) {
       _selectedAnnotationId = null;
     }
+    _selectedAnnotationIds.removeAll(draftIds);
     return true;
   }
 
@@ -513,10 +632,51 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   void _recordPinEdit(_PinEdit edit) {
     _discardPinRedoHistory();
     _undoPinEdits.add(edit);
+    if (_undoPinEdits.length > 60) {
+      final _PinEdit discarded = _undoPinEdits.removeAt(0);
+      if (discarded.kind == _PinEditKind.delete &&
+          !_pins.any((PinData pin) => pin.id == discarded.pinId)) {
+        _queueDeletedPinCleanup(discarded.pinId);
+      }
+    }
+  }
+
+  void _queueDeletedPinCleanup(String pinId) {
+    final Set<String> photoIds =
+        (_photosByPinId.remove(pinId) ?? const <PhotoData>[])
+            .map((PhotoData photo) => photo.id)
+            .toSet();
+    for (final String photoId in photoIds) {
+      _photoAnnotationsById.remove(photoId);
+    }
+    _photoAnnotationsById.removeWhere(
+      (String photoId, List<DrawingStroke> _) =>
+          photoId.startsWith('$pinId-') || photoId.startsWith('$pinId::'),
+    );
+    _photoStorageVerifiedPinIds.remove(pinId);
+    _photoStorageNeedsRescanPinIds.remove(pinId);
+    _photoSavesInProgressByPinId.remove(pinId);
+    _pendingPhotoCleanupPinIds.add(pinId);
   }
 
   bool _samePinPosition(PinData first, PinData second) {
     return first.xRatio == second.xRatio && first.yRatio == second.yRatio;
+  }
+
+  String? _pinEditDocumentId(_PinEdit edit) {
+    final String? stored = edit.after?.documentId ?? edit.before?.documentId;
+    if (stored != null) return stored;
+    for (final PinData pin in _pins) {
+      if (pin.id == edit.pinId) return pin.documentId;
+    }
+    return null;
+  }
+
+  int _lastPinEditIndexForDocument(List<_PinEdit> edits) {
+    for (int index = edits.length - 1; index >= 0; index--) {
+      if (_pinEditDocumentId(edits[index]) == _activeDocumentId) return index;
+    }
+    return -1;
   }
 
   void _addPin(Offset normalizedPosition) {
@@ -526,6 +686,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     final PinData pin = PinData(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
+      documentId: _activeDocumentId,
       number: _nextPinNumber,
       pageNumber: _currentPage,
       xRatio: normalizedPosition.dx,
@@ -963,6 +1124,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     _scheduleSave();
   }
 
+  void _updateSelectedPinName(String value) {
+    final String? selectedId = _selectedPinId;
+    if (selectedId == null) return;
+    final int index = _pins.indexWhere((PinData pin) => pin.id == selectedId);
+    if (index < 0 || _pins[index].name == value) return;
+    _discardPinRedoHistory();
+    setState(() => _pins[index] = _pins[index].copyWith(name: value));
+    _scheduleSave(pins: true, drawings: false, meta: true);
+  }
+
   Future<void> _deleteSelectedPin() async {
     final String? selectedId = _selectedPinId;
 
@@ -977,10 +1148,35 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (index < 0) {
       return;
     }
-    final Set<String> photoIds =
-        (_photosByPinId[selectedId] ?? const <PhotoData>[])
-            .map((PhotoData photo) => photo.id)
-            .toSet();
+    final PinData selectedPin = _pins[index];
+    final int photoCount = math.max(
+      selectedPin.photoCount,
+      (_photosByPinId[selectedId] ?? const <PhotoData>[]).length,
+    );
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) => AlertDialog(
+        title: Text('ピン${selectedPin.number}を削除しますか？'),
+        content: Text(
+          photoCount > 0
+              ? 'このピンには写真が$photoCount枚あります。\n'
+                  'ピンを削除すると、写真と写真への書き込みも削除されます。'
+              : 'このピンを削除します。',
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('削除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
 
     // Finish any older snapshot before changing pin numbers. The deletion
     // itself is then committed through the durable cleanup transaction below.
@@ -998,24 +1194,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (latestIndex < 0) return;
 
     setState(() {
-      _photosByPinId.remove(selectedId);
-      for (final String photoId in photoIds) {
-        _photoAnnotationsById.remove(photoId);
-      }
-      _photoAnnotationsById.removeWhere(
-        (String photoId, List<DrawingStroke> _) =>
-            photoId.startsWith('$selectedId-'),
+      final PinData removedPin = _pins.removeAt(latestIndex);
+      _recordPinEdit(
+        _PinEdit(
+          kind: _PinEditKind.delete,
+          pinId: removedPin.id,
+          index: latestIndex,
+          before: removedPin,
+        ),
       );
-      _photoStorageVerifiedPinIds.remove(selectedId);
-      _photoStorageNeedsRescanPinIds.remove(selectedId);
-      _photoSavesInProgressByPinId.remove(selectedId);
-      _discardPinRedoHistory();
-      _undoPinEdits.removeWhere((_PinEdit edit) => edit.pinId == selectedId);
-      _redoPinEdits.removeWhere((_PinEdit edit) => edit.pinId == selectedId);
-      _pins.removeAt(latestIndex);
-      _pendingPhotoCleanupPinIds.add(selectedId);
-
-      _renumberPins();
+      _refreshNextPinNumber();
 
       _selectedPinId = null;
       if (_pendingDirectionPinId == selectedId) {
@@ -1028,26 +1216,41 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     _noteController?.dispose();
     _noteController = null;
-    _pinsDirty = true;
-    _metaDirty = true;
-    _pdfDirty = true;
+    _scheduleSave(pins: true, drawings: false, meta: true);
     try {
-      // _saveProjectNow first commits the pin-free snapshot together with the
-      // cleanup marker, then removes photos idempotently, and finally clears
-      // the marker in a second snapshot. A termination at any point therefore
-      // cannot resurrect a pin whose photos have already been deleted.
       await _enqueueSave();
     } catch (_) {
-      // The marker and dirty flags remain in memory and automatic retry is
-      // scheduled by _saveProjectNow.
+      // Dirty flags and the retry timer keep the reversible deletion pending.
     }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text('ピン${selectedPin.number}を削除しました'),
+          action: SnackBarAction(
+            label: '取り消す',
+            onPressed: () => _undoPinDeletion(selectedId),
+          ),
+        ),
+      );
+  }
+
+  void _undoPinDeletion(String pinId) {
+    final int index = _lastPinEditIndexForDocument(_undoPinEdits);
+    if (index < 0) return;
+    final _PinEdit edit = _undoPinEdits[index];
+    if (edit.kind != _PinEditKind.delete || edit.pinId != pinId) return;
+    _undo();
   }
 
   void _startStroke(Offset normalizedPosition, double pressure) {
-    if (_selectedTool != FieldTool.pen && _selectedTool != FieldTool.shape) {
+    if (_selectedTool != FieldTool.pen &&
+        _selectedTool != FieldTool.eraser &&
+        _selectedTool != FieldTool.shape) {
       return;
     }
-    if (_selectedTool == FieldTool.pen && _eraserEnabled) {
+    if (_selectedTool == FieldTool.eraser) {
       _activeEraserPage = _currentPage;
       _lastEraserPosition = null;
       final List<DrawingStroke> strokes =
@@ -1070,6 +1273,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _selectedTool == FieldTool.shape ? _shapeKind : DrawingKind.freehand;
     final DrawingStroke stroke = DrawingStroke(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
+      documentId: _activeDocumentId,
       pageNumber: _currentPage,
       width: _penWidth,
       color: _penColor,
@@ -1100,7 +1304,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   void _updateStroke(Offset normalizedPosition, double pressure) {
-    if (_selectedTool == FieldTool.pen && _eraserEnabled) {
+    if (_selectedTool == FieldTool.eraser) {
       if (_activeEraserPage != null) {
         _eraseAt(normalizedPosition);
       }
@@ -1277,7 +1481,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return (_undoDrawingEditsByPage[_currentPage]?.isNotEmpty ?? false) ||
           (_strokesByPage[_currentPage]?.isNotEmpty ?? false);
     }
-    return _undoPinEdits.isNotEmpty;
+    return _lastPinEditIndexForDocument(_undoPinEdits) >= 0;
   }
 
   bool get _canRedoCurrentTool {
@@ -1285,7 +1489,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (_drawingToolSelected) {
       return (_redoDrawingEditsByPage[_currentPage]?.isNotEmpty ?? false);
     }
-    return _redoPinEdits.isNotEmpty;
+    return _lastPinEditIndexForDocument(_redoPinEdits) >= 0;
   }
 
   PinData _applyPinEditValue(
@@ -1304,7 +1508,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           directionDegrees: value.directionDegrees,
           showsDirection: value.showsDirection,
         ),
-      _PinEditKind.add => value,
+      _PinEditKind.add || _PinEditKind.delete => value,
     };
   }
 
@@ -1344,11 +1548,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return;
     }
 
-    if (_undoPinEdits.isEmpty) {
+    final int undoIndex = _lastPinEditIndexForDocument(_undoPinEdits);
+    if (undoIndex < 0) {
       return;
     }
 
-    _PinEdit edit = _undoPinEdits.removeLast();
+    _PinEdit edit = _undoPinEdits.removeAt(undoIndex);
 
     setState(() {
       if (edit.kind == _PinEditKind.add) {
@@ -1368,8 +1573,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             _noteController?.dispose();
             _noteController = null;
           }
-          _renumberPins();
+          _refreshNextPinNumber();
         }
+      } else if (edit.kind == _PinEditKind.delete && edit.before != null) {
+        final int insertionIndex = edit.index.clamp(0, _pins.length);
+        _pins.insert(insertionIndex, edit.before!);
+        _pendingPhotoCleanupPinIds.remove(edit.pinId);
+        _refreshNextPinNumber();
       } else {
         final int index =
             _pins.indexWhere((PinData pin) => pin.id == edit.pinId);
@@ -1404,17 +1614,21 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       return;
     }
 
-    if (_redoPinEdits.isEmpty) {
+    final int redoIndex = _lastPinEditIndexForDocument(_redoPinEdits);
+    if (redoIndex < 0) {
       return;
     }
 
-    final _PinEdit edit = _redoPinEdits.removeLast();
+    final _PinEdit edit = _redoPinEdits.removeAt(redoIndex);
 
     setState(() {
       if (edit.kind == _PinEditKind.add && edit.after != null) {
         final int insertionIndex = edit.index.clamp(0, _pins.length);
         _pins.insert(insertionIndex, edit.after!);
-        _renumberPins();
+        _refreshNextPinNumber();
+      } else if (edit.kind == _PinEditKind.delete) {
+        _pins.removeWhere((PinData pin) => pin.id == edit.pinId);
+        _refreshNextPinNumber();
       } else {
         final int index =
             _pins.indexWhere((PinData pin) => pin.id == edit.pinId);
@@ -1431,14 +1645,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     _scheduleSave(pins: true, drawings: false, meta: true);
   }
 
-  void _renumberPins() {
-    for (int index = 0; index < _pins.length; index++) {
-      _pins[index] = _pins[index].copyWith(
-        number: index + 1,
-      );
-    }
-
-    _nextPinNumber = _pins.length + 1;
+  void _refreshNextPinNumber() {
+    _nextPinNumber = nextPinNumberForDocument(_pins, _activeDocumentId);
   }
 
   List<PhotoData> _photosForPin(String pinId) {
@@ -1468,6 +1676,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       MaterialPageRoute<void>(
         fullscreenDialog: true,
         builder: (_) => CameraCaptureScreen(
+          simplifiedMobile: widget.simplifiedMobile,
           pinNumber: currentPin.number,
           initialPhotoCount: currentPin.photoCount,
           initialPhotos: _photosForPin(currentPin.id),
@@ -1482,7 +1691,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
               (PhotoData photo) => photo.id == photoId,
             );
             if (index >= 0) {
-              _openPhotoEditor(currentPin, photos[index]);
+              if (widget.simplifiedMobile) {
+                _openPhotoReadOnly(currentPin, photos[index]);
+              } else {
+                _openPhotoEditor(currentPin, photos[index]);
+              }
             }
           },
         ),
@@ -1640,7 +1853,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       try {
         final Uint8List? edited = await ProjectRepository.loadEditedPhotoBytes(
           projectId: widget.projectId,
+          documentId: pin.documentId,
           pinNumber: pin.number,
+          pinName: pin.name,
           photoId: photo.id,
         );
         if (edited == null || edited.isEmpty) continue;
@@ -1687,7 +1902,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           projectId: widget.projectId,
           projectName: _projectName,
           pinId: pin.id,
+          documentId: pin.documentId,
           pinNumber: pin.number,
+          pinName: pin.name,
           photoId: photoId,
           fileName: fileName,
           bytes: bytes,
@@ -1805,7 +2022,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                       return InkWell(
                         onTap: () {
                           Navigator.of(context).pop();
-                          _openPhotoEditor(pin, photo);
+                          if (widget.simplifiedMobile) {
+                            _openPhotoReadOnly(pin, photo);
+                          } else {
+                            _openPhotoEditor(pin, photo);
+                          }
                         },
                         borderRadius: BorderRadius.circular(10),
                         child: ClipRRect(
@@ -1847,7 +2068,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       MaterialPageRoute<void>(
         builder: (BuildContext context) => PhotoEditorScreen(
           projectId: widget.projectId,
+          documentId: pin.documentId,
           pinNumber: pin.number,
+          pinName: pin.name,
           photos: photos,
           initialPhotoId: photo.id,
           annotations: <String, List<DrawingStroke>>{
@@ -1865,7 +2088,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
               await _enqueueStorageOperation<void>(
                 () => ProjectRepository.deleteEditedPhoto(
                   projectId: widget.projectId,
+                  documentId: pin.documentId,
                   pinNumber: pin.number,
+                  pinName: pin.name,
                   photoId: photoId,
                 ),
               );
@@ -1873,7 +2098,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
               await _enqueueStorageOperation<void>(
                 () => ProjectRepository.saveEditedPhoto(
                   projectId: widget.projectId,
+                  documentId: pin.documentId,
                   pinNumber: pin.number,
+                  pinName: pin.name,
                   photoId: photoId,
                   bytes: renderedImage,
                 ),
@@ -1895,8 +2122,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                 final Uint8List? originalBytes =
                     await ProjectRepository.loadPhotoBytes(
                   projectId: widget.projectId,
+                  documentId: pin.documentId,
                   photoId: photoId,
                   pinNumber: pin.number,
+                  pinName: pin.name,
                   fileName: originalPhoto.fileName,
                 );
                 if (originalBytes != null && originalBytes.isNotEmpty) {
@@ -1936,6 +2165,42 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     );
   }
 
+  Future<void> _openPhotoReadOnly(PinData pin, PhotoData photo) async {
+    final Uint8List? bytes = await ProjectRepository.loadPhotoBytes(
+      projectId: widget.projectId,
+      documentId: pin.documentId,
+      photoId: photo.id,
+      pinNumber: pin.number,
+      pinName: pin.name,
+      fileName: photo.fileName,
+    );
+    if (!mounted) return;
+    if (bytes == null || bytes.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('写真を読み込めませんでした。')),
+      );
+      return;
+    }
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (BuildContext context) => Scaffold(
+          backgroundColor: Colors.black,
+          appBar: AppBar(
+            backgroundColor: Colors.black,
+            title: Text('ピン ${pin.number} ${pin.name}'.trim()),
+          ),
+          body: Center(
+            child: InteractiveViewer(
+              minScale: 0.5,
+              maxScale: 8,
+              child: Image.memory(bytes),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   PinData? get _selectedPin {
     final String? selectedId = _selectedPinId;
 
@@ -1955,7 +2220,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   List<PinData> get _currentPagePins {
     return _pins
         .where(
-          (pin) => pin.pageNumber == _currentPage,
+          (pin) =>
+              pin.documentId == _activeDocumentId &&
+              pin.pageNumber == _currentPage,
         )
         .toList();
   }
@@ -2083,7 +2350,96 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     }
   }
 
+  Future<void> _switchDocument(String documentId) async {
+    if (documentId == _activeDocumentId ||
+        _isRenderingPage ||
+        _isPickingFile ||
+        _isLeaving) {
+      return;
+    }
+    ProjectPdfDocument? target;
+    for (final ProjectPdfDocument document in _documents) {
+      if (document.id == documentId) {
+        target = document;
+        break;
+      }
+    }
+    if (target == null) return;
+    _endStroke();
+    _saveSelectedPinNote();
+    _rememberCurrentDocumentPage();
+    _saveDebounce?.cancel();
+    await _enqueueSave();
+    if (!mounted) return;
+    final Uint8List? bytes = await ProjectRepository.loadPdfDocument(
+      projectId: widget.projectId,
+      documentId: target.id,
+    );
+    if (bytes == null || bytes.isEmpty) {
+      setState(() => _errorMessage = '${target!.name}を読み込めませんでした。');
+      return;
+    }
+    final String? sourcePath = await ProjectRepository.sourcePdfPath(
+      widget.projectId,
+      documentId: target.id,
+    );
+    if (sourcePath != null) {
+      try {
+        await NativeProjectService.synchronizePencilDrawings(sourcePath);
+      } catch (_) {
+        // The app's own stroke data remains authoritative. A damaged native
+        // sidecar must not prevent switching to another PDF.
+      }
+    }
+    final pdfx.PdfDocument nextDocument = await pdfx.PdfDocument.openData(
+      Uint8List.fromList(bytes),
+    );
+    if (!mounted) {
+      await nextDocument.close();
+      return;
+    }
+    final pdfx.PdfDocument? previous = _pdfDocument;
+    setState(() {
+      _currentDocumentId = target!.id;
+      _pdfDocument = nextDocument;
+      _pdfBytes = Uint8List.fromList(bytes);
+      _pdfPath = '${target.id}-${bytes.length}';
+      _pageCount = nextDocument.pagesCount;
+      _currentPage = target.currentPage.clamp(1, nextDocument.pagesCount);
+      _pageImageBytes = null;
+      _thumbnailFutures.clear();
+      _selectedPinId = null;
+      _selectedAnnotationId = null;
+      _pendingDirectionPinId = null;
+      _captureAfterDirectionPinId = null;
+      _refreshNextPinNumber();
+      _metaDirty = true;
+    });
+    _noteController?.dispose();
+    _noteController = null;
+    await previous?.close();
+    await _renderPage(_currentPage);
+    _scheduleSave(pins: false, drawings: false, meta: true);
+  }
+
   String _threeDigits(int value) => value.toString().padLeft(3, '0');
+
+  String _pinPhotoFolderName(int number, String name) {
+    final String safeName = name
+        .trim()
+        .replaceAll(RegExp(r'[\\/:*?"<>|\u0000-\u001F]'), '_')
+        .replaceAll(RegExp(r'[. ]+$'), '');
+    return safeName.isEmpty
+        ? _threeDigits(number)
+        : '${_threeDigits(number)} $safeName';
+  }
+
+  bool _isPng(Uint8List bytes) =>
+      bytes.length >= 4 &&
+      bytes[0] == 0x89 &&
+      bytes[1] == 0x50 &&
+      bytes[2] == 0x4E &&
+      bytes[3] == 0x47;
 
   String _safeProjectFileName() {
     final String sanitized = _projectName
@@ -2203,13 +2559,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   Future<Uint8List> _buildAnnotatedPageImage(
     int pageNumber, {
+    required pdfx.PdfDocument document,
+    required Map<int, List<DrawingStroke>> strokesByPage,
     required List<PinData> pins,
+    required bool includeDrawings,
   }) async {
-    final pdfx.PdfDocument? document = _pdfDocument;
-    if (document == null) {
-      throw StateError('PDFが開かれていません。');
-    }
-
     pdfx.PdfPage? page;
     ui.Image? background;
     ui.Image? output;
@@ -2233,12 +2587,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       final Canvas canvas = Canvas(recorder);
       canvas.drawImage(background, Offset.zero, Paint());
 
-      paintDrawingStrokes(
-        canvas,
-        Size(width, height),
-        _strokesByPage[pageNumber] ?? const <DrawingStroke>[],
-        widthScale: exportScale,
-      );
+      if (includeDrawings) {
+        paintDrawingStrokes(
+          canvas,
+          Size(width, height),
+          strokesByPage[pageNumber] ?? const <DrawingStroke>[],
+          widthScale: exportScale,
+        );
+      }
 
       final List<PinData> pagePins = pins
           .where((pin) => pin.pageNumber == pageNumber)
@@ -2269,13 +2625,21 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   Future<Uint8List> _buildAnnotatedPdf({
+    required pdfx.PdfDocument document,
+    required Map<int, List<DrawingStroke>> strokesByPage,
     required List<int> pageNumbers,
     required List<PinData> pins,
+    required bool includeDrawings,
   }) async {
     final pw.Document outputPdf = pw.Document();
     for (final int pageNumber in pageNumbers) {
-      final Uint8List pagePng =
-          await _buildAnnotatedPageImage(pageNumber, pins: pins);
+      final Uint8List pagePng = await _buildAnnotatedPageImage(
+        pageNumber,
+        document: document,
+        strokesByPage: strokesByPage,
+        pins: pins,
+        includeDrawings: includeDrawings,
+      );
       final ui.Image decoded = await _decodeUiImage(pagePng);
       final double aspectRatio = decoded.width / decoded.height;
       decoded.dispose();
@@ -2293,15 +2657,107 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     return outputPdf.save();
   }
 
-  Set<int> get _annotatedPageNumbers {
+  Set<int> _annotatedPagesForContents(
+    Set<_ExportContent> contents, {
+    required String documentId,
+  }) {
+    final bool includePins = contents.contains(_ExportContent.pins) ||
+        contents.contains(_ExportContent.both);
+    final bool includeDrawings = contents.contains(_ExportContent.drawings) ||
+        contents.contains(_ExportContent.both);
     return buildAnnotatedPageNumbers(
-      pins: _pins,
-      strokesByPage: _strokesByPage,
+      pins: includePins
+          ? _pins.where((PinData pin) => pin.documentId == documentId)
+          : const <PinData>[],
+      strokesByPage: includeDrawings
+          ? _strokesByDocumentPage[documentId] ??
+              const <int, List<DrawingStroke>>{}
+          : const <int, List<DrawingStroke>>{},
     );
   }
 
-  Future<_ExportPageMode?> _chooseExportPageMode() {
-    final int annotatedCount = _annotatedPageNumbers.length;
+  String _exportContentLabel(_ExportContent content) => switch (content) {
+        _ExportContent.pins => 'ピンのみ',
+        _ExportContent.drawings => '書き込みのみ',
+        _ExportContent.both => 'ピンと書き込み',
+      };
+
+  Future<Set<_ExportContent>?> _chooseExportContents() async {
+    final Set<_ExportContent> selected = <_ExportContent>{_ExportContent.both};
+    return showDialog<Set<_ExportContent>>(
+      context: context,
+      builder: (BuildContext dialogContext) => StatefulBuilder(
+        builder: (BuildContext context, StateSetter setDialogState) {
+          return AlertDialog(
+            title: const Text('書き出す内容'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: _ExportContent.values.map((_ExportContent content) {
+                final bool available = switch (content) {
+                  _ExportContent.pins => _pins.isNotEmpty,
+                  _ExportContent.drawings => _strokesByDocumentPage.values.any(
+                      (Map<int, List<DrawingStroke>> pages) => pages.values
+                          .any((List<DrawingStroke> value) => value.isNotEmpty),
+                    ),
+                  _ExportContent.both => _pins.isNotEmpty ||
+                      _strokesByDocumentPage.values.any(
+                        (Map<int, List<DrawingStroke>> pages) =>
+                            pages.values.any(
+                          (List<DrawingStroke> value) => value.isNotEmpty,
+                        ),
+                      ),
+                };
+                return CheckboxListTile(
+                  value: selected.contains(content),
+                  enabled: available,
+                  controlAffinity: ListTileControlAffinity.leading,
+                  title: Text(_exportContentLabel(content)),
+                  onChanged: (bool? checked) {
+                    setDialogState(() {
+                      if (checked == true) {
+                        selected.add(content);
+                      } else {
+                        selected.remove(content);
+                      }
+                    });
+                  },
+                );
+              }).toList(growable: false),
+            ),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext),
+                child: const Text('キャンセル'),
+              ),
+              FilledButton(
+                onPressed: selected.isEmpty
+                    ? null
+                    : () => Navigator.pop(
+                          dialogContext,
+                          Set<_ExportContent>.of(selected),
+                        ),
+                child: const Text('次へ'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<_ExportPageMode?> _chooseExportPageMode(
+    Set<_ExportContent> contents,
+  ) {
+    final int annotatedCount = _documents.fold<int>(
+      0,
+      (int total, ProjectPdfDocument document) =>
+          total +
+          _annotatedPagesForContents(contents, documentId: document.id).length,
+    );
+    final int totalPageCount = _documents.fold<int>(
+      0,
+      (int total, ProjectPdfDocument document) => total + document.pageCount,
+    );
     return showDialog<_ExportPageMode>(
       context: context,
       builder: (BuildContext context) => SimpleDialog(
@@ -2312,7 +2768,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             child: ListTile(
               leading: const Icon(Icons.library_books_rounded),
               title: const Text('すべてのページ'),
-              subtitle: Text('$_pageCountページを書き出します'),
+              subtitle: Text('$totalPageCountページを書き出します'),
             ),
           ),
           SimpleDialogOption(
@@ -2329,7 +2785,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
               subtitle: Text(
                 annotatedCount == 0
                     ? '対象ページがありません'
-                    : '$annotatedCount / $_pageCountページを書き出します',
+                    : '$annotatedCount / $totalPageCountページを書き出します',
               ),
             ),
           ),
@@ -2349,11 +2805,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (_pdfDocument == null || _isExporting) return;
     ProjectExportZipSink? zipSink;
     _endStroke();
-    final _ExportPageMode? pageMode = await _chooseExportPageMode();
+    final Set<_ExportContent>? contents = await _chooseExportContents();
+    if (contents == null || contents.isEmpty || !mounted) return;
+    final _ExportPageMode? pageMode = await _chooseExportPageMode(contents);
     if (pageMode == null || !mounted) return;
-    final List<int> pageNumbers = pageMode == _ExportPageMode.allPages
-        ? <int>[for (int page = 1; page <= _pageCount; page++) page]
-        : (_annotatedPageNumbers.toList()..sort());
     _saveSelectedPinNote();
     setState(() {
       _isExporting = true;
@@ -2364,8 +2819,25 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       _saveDebounce?.cancel();
       await _enqueueSave();
       final String baseName = _safeProjectFileName();
-      final List<PinData> sortedPins = pinsInExportOrder(_pins);
-      final Map<String, int> exportNumbers = buildExportPinNumbers(sortedPins);
+      final List<PinData> sortedPins = _documents
+          .expand(
+            (ProjectPdfDocument document) => pinsInExportOrder(
+              _pins.where(
+                (PinData pin) => pin.documentId == document.id,
+              ),
+            ),
+          )
+          .toList(growable: false);
+      final Map<String, int> exportNumbers = <String, int>{};
+      for (final ProjectPdfDocument document in _documents) {
+        exportNumbers.addAll(
+          buildExportPinNumbers(
+            sortedPins.where(
+              (PinData pin) => pin.documentId == document.id,
+            ),
+          ),
+        );
+      }
       final List<PinData> exportPins = sortedPins
           .map(
             (PinData pin) => pin.copyWith(number: exportNumbers[pin.id]),
@@ -2377,30 +2849,103 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       // a second large temporary deflate buffer for each entry.
       zipSink = await ProjectExportZipSink.create();
       final ZipEncoder zipEncoder = ZipEncoder()..startEncode(zipSink.output);
-      {
-        final Uint8List pdfBytes;
-        if (NativeProjectService.isAvailable) {
-          final String? sourcePath =
-              await ProjectRepository.sourcePdfPath(widget.projectId);
-          if (sourcePath == null) {
-            throw StateError('書き出し用PDFが見つかりません。');
-          }
-          pdfBytes = await NativeProjectService.buildExportPdf(
-            sourcePath: sourcePath,
-            pins: exportPins.map(_serializePin).toList(growable: false),
-            strokes: _serializeStrokes(),
-            pageNumbers: pageNumbers,
+      final List<Map<String, dynamic>> serializedStrokes = _serializeStrokes();
+      for (final ProjectPdfDocument document in _documents) {
+        final List<int> documentPageNumbers = pageMode ==
+                _ExportPageMode.allPages
+            ? <int>[for (int page = 1; page <= document.pageCount; page++) page]
+            : (_annotatedPagesForContents(
+                contents,
+                documentId: document.id,
+              ).toList()
+              ..sort());
+        if (documentPageNumbers.isEmpty) continue;
+        final List<PinData> documentPins = exportPins
+            .where((PinData pin) => pin.documentId == document.id)
+            .toList(growable: false);
+        final List<Map<String, dynamic>> documentStrokes = serializedStrokes
+            .where(
+              (Map<String, dynamic> stroke) =>
+                  stroke['documentId']?.toString() == document.id,
+            )
+            .toList(growable: false);
+        pdfx.PdfDocument? fallbackDocument;
+        if (!NativeProjectService.isAvailable) {
+          final Uint8List? sourceBytes =
+              await ProjectRepository.loadPdfDocument(
+            projectId: widget.projectId,
+            documentId: document.id,
           );
-        } else {
-          pdfBytes = await _buildAnnotatedPdf(
-            pageNumbers: pageNumbers,
-            pins: exportPins,
+          if (sourceBytes == null || sourceBytes.isEmpty) {
+            throw StateError('${document.name}を読み込めませんでした。');
+          }
+          fallbackDocument = await pdfx.PdfDocument.openData(
+            Uint8List.fromList(sourceBytes),
           );
         }
-        zipEncoder.add(
-          ArchiveFile.noCompress('$baseName.pdf', pdfBytes.length, pdfBytes),
-          autoClose: true,
-        );
+        try {
+          for (final _ExportContent content
+              in _ExportContent.values.where(contents.contains)) {
+            final List<int> pageNumbers = pageMode == _ExportPageMode.allPages
+                ? documentPageNumbers
+                : (_annotatedPagesForContents(
+                    <_ExportContent>{content},
+                    documentId: document.id,
+                  ).toList()
+                  ..sort());
+            if (pageNumbers.isEmpty) continue;
+            final bool includePins = content != _ExportContent.drawings;
+            final bool includeDrawings = content != _ExportContent.pins;
+            final List<PinData> contentPins =
+                includePins ? documentPins : const <PinData>[];
+            final List<Map<String, dynamic>> contentStrokes = includeDrawings
+                ? documentStrokes
+                : const <Map<String, dynamic>>[];
+            final Uint8List pdfBytes;
+            if (NativeProjectService.isAvailable) {
+              final String? sourcePath = await ProjectRepository.sourcePdfPath(
+                widget.projectId,
+                documentId: document.id,
+              );
+              if (sourcePath == null) {
+                throw StateError('書き出し用PDFが見つかりません。');
+              }
+              pdfBytes = await NativeProjectService.buildExportPdf(
+                sourcePath: sourcePath,
+                pins: contentPins.map(_serializePin).toList(growable: false),
+                strokes: contentStrokes,
+                pageNumbers: pageNumbers,
+              );
+            } else {
+              pdfBytes = await _buildAnnotatedPdf(
+                document: fallbackDocument!,
+                strokesByPage: _strokesByDocumentPage[document.id] ??
+                    const <int, List<DrawingStroke>>{},
+                pageNumbers: pageNumbers,
+                pins: contentPins,
+                includeDrawings: includeDrawings,
+              );
+            }
+            final String pdfName;
+            if (_documents.length == 1 &&
+                contents.length == 1 &&
+                content == _ExportContent.both) {
+              pdfName = '$baseName.pdf';
+            } else {
+              final String suffix =
+                  contents.length == 1 && content == _ExportContent.both
+                      ? ''
+                      : '_${_exportContentLabel(content)}';
+              pdfName = '${document.folderName}$suffix.pdf';
+            }
+            zipEncoder.add(
+              ArchiveFile.noCompress(pdfName, pdfBytes.length, pdfBytes),
+              autoClose: true,
+            );
+          }
+        } finally {
+          await fallbackDocument?.close();
+        }
       }
 
       final List<Map<String, dynamic>> photoMetadata =
@@ -2416,6 +2961,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       }
       final Map<String, PinData> pinsById = <String, PinData>{
         for (final PinData pin in sortedPins) pin.id: pin,
+      };
+      final Map<String, ProjectPdfDocument> documentsById =
+          <String, ProjectPdfDocument>{
+        for (final ProjectPdfDocument document in _documents)
+          document.id: document,
       };
       final List<Map<String, dynamic>> exportPhotos = <Map<String, dynamic>>[];
       for (final PinData pin in sortedPins) {
@@ -2454,7 +3004,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           final bool hasAnnotations =
               _photoAnnotationsById[photoId]?.isNotEmpty ?? false;
           final int exportNumber = exportNumbers[pin.id] ?? pin.number;
-          final String folder = '写真/${_threeDigits(exportNumber)}/';
+          final String documentFolder =
+              documentsById[pin.documentId]?.folderName ?? '01_図面';
+          final String folder =
+              '写真/$documentFolder/${_pinPhotoFolderName(exportNumber, pin.name)}/';
           final String number = _threeDigits(photoCount);
           if (hasAnnotations) {
             zipEncoder.add(
@@ -2468,13 +3021,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             final Uint8List? edited =
                 await ProjectRepository.loadEditedPhotoBytes(
               projectId: widget.projectId,
+              documentId: pin.documentId,
               pinNumber: pin.number,
+              pinName: pin.name,
               photoId: photoId,
             );
             if (edited != null && edited.isNotEmpty) {
+              final String editedExtension = _isPng(edited) ? 'png' : 'jpg';
               zipEncoder.add(
                 ArchiveFile.noCompress(
-                  '$folder${number}_書き込み済み.png',
+                  '$folder${number}_書き込み済み.$editedExtension',
                   edited.length,
                   edited,
                 ),
@@ -2495,9 +3051,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
       );
       for (final PinData pin in sortedPins) {
         if ((exportedPhotoCounts[pin.id] ?? 0) == 0) {
+          final String documentFolder =
+              documentsById[pin.documentId]?.folderName ?? '01_図面';
           zipEncoder.add(
             ArchiveFile.directory(
-              '写真/${_threeDigits(exportNumbers[pin.id] ?? pin.number)}/',
+              '写真/$documentFolder/'
+              '${_pinPhotoFolderName(exportNumbers[pin.id] ?? pin.number, pin.name)}/',
             ),
             autoClose: true,
           );
@@ -2532,6 +3091,132 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           });
         }
       }
+    }
+  }
+
+  Future<void> _exportPinsOnlyMobile() async {
+    if (_pdfDocument == null || _isExporting) return;
+    if (_pins.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('書き出すピンがありません。')),
+      );
+      return;
+    }
+    final Set<_ExportContent> contents = <_ExportContent>{_ExportContent.pins};
+    final _ExportPageMode? pageMode = await _chooseExportPageMode(contents);
+    if (pageMode == null || !mounted) return;
+    _saveSelectedPinNote();
+    setState(() {
+      _isExporting = true;
+      _errorMessage = null;
+    });
+    int exportedCount = 0;
+    try {
+      _saveDebounce?.cancel();
+      await _enqueueSave();
+      final List<PinData> orderedPins = _documents
+          .expand(
+            (ProjectPdfDocument document) => pinsInExportOrder(
+              _pins.where(
+                (PinData pin) => pin.documentId == document.id,
+              ),
+            ),
+          )
+          .toList(growable: false);
+      final Map<String, int> exportNumbers = <String, int>{};
+      for (final ProjectPdfDocument document in _documents) {
+        exportNumbers.addAll(
+          buildExportPinNumbers(
+            orderedPins.where(
+              (PinData pin) => pin.documentId == document.id,
+            ),
+          ),
+        );
+      }
+      final List<PinData> exportPins = orderedPins
+          .map(
+            (PinData pin) => pin.copyWith(number: exportNumbers[pin.id]),
+          )
+          .toList(growable: false);
+
+      for (final ProjectPdfDocument document in _documents) {
+        final List<PinData> documentPins = exportPins
+            .where((PinData pin) => pin.documentId == document.id)
+            .toList(growable: false);
+        if (documentPins.isEmpty) continue;
+        final List<int> pageNumbers = pageMode == _ExportPageMode.allPages
+            ? <int>[
+                for (int page = 1; page <= document.pageCount; page++) page,
+              ]
+            : (_annotatedPagesForContents(
+                contents,
+                documentId: document.id,
+              ).toList()
+              ..sort());
+        if (pageNumbers.isEmpty) continue;
+
+        final Uint8List exportedPdf;
+        if (NativeProjectService.isAvailable) {
+          final String? sourcePath = await ProjectRepository.sourcePdfPath(
+            widget.projectId,
+            documentId: document.id,
+          );
+          if (sourcePath == null) {
+            throw StateError('${document.name}の元PDFが見つかりません。');
+          }
+          exportedPdf = await NativeProjectService.buildExportPdf(
+            sourcePath: sourcePath,
+            pins: documentPins.map(_serializePin).toList(growable: false),
+            strokes: const <Map<String, dynamic>>[],
+            pageNumbers: pageNumbers,
+          );
+        } else {
+          final Uint8List? sourceBytes =
+              await ProjectRepository.loadPdfDocument(
+            projectId: widget.projectId,
+            documentId: document.id,
+          );
+          if (sourceBytes == null || sourceBytes.isEmpty) {
+            throw StateError('${document.name}の元PDFが見つかりません。');
+          }
+          final pdfx.PdfDocument sourceDocument =
+              await pdfx.PdfDocument.openData(sourceBytes);
+          try {
+            exportedPdf = await _buildAnnotatedPdf(
+              document: sourceDocument,
+              strokesByPage: const <int, List<DrawingStroke>>{},
+              pageNumbers: pageNumbers,
+              pins: documentPins,
+              includeDrawings: false,
+            );
+          } finally {
+            await sourceDocument.close();
+          }
+        }
+        await ProjectRepository.saveMobileExportPdf(
+          projectId: widget.projectId,
+          fileName: '${document.folderName}_ピン付き.pdf',
+          bytes: exportedPdf,
+        );
+        exportedCount++;
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            exportedCount == 0
+                ? '書き出し対象のPDFがありません。'
+                : 'ピン付きPDFを$exportedCount件書き出しました。',
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('ピン付きPDFを書き出せませんでした。\n$error')),
+      );
+    } finally {
+      if (mounted) setState(() => _isExporting = false);
     }
   }
 
@@ -2606,12 +3291,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
   Map<String, dynamic> _serializePin(PinData pin) => <String, dynamic>{
         'id': pin.id,
+        'documentId': pin.documentId,
         'number': pin.number,
         'pageNumber': pin.pageNumber,
         'xRatio': pin.xRatio,
         'yRatio': pin.yRatio,
         'directionDegrees': pin.directionDegrees,
         'photoCount': pin.photoCount,
+        'name': pin.name,
         'note': pin.note,
         'colorValue': pin.colorValue,
         'opacity': pin.opacity,
@@ -2629,17 +3316,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   List<Map<String, dynamic>> _serializePins() =>
       _pins.map(_serializePin).toList(growable: false);
 
-  List<Map<String, dynamic>> _serializePinRedoHistory() => _redoPinEdits
-      .map(
-        (_PinEdit edit) => <String, dynamic>{
-          'kind': edit.kind.name,
-          'pinId': edit.pinId,
-          'index': edit.index,
-          if (edit.before != null) 'before': _serializePin(edit.before!),
-          if (edit.after != null) 'after': _serializePin(edit.after!),
-        },
-      )
-      .toList(growable: false);
+  List<Map<String, dynamic>> _serializePinHistory(Iterable<_PinEdit> edits) =>
+      edits
+          .map(
+            (_PinEdit edit) => <String, dynamic>{
+              'kind': edit.kind.name,
+              'pinId': edit.pinId,
+              'index': edit.index,
+              if (edit.before != null) 'before': _serializePin(edit.before!),
+              if (edit.after != null) 'after': _serializePin(edit.after!),
+            },
+          )
+          .toList(growable: false);
 
   PinData? _deserializePin(dynamic raw) {
     if (raw is! Map) return null;
@@ -2649,12 +3337,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     if (id.isEmpty) return null;
     return PinData(
       id: id,
+      documentId: map['documentId']?.toString() ?? 'main',
       number: (map['number'] as num?)?.toInt() ?? 1,
       pageNumber: (map['pageNumber'] as num?)?.toInt() ?? 1,
       xRatio: (map['xRatio'] as num?)?.toDouble() ?? 0,
       yRatio: (map['yRatio'] as num?)?.toDouble() ?? 0,
       directionDegrees: (map['directionDegrees'] as num?)?.toDouble() ?? 0,
       photoCount: (map['photoCount'] as num?)?.toInt() ?? 0,
+      name: map['name']?.toString() ?? '',
       note: map['note']?.toString() ?? '',
       colorValue: (map['colorValue'] as num?)?.toInt() ?? 0xFF1976D2,
       opacity: ((map['opacity'] as num?)?.toDouble() ?? 1).clamp(0.1, 1),
@@ -2697,8 +3387,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     return edits;
   }
 
-  List<Map<String, dynamic>> _serializeStrokes() => _strokesByPage.entries
-      .expand((MapEntry<int, List<DrawingStroke>> entry) => entry.value)
+  List<Map<String, dynamic>> _serializeStrokes() => _strokesByDocumentPage
+      .values
+      .expand((Map<int, List<DrawingStroke>> pages) => pages.values)
+      .expand((List<DrawingStroke> strokes) => strokes)
       .where(
         (DrawingStroke stroke) =>
             stroke.kind != DrawingKind.text || stroke.text.trim().isNotEmpty,
@@ -2724,31 +3416,48 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                 .toList(growable: false),
       };
 
-  Map<String, dynamic> _projectMetadata() => <String, dynamic>{
-        'pdfName': '$_projectName.pdf',
-        'pageCount': _pageCount,
-        'currentPage': _currentPage,
-        'nextPinNumber': _nextPinNumber,
-        'pinColor': _pinColor.toARGB32(),
-        'penColor': _penColor.toARGB32(),
-        'penWidth': _penWidth,
-        'pinOpacity': _pinOpacity,
-        'pinSizeScale': _pinSizeScale,
-        'penOpacity': _penOpacity,
-        'penBrush': _penBrush.name,
-        'shapeKind': _shapeKind.name,
-        'eraserWidth': _eraserWidth,
-        'textFontSize': _textFontSize,
-        'textBoxWidthRatio': _textBoxWidthRatio,
-        'photoAnnotations': _serializePhotoAnnotations(),
-        'boardBusinessName': _boardBusinessName,
-        'boardFacilityName': _boardFacilityName,
-        'pendingDirectionPinId': _pendingDirectionPinId,
-        'captureAfterDirectionPinId': _captureAfterDirectionPinId,
-        'pinRedoHistory': _serializePinRedoHistory(),
-        'pendingPhotoCleanupPinIds':
-            _pendingPhotoCleanupPinIds.toList(growable: false),
-      };
+  Map<String, dynamic> _projectMetadata() {
+    final List<ProjectPdfDocument> documents = _documents.map(
+      (ProjectPdfDocument document) {
+        return document.id == _activeDocumentId
+            ? document.copyWith(currentPage: _currentPage)
+            : document;
+      },
+    ).toList(growable: false);
+    return <String, dynamic>{
+      'pdfName': '$_projectName.pdf',
+      'pageCount': documents.fold<int>(
+        0,
+        (int total, ProjectPdfDocument document) => total + document.pageCount,
+      ),
+      'currentPage': _currentPage,
+      'nextPinNumber': _nextPinNumber,
+      'documents': documents
+          .map((ProjectPdfDocument document) => document.toJson())
+          .toList(growable: false),
+      'activeDocumentId': _activeDocumentId,
+      'pinColor': _pinColor.toARGB32(),
+      'penColor': _penColor.toARGB32(),
+      'penWidth': _penWidth,
+      'pinOpacity': _pinOpacity,
+      'pinSizeScale': _pinSizeScale,
+      'penOpacity': _penOpacity,
+      'penBrush': _penBrush.name,
+      'shapeKind': _shapeKind.name,
+      'eraserWidth': _eraserWidth,
+      'textFontSize': _textFontSize,
+      'textBoxWidthRatio': _textBoxWidthRatio,
+      'photoAnnotations': _serializePhotoAnnotations(),
+      'boardBusinessName': _boardBusinessName,
+      'boardFacilityName': _boardFacilityName,
+      'pendingDirectionPinId': _pendingDirectionPinId,
+      'captureAfterDirectionPinId': _captureAfterDirectionPinId,
+      'pinUndoHistory': _serializePinHistory(_undoPinEdits),
+      'pinRedoHistory': _serializePinHistory(_redoPinEdits),
+      'pendingPhotoCleanupPinIds':
+          _pendingPhotoCleanupPinIds.toList(growable: false),
+    };
+  }
 
   Future<void> _saveProjectNow() async {
     if (_isRestoring || _pdfBytes == null) return;
@@ -2796,18 +3505,32 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         );
       }
       if (savePdf && NativeProjectService.isAvailable) {
-        final String? sourcePath =
-            await ProjectRepository.sourcePdfPath(widget.projectId);
-        final String? outputPath =
-            await ProjectRepository.outputPdfPath(widget.projectId);
+        final String? sourcePath = await ProjectRepository.sourcePdfPath(
+          widget.projectId,
+          documentId: _activeDocumentId,
+        );
+        final String? outputPath = await ProjectRepository.outputPdfPath(
+          widget.projectId,
+          documentId: _activeDocumentId,
+        );
         if (sourcePath == null || outputPath == null) {
           throw StateError('PDFの保存先が見つかりません。');
         }
         await NativeProjectService.writeAnnotatedPdf(
           sourcePath: sourcePath,
           outputPath: outputPath,
-          pins: pins,
-          strokes: strokes,
+          pins: pins
+              .where(
+                (Map<String, dynamic> pin) =>
+                    pin['documentId']?.toString() == _activeDocumentId,
+              )
+              .toList(growable: false),
+          strokes: strokes
+              .where(
+                (Map<String, dynamic> stroke) =>
+                    stroke['documentId']?.toString() == _activeDocumentId,
+              )
+              .toList(growable: false),
         );
       }
       for (final String pinId in cleanupPinIds) {
@@ -2867,8 +3590,46 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     _isRestoring = true;
     Object? pencilRecoveryError;
     try {
-      final String? sourcePath =
-          await ProjectRepository.sourcePdfPath(widget.projectId);
+      final data = await ProjectRepository.loadProject(widget.projectId);
+      if (!mounted) return;
+      if (data == null) {
+        if (mounted) setState(() => _errorMessage = '案件データが見つかりません。');
+        return;
+      }
+      final List<ProjectPdfDocument> restoredDocuments =
+          (data['documents'] as List? ?? const <dynamic>[])
+              .whereType<Map>()
+              .map(
+                (Map<dynamic, dynamic> raw) => ProjectPdfDocument.fromJson(
+                  raw.map<String, dynamic>(
+                    (dynamic key, dynamic value) =>
+                        MapEntry<String, dynamic>(key.toString(), value),
+                  ),
+                ),
+              )
+              .toList(growable: true);
+      if (restoredDocuments.isEmpty) {
+        restoredDocuments.add(
+          ProjectPdfDocument(
+            id: 'main',
+            name: data['pdfName']?.toString() ?? '${widget.projectName}.pdf',
+            folderName:
+                '01_${_documentStem(data['pdfName']?.toString() ?? widget.projectName)}',
+            pageCount: (data['pageCount'] as num?)?.toInt() ?? 0,
+            currentPage: (data['currentPage'] as num?)?.toInt() ?? 1,
+          ),
+        );
+      }
+      final String requestedDocumentId =
+          data['activeDocumentId']?.toString() ?? restoredDocuments.first.id;
+      final ProjectPdfDocument activeDocument = restoredDocuments.firstWhere(
+        (ProjectPdfDocument document) => document.id == requestedDocumentId,
+        orElse: () => restoredDocuments.first,
+      );
+      final String? sourcePath = await ProjectRepository.sourcePdfPath(
+        widget.projectId,
+        documentId: activeDocument.id,
+      );
       if (!mounted) return;
       if (sourcePath != null) {
         try {
@@ -2878,13 +3639,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         }
       }
       if (!mounted) return;
-      final data = await ProjectRepository.loadProject(widget.projectId);
-      if (!mounted) return;
-      if (data == null) {
-        if (mounted) setState(() => _errorMessage = '案件データが見つかりません。');
-        return;
-      }
-      final dynamic storedPdf = data['pdfBytes'];
+      final dynamic storedPdf = await ProjectRepository.loadPdfDocument(
+            projectId: widget.projectId,
+            documentId: activeDocument.id,
+          ) ??
+          data['pdfBytes'];
       final Uint8List persistentBytes = storedPdf is Uint8List
           ? Uint8List.fromList(storedPdf)
           : storedPdf is List<int>
@@ -2909,20 +3668,27 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           .toList(growable: true);
       final List<_PinEdit> restoredRedoPinEdits =
           _deserializePinRedoHistory(data['pinRedoHistory']);
+      final List<_PinEdit> restoredUndoPinEdits =
+          _deserializePinRedoHistory(data['pinUndoHistory']);
       final Set<String> restoredCleanupPinIds =
           (data['pendingPhotoCleanupPinIds'] as List? ?? const <dynamic>[])
               .map((dynamic value) => value.toString())
               .where((String id) => id.isNotEmpty)
               .toSet();
-      final restoredStrokes = <int, List<DrawingStroke>>{};
+      final restoredStrokes = <String, Map<int, List<DrawingStroke>>>{};
       for (final v in (data['strokes'] as List? ?? const [])) {
         final DrawingStroke? stroke = deserializeDrawingStroke(
           v,
           defaultPageNumber: 1,
         );
         if (stroke == null) continue;
-        final int page = stroke.pageNumber;
-        restoredStrokes.putIfAbsent(page, () => []).add(stroke);
+        restoredStrokes
+            .putIfAbsent(
+              stroke.documentId,
+              () => <int, List<DrawingStroke>>{},
+            )
+            .putIfAbsent(stroke.pageNumber, () => <DrawingStroke>[])
+            .add(stroke);
       }
       final Map<String, List<DrawingStroke>> restoredPhotoAnnotations =
           <String, List<DrawingStroke>>{};
@@ -2982,18 +3748,31 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         }
         return !restoredActivePinIds.contains(edit.pinId);
       });
+      restoredUndoPinEdits.removeWhere((_PinEdit edit) {
+        if (edit.kind == _PinEditKind.delete) {
+          return edit.before == null ||
+              restoredActivePinIds.contains(edit.pinId);
+        }
+        return !restoredActivePinIds.contains(edit.pinId);
+      });
       if (!mounted) return;
       setState(() {
         _projectName = data['projectName']?.toString() ?? widget.projectName;
+        _documents
+          ..clear()
+          ..addAll(restoredDocuments);
+        _currentDocumentId = activeDocument.id;
         _pdfDocument = document;
         _thumbnailFutures.clear();
         _pdfBytes = persistentBytes;
-        _pdfPath = '${widget.projectId}-${persistentBytes.length}';
+        _pdfPath = '${activeDocument.id}-${persistentBytes.length}';
         _pageCount = document.pagesCount;
         _pins
           ..clear()
           ..addAll(restoredPins);
-        _undoPinEdits.clear();
+        _undoPinEdits
+          ..clear()
+          ..addAll(restoredUndoPinEdits);
         _redoPinEdits
           ..clear()
           ..addAll(restoredRedoPinEdits);
@@ -3002,6 +3781,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           ...restoredRedoPinEdits
               .where((_PinEdit edit) => edit.kind == _PinEditKind.add)
               .map((_PinEdit edit) => edit.pinId),
+          ...restoredUndoPinEdits
+              .where((_PinEdit edit) => edit.kind == _PinEditKind.delete)
+              .map((_PinEdit edit) => edit.pinId),
         };
         _pendingPhotoCleanupPinIds
           ..clear()
@@ -3009,14 +3791,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
             restoredCleanupPinIds
                 .where((String id) => !recoverablePinIds.contains(id)),
           );
-        _strokesByPage
+        _strokesByDocumentPage
           ..clear()
           ..addAll(restoredStrokes);
         _photoAnnotationsById
           ..clear()
           ..addAll(restoredPhotoAnnotations);
-        _undoDrawingEditsByPage.clear();
-        _redoDrawingEditsByPage.clear();
+        _undoDrawingEditsByDocumentPage.clear();
+        _redoDrawingEditsByDocumentPage.clear();
         _activeStroke = null;
         _activeStrokeIndex = null;
         _activeEraserPage = null;
@@ -3032,8 +3814,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _photoStorageVerifiedPinIds.clear();
         _photoStorageNeedsRescanPinIds.clear();
         _photoSavesInProgressByPinId.clear();
-        _nextPinNumber =
-            (data['nextPinNumber'] as num?)?.toInt() ?? (_pins.length + 1);
+        _refreshNextPinNumber();
         _pinColor = Color((data['pinColor'] as num?)?.toInt() ?? 0xFF1976D2);
         _pinOpacity =
             ((data['pinOpacity'] as num?)?.toDouble() ?? 1).clamp(0.1, 1);
@@ -3043,7 +3824,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _boardBusinessName =
             data['boardBusinessName']?.toString() ?? _projectName;
         _boardFacilityName = data['boardFacilityName']?.toString() ?? '';
-        _selectedTool = null;
+        _selectedTool = widget.simplifiedMobile ? FieldTool.pin : null;
         _penWidth = (data['penWidth'] as num?)?.toDouble() ?? 3;
         _penOpacity =
             ((data['penOpacity'] as num?)?.toDouble() ?? 1).clamp(0.1, 1);
@@ -3061,8 +3842,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         _textBoxWidthRatio =
             ((data['textBoxWidthRatio'] as num?)?.toDouble() ?? 0.45)
                 .clamp(0.12, 0.8);
-        _currentPage =
-            ((data['currentPage'] as num?)?.toInt() ?? 1).clamp(1, _pageCount);
+        _currentPage = activeDocument.currentPage.clamp(1, _pageCount);
         final String? pendingId = data['pendingDirectionPinId']?.toString();
         _pendingDirectionPinId =
             restoredPins.any((PinData pin) => pin.id == pendingId)
@@ -3227,6 +4007,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           (List<DrawingPoint> points) => DrawingStroke(
             id: '$sourceId-erase-${_activeEraserEditId ?? 'edit'}'
                 '-${_eraserFragmentSequence++}',
+            documentId: stroke.documentId,
             pageNumber: stroke.pageNumber,
             points: points,
             width: stroke.width,
@@ -3652,7 +4433,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   Future<void> _handleCanvasTap(Offset position) async {
     if (_selectedTool == FieldTool.select) {
       final DrawingStroke? selected = _annotationAt(position);
-      setState(() => _selectedAnnotationId = selected?.id);
+      setState(() {
+        _selectedAnnotationId = selected?.id;
+        _selectedAnnotationIds =
+            selected == null ? <String>{} : <String>{selected.id};
+      });
       return;
     }
     if (_selectedTool == FieldTool.shape &&
@@ -3686,6 +4471,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
 
     final DrawingStroke annotation = DrawingStroke(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
+      documentId: _activeDocumentId,
       pageNumber: _currentPage,
       points: <DrawingPoint>[DrawingPoint(position: position)],
       width: _penWidth,
@@ -3723,6 +4509,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     }
     final DrawingStroke stroke = DrawingStroke(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
+      documentId: _activeDocumentId,
       pageNumber: _currentPage,
       width: _penWidth,
       color: _penColor,
@@ -3765,7 +4552,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   Future<void> _handleCanvasDoubleTap(Offset position) async {
     final DrawingStroke? hit = _annotationAt(position);
     if (hit?.kind != DrawingKind.text) return;
-    setState(() => _selectedAnnotationId = hit!.id);
+    setState(() {
+      _selectedAnnotationId = hit!.id;
+      _selectedAnnotationIds = <String>{hit.id};
+    });
     await _editSelectedText();
   }
 
@@ -3821,7 +4611,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     }
     _movingTextOriginal = hit;
     _movingTextGrabOffset = hit.points.first.position - position;
-    setState(() => _selectedAnnotationId = hit.id);
+    setState(() {
+      _selectedAnnotationId = hit.id;
+      _selectedAnnotationIds = <String>{hit.id};
+    });
     return true;
   }
 
@@ -3924,6 +4717,66 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
     return null;
   }
 
+  Rect _rectFromNormalizedPoints(Offset first, Offset second) => Rect.fromLTRB(
+        math.min(first.dx, second.dx),
+        math.min(first.dy, second.dy),
+        math.max(first.dx, second.dx),
+        math.max(first.dy, second.dy),
+      );
+
+  void _startSelectionDrag(Offset position) {
+    if (_selectedTool != FieldTool.select) return;
+    setState(() {
+      _selectionDragStart = position;
+      _selectionRect = Rect.fromPoints(position, position);
+      _selectedAnnotationId = null;
+      _selectedAnnotationIds = <String>{};
+    });
+  }
+
+  void _updateSelectionDrag(Offset position) {
+    final Offset? start = _selectionDragStart;
+    if (start == null) return;
+    setState(() => _selectionRect = _rectFromNormalizedPoints(start, position));
+  }
+
+  void _finishSelectionDrag(Offset position) {
+    final Offset? start = _selectionDragStart;
+    if (start == null) return;
+    final Rect normalized = _rectFromNormalizedPoints(start, position);
+    final Size pageSize = Size(_pageAspectRatio * 1000, 1000);
+    final Rect pixelRect = Rect.fromLTRB(
+      normalized.left * pageSize.width,
+      normalized.top * pageSize.height,
+      normalized.right * pageSize.width,
+      normalized.bottom * pageSize.height,
+    );
+    final Set<String> selected = pixelRect.width < 3 || pixelRect.height < 3
+        ? <String>{}
+        : (_strokesByPage[_currentPage] ?? const <DrawingStroke>[])
+            .where(
+              (DrawingStroke stroke) =>
+                  stroke.points.isNotEmpty &&
+                  drawingStrokeBounds(stroke, pageSize).overlaps(pixelRect),
+            )
+            .map((DrawingStroke stroke) => stroke.id)
+            .toSet();
+    setState(() {
+      _selectionDragStart = null;
+      _selectionRect = null;
+      _selectedAnnotationIds = selected;
+      _selectedAnnotationId = selected.length == 1 ? selected.first : null;
+    });
+  }
+
+  void _cancelSelectionDrag() {
+    if (_selectionDragStart == null && _selectionRect == null) return;
+    setState(() {
+      _selectionDragStart = null;
+      _selectionRect = null;
+    });
+  }
+
   void _changeSelectedAnnotation({
     Color? color,
     double? width,
@@ -3968,23 +4821,26 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   void _deleteSelectedAnnotation() {
-    final DrawingStroke? selected = _selectedAnnotation;
     final List<DrawingStroke>? strokes = _strokesByPage[_currentPage];
-    final int index = strokes?.indexWhere(
-          (DrawingStroke stroke) => stroke.id == selected?.id,
-        ) ??
-        -1;
-    if (selected == null || strokes == null || index < 0) return;
+    final Set<String> ids = _selectedAnnotationIds.isNotEmpty
+        ? _selectedAnnotationIds
+        : <String>{if (_selectedAnnotationId != null) _selectedAnnotationId!};
+    if (strokes == null || ids.isEmpty) return;
+    final List<_IndexedDrawingStroke> removed = <_IndexedDrawingStroke>[
+      for (int index = 0; index < strokes.length; index++)
+        if (ids.contains(strokes[index].id))
+          _IndexedDrawingStroke(stroke: strokes[index], index: index),
+    ];
+    if (removed.isEmpty) return;
     setState(() {
-      strokes.removeAt(index);
+      strokes.removeWhere((DrawingStroke stroke) => ids.contains(stroke.id));
       _selectedAnnotationId = null;
+      _selectedAnnotationIds = <String>{};
       _undoDrawingEditsByPage
           .putIfAbsent(_currentPage, () => <_DrawingEdit>[])
           .add(
             _DrawingEdit(
-              removedStrokes: <_IndexedDrawingStroke>[
-                _IndexedDrawingStroke(stroke: selected, index: index),
-              ],
+              removedStrokes: removed,
               addedStrokes: const <_IndexedDrawingStroke>[],
             ),
           );
@@ -3994,9 +4850,44 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   }
 
   Future<void> _showSelectionSettings() async {
-    if (_selectedAnnotation == null) {
+    if (_selectedAnnotationIds.isEmpty && _selectedAnnotation == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('変更する線・図形・テキストを選択してください。')),
+      );
+      return;
+    }
+    if (_selectedAnnotationIds.length > 1) {
+      await showModalBottomSheet<void>(
+        context: context,
+        backgroundColor: AppColors.panel,
+        builder: (BuildContext context) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                Text(
+                  '${_selectedAnnotationIds.length}件を選択中',
+                  style: const TextStyle(
+                    color: AppColors.textPrimary,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 16),
+                OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.pop(context);
+                    _deleteSelectedAnnotation();
+                  },
+                  icon: const Icon(Icons.delete_outline_rounded),
+                  label: const Text('選択した注釈を削除'),
+                ),
+              ],
+            ),
+          ),
+        ),
       );
       return;
     }
@@ -4405,7 +5296,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                     onSelectionChanged: (Set<DrawingBrush> values) {
                       setState(() {
                         _penBrush = values.first;
-                        _eraserEnabled = false;
                         if (_penBrush == DrawingBrush.highlighter &&
                             _penOpacity > 0.55) {
                           _penOpacity = 0.35;
@@ -4426,13 +5316,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                     children: _fieldPaletteColors.map((Color color) {
                       return _PaletteColorButton(
                         color: color,
-                        selected: _penColor.toARGB32() == color.toARGB32() &&
-                            !_eraserEnabled,
+                        selected: _penColor.toARGB32() == color.toARGB32(),
                         onTap: () {
-                          setState(() {
-                            _penColor = color;
-                            _eraserEnabled = false;
-                          });
+                          setState(() => _penColor = color);
                           setSheetState(() {});
                           _scheduleSave(
                             pins: false,
@@ -4476,39 +5362,49 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                       );
                     },
                   ),
-                  const SizedBox(height: 8),
-                  SizedBox(
-                    width: double.infinity,
-                    child: OutlinedButton.icon(
-                      onPressed: () {
-                        setState(() => _eraserEnabled = !_eraserEnabled);
-                        setSheetState(() {});
-                      },
-                      icon: const Icon(Icons.auto_fix_off_rounded),
-                      label: Text(
-                        _eraserEnabled ? '消しゴム：ON' : '消しゴム',
-                      ),
-                    ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _showEraserSettings() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: AppColors.panel,
+      builder: (BuildContext context) => StatefulBuilder(
+        builder: (BuildContext context, StateSetter setSheetState) {
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  const Text(
+                    '消しゴム設定',
+                    style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
                   ),
-                  if (_eraserEnabled) ...<Widget>[
-                    const SizedBox(height: 12),
-                    Text('消しゴムの太さ ${_eraserWidth.round()}'),
-                    Slider(
-                      value: _eraserWidth,
-                      min: 6,
-                      max: 80,
-                      divisions: 37,
-                      onChanged: (double value) {
-                        setState(() => _eraserWidth = value);
-                        setSheetState(() {});
-                        _scheduleSave(
-                          pins: false,
-                          drawings: false,
-                          meta: true,
-                        );
-                      },
-                    ),
-                  ],
+                  const SizedBox(height: 18),
+                  Text('消しゴムの太さ ${_eraserWidth.round()}'),
+                  Slider(
+                    value: _eraserWidth,
+                    min: 6,
+                    max: 80,
+                    divisions: 37,
+                    onChanged: (double value) {
+                      setState(() => _eraserWidth = value);
+                      setSheetState(() {});
+                      _scheduleSave(
+                        pins: false,
+                        drawings: false,
+                        meta: true,
+                      );
+                    },
+                  ),
                 ],
               ),
             ),
@@ -4684,6 +5580,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   @override
   Widget build(BuildContext context) {
     final PinData? selectedPin = _selectedPin;
+    final bool mobile = widget.simplifiedMobile;
+    final ProjectPdfDocument? activeDocument = _activeDocument;
 
     return PopScope<void>(
       canPop: _allowPop,
@@ -4703,16 +5601,99 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
           backgroundColor: AppColors.panel,
           foregroundColor: AppColors.textPrimary,
           titleSpacing: 8,
-          title: Text(
-            _projectName,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(
-              fontWeight: FontWeight.w700,
-            ),
-          ),
+          title: mobile
+              ? Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Text(
+                      _projectName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    if (activeDocument != null)
+                      Text(
+                        activeDocument.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: AppColors.textSecondary,
+                        ),
+                      ),
+                  ],
+                )
+              : Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: Text(
+                        _projectName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    if (_documents.isNotEmpty)
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 260),
+                        child: DropdownButtonHideUnderline(
+                          child: DropdownButton<String>(
+                            value: _activeDocumentId,
+                            isExpanded: true,
+                            items: _documents
+                                .map(
+                                  (ProjectPdfDocument document) =>
+                                      DropdownMenuItem<String>(
+                                    value: document.id,
+                                    child: Text(
+                                      document.name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                )
+                                .toList(growable: false),
+                            onChanged: _isPickingFile
+                                ? null
+                                : (String? value) {
+                                    if (value != null) {
+                                      unawaited(_switchDocument(value));
+                                    }
+                                  },
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
           actions: [
             if (_pdfDocument != null)
+              IconButton(
+                tooltip: 'PDFを追加',
+                onPressed: _isPickingFile ? null : () => _pickPdf(append: true),
+                icon: const Icon(Icons.note_add_rounded),
+              ),
+            if (mobile && _documents.length > 1)
+              PopupMenuButton<String>(
+                tooltip: 'PDFを切り替え',
+                icon: const Icon(Icons.picture_as_pdf_rounded),
+                initialValue: _activeDocumentId,
+                onSelected: (String documentId) {
+                  unawaited(_switchDocument(documentId));
+                },
+                itemBuilder: (BuildContext context) => _documents
+                    .map(
+                      (ProjectPdfDocument document) => PopupMenuItem<String>(
+                        value: document.id,
+                        child: Text(document.name),
+                      ),
+                    )
+                    .toList(growable: false),
+              ),
+            if (_pdfDocument != null && !mobile)
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 8),
                 child: Center(
@@ -4770,7 +5751,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                 onPressed: _isRenderingPage ? null : _showPageList,
                 icon: const Icon(Icons.grid_view_rounded),
               ),
-            if (_pdfDocument != null)
+            if (_pdfDocument != null && !mobile)
               Center(
                 child: Container(
                   margin: const EdgeInsets.only(right: 8),
@@ -4815,7 +5796,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   ),
                 ),
               ),
-            const SizedBox(width: 6),
+            if (!mobile) const SizedBox(width: 6),
           ],
         ),
         body: AbsorbPointer(
@@ -4832,42 +5813,81 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                         left: 0,
                         bottom: 0,
                         right:
-                            selectedPin != null && !_suppressPinPanel ? 320 : 0,
+                            !mobile && selectedPin != null && !_suppressPinPanel
+                                ? 320
+                                : 0,
                         child: _buildDrawingArea(),
                       ),
-                      AnimatedPositioned(
-                        duration: const Duration(
-                          milliseconds: 220,
+                      if (!mobile)
+                        AnimatedPositioned(
+                          duration: const Duration(
+                            milliseconds: 220,
+                          ),
+                          curve: Curves.easeOut,
+                          top: 0,
+                          right: selectedPin == null || _suppressPinPanel
+                              ? -320
+                              : 0,
+                          bottom: 0,
+                          width: 320,
+                          child: selectedPin == null ||
+                                  _suppressPinPanel ||
+                                  _noteController == null
+                              ? const SizedBox.shrink()
+                              : PinSidePanel(
+                                  pin: selectedPin,
+                                  photos: _photosForPin(selectedPin.id),
+                                  noteController: _noteController!,
+                                  onClose: _closePinPanel,
+                                  onDelete: _deleteSelectedPin,
+                                  onNameChanged: _updateSelectedPinName,
+                                  onAddPhotos: _addPhotosToSelectedPin,
+                                  onShowAllPhotos: _showAllPhotosForSelectedPin,
+                                  onPhotoTap: (PhotoData photo) =>
+                                      _openPhotoEditor(selectedPin, photo),
+                                  directionEditing:
+                                      _pendingDirectionPinId == selectedPin.id,
+                                  onChangeDirection:
+                                      _toggleSelectedPinDirectionEditing,
+                                  onNoteChanged: (_) {
+                                    _saveSelectedPinNote();
+                                  },
+                                ),
                         ),
-                        curve: Curves.easeOut,
-                        top: 0,
-                        right:
-                            selectedPin == null || _suppressPinPanel ? -320 : 0,
-                        bottom: 0,
-                        width: 320,
-                        child: selectedPin == null ||
-                                _suppressPinPanel ||
-                                _noteController == null
-                            ? const SizedBox.shrink()
-                            : PinSidePanel(
-                                pin: selectedPin,
-                                photos: _photosForPin(selectedPin.id),
-                                noteController: _noteController!,
-                                onClose: _closePinPanel,
-                                onDelete: _deleteSelectedPin,
-                                onAddPhotos: _addPhotosToSelectedPin,
-                                onShowAllPhotos: _showAllPhotosForSelectedPin,
-                                onPhotoTap: (PhotoData photo) =>
-                                    _openPhotoEditor(selectedPin, photo),
-                                directionEditing:
-                                    _pendingDirectionPinId == selectedPin.id,
-                                onChangeDirection:
-                                    _toggleSelectedPinDirectionEditing,
-                                onNoteChanged: (_) {
-                                  _saveSelectedPinNote();
-                                },
-                              ),
-                      ),
+                      if (mobile &&
+                          selectedPin != null &&
+                          !_suppressPinPanel &&
+                          _noteController != null)
+                        Positioned(
+                          left: 8,
+                          right: 8,
+                          bottom: 8,
+                          height: MediaQuery.sizeOf(context).height * 0.52,
+                          child: Material(
+                            elevation: 20,
+                            borderRadius: BorderRadius.circular(16),
+                            clipBehavior: Clip.antiAlias,
+                            child: PinSidePanel(
+                              pin: selectedPin,
+                              photos: _photosForPin(selectedPin.id),
+                              noteController: _noteController!,
+                              onClose: _closePinPanel,
+                              onDelete: _deleteSelectedPin,
+                              onNameChanged: _updateSelectedPinName,
+                              onAddPhotos: _addPhotosToSelectedPin,
+                              onShowAllPhotos: _showAllPhotosForSelectedPin,
+                              onPhotoTap: (PhotoData photo) =>
+                                  _openPhotoReadOnly(selectedPin, photo),
+                              directionEditing:
+                                  _pendingDirectionPinId == selectedPin.id,
+                              onChangeDirection:
+                                  _toggleSelectedPinDirectionEditing,
+                              onNoteChanged: (_) {
+                                _saveSelectedPinNote();
+                              },
+                            ),
+                          ),
+                        ),
                     ],
                   ),
           ),
@@ -4975,17 +5995,19 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   strokes: _currentPageStrokes,
                   pinModeEnabled: _selectedTool == FieldTool.pin,
                   penModeEnabled: _selectedTool == FieldTool.pen ||
+                      _selectedTool == FieldTool.eraser ||
                       (_selectedTool == FieldTool.shape &&
                           _shapeKind != DrawingKind.polyline),
                   selectionModeEnabled: _selectedTool == FieldTool.select,
                   textModeEnabled: _selectedTool == FieldTool.text,
                   polylineModeEnabled: _selectedTool == FieldTool.shape &&
                       _shapeKind == DrawingKind.polyline,
-                  eraserEnabled:
-                      _selectedTool == FieldTool.pen && _eraserEnabled,
+                  eraserEnabled: _selectedTool == FieldTool.eraser,
                   eraserRadiusNormalized:
                       (_eraserWidth / 1120).clamp(0.006, 0.08),
                   selectedStrokeId: _selectedAnnotationId,
+                  selectedStrokeIds: _selectedAnnotationIds,
+                  selectionRect: _selectionRect,
                   selectedPinId: _selectedPinId,
                   pendingDirectionPinId: _pendingDirectionPinId,
                   onAddPin: _addPin,
@@ -5012,6 +6034,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
                   onAnnotationTransformUpdate: _updateAnnotationTransform,
                   onAnnotationTransformEnd: _finishAnnotationTransform,
                   onAnnotationTransformCancel: _cancelAnnotationTransform,
+                  onSelectionDragStart: _startSelectionDrag,
+                  onSelectionDragUpdate: _updateSelectionDrag,
+                  onSelectionDragEnd: _finishSelectionDrag,
+                  onSelectionDragCancel: _cancelSelectionDrag,
                 ),
         ),
         if (imageBytes != null)
@@ -5216,6 +6242,79 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
   Widget _buildBottomToolbar() {
     final bool pageInteractionAvailable =
         _pageImageBytes != null && !_isRenderingPage;
+    if (widget.simplifiedMobile) {
+      return Material(
+        color: AppColors.panel,
+        elevation: 12,
+        child: SafeArea(
+          top: false,
+          child: SizedBox(
+            height: 72,
+            child: Row(
+              children: <Widget>[
+                Expanded(
+                  child: _ToolbarButton(
+                    icon: Icons.chevron_left_rounded,
+                    label: '前へ',
+                    selected: null,
+                    enabled: pageInteractionAvailable && _currentPage > 1,
+                    onPressed: () => _goToPage(_currentPage - 1),
+                  ),
+                ),
+                Expanded(
+                  child: _ToolbarButton(
+                    icon: Icons.location_on_rounded,
+                    iconColor: _pinColor,
+                    label: 'ピン',
+                    selected: _selectedTool == FieldTool.pin,
+                    enabled: pageInteractionAvailable,
+                    onPressed: () => _selectTool(FieldTool.pin),
+                  ),
+                ),
+                Expanded(
+                  child: _ToolbarButton(
+                    icon: Icons.undo_rounded,
+                    label: '戻す',
+                    selected: null,
+                    enabled: pageInteractionAvailable && _canUndoCurrentTool,
+                    onPressed: _undo,
+                  ),
+                ),
+                Expanded(
+                  child: _ToolbarButton(
+                    icon: Icons.redo_rounded,
+                    label: 'やり直す',
+                    selected: null,
+                    enabled: pageInteractionAvailable && _canRedoCurrentTool,
+                    onPressed: _redo,
+                  ),
+                ),
+                Expanded(
+                  child: _ToolbarButton(
+                    icon: Icons.chevron_right_rounded,
+                    label: '次へ',
+                    selected: null,
+                    enabled: pageInteractionAvailable &&
+                        _pageCount > 0 &&
+                        _currentPage < _pageCount,
+                    onPressed: () => _goToPage(_currentPage + 1),
+                  ),
+                ),
+                Expanded(
+                  child: _ToolbarButton(
+                    icon: Icons.picture_as_pdf_rounded,
+                    label: _isExporting ? '作成中' : 'PDF出力',
+                    selected: null,
+                    enabled: !_isExporting,
+                    onPressed: _exportPinsOnlyMobile,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
     return Material(
       color: AppColors.panel,
       elevation: 12,
@@ -5223,72 +6322,89 @@ class _PdfViewerScreenState extends State<PdfViewerScreen>
         top: false,
         child: SizedBox(
           height: 78,
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: <Widget>[
-              _ToolbarButton(
-                icon: Icons.select_all_rounded,
-                label: '選択',
-                selected: _selectedTool == FieldTool.select,
-                enabled: pageInteractionAvailable,
-                onPressed: () => _selectTool(FieldTool.select),
-              ),
-              _ToolbarButton(
-                icon: Icons.location_on_rounded,
-                iconColor: _pinColor,
-                label: 'ピン',
-                selected: _selectedTool == FieldTool.pin,
-                enabled: pageInteractionAvailable,
-                onPressed: () => _selectTool(FieldTool.pin),
-              ),
-              _ToolbarButton(
-                icon: _eraserEnabled
-                    ? Icons.auto_fix_off_rounded
-                    : Icons.edit_rounded,
-                iconColor: _eraserEnabled ? Colors.white : _penColor,
-                label: _eraserEnabled ? '消しゴム' : 'ペン',
-                selected: _selectedTool == FieldTool.pen,
-                enabled: pageInteractionAvailable,
-                onPressed: () => _selectTool(FieldTool.pen),
-              ),
-              _ToolbarButton(
-                icon: Icons.category_outlined,
-                iconColor: _penColor,
-                label: '図形',
-                selected: _selectedTool == FieldTool.shape,
-                enabled: pageInteractionAvailable,
-                onPressed: () => _selectTool(FieldTool.shape),
-              ),
-              _ToolbarButton(
-                icon: Icons.text_fields_rounded,
-                iconColor: _penColor,
-                label: 'テキスト',
-                selected: _selectedTool == FieldTool.text,
-                enabled: pageInteractionAvailable,
-                onPressed: () => _selectTool(FieldTool.text),
-              ),
-              _ToolbarButton(
-                icon: Icons.undo_rounded,
-                label: '戻る',
-                selected: null,
-                enabled: pageInteractionAvailable && _canUndoCurrentTool,
-                onPressed: _undo,
-              ),
-              _ToolbarButton(
-                icon: Icons.redo_rounded,
-                label: 'やり直し',
-                selected: null,
-                enabled: pageInteractionAvailable && _canRedoCurrentTool,
-                onPressed: _redo,
-              ),
-              _ToolbarButton(
-                icon: Icons.ios_share_rounded,
-                label: _isExporting ? '書出中' : '書き出し',
-                selected: null,
-                enabled: !_isExporting,
-                onPressed: _exportProject,
-              ),
-            ],
+          child: LayoutBuilder(
+            builder: (BuildContext context, BoxConstraints constraints) {
+              return SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(minWidth: constraints.maxWidth),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: <Widget>[
+                      _ToolbarButton(
+                        icon: Icons.select_all_rounded,
+                        label: '選択',
+                        selected: _selectedTool == FieldTool.select,
+                        enabled: pageInteractionAvailable,
+                        onPressed: () => _selectTool(FieldTool.select),
+                      ),
+                      _ToolbarButton(
+                        icon: Icons.location_on_rounded,
+                        iconColor: _pinColor,
+                        label: 'ピン',
+                        selected: _selectedTool == FieldTool.pin,
+                        enabled: pageInteractionAvailable,
+                        onPressed: () => _selectTool(FieldTool.pin),
+                      ),
+                      _ToolbarButton(
+                        icon: Icons.edit_rounded,
+                        iconColor: _penColor,
+                        label: 'ペン',
+                        selected: _selectedTool == FieldTool.pen,
+                        enabled: pageInteractionAvailable,
+                        onPressed: () => _selectTool(FieldTool.pen),
+                      ),
+                      _ToolbarButton(
+                        icon: Icons.auto_fix_off_rounded,
+                        label: '消しゴム',
+                        selected: _selectedTool == FieldTool.eraser,
+                        enabled: pageInteractionAvailable,
+                        onPressed: () => _selectTool(FieldTool.eraser),
+                      ),
+                      _ToolbarButton(
+                        icon: Icons.category_outlined,
+                        iconColor: _penColor,
+                        label: '図形',
+                        selected: _selectedTool == FieldTool.shape,
+                        enabled: pageInteractionAvailable,
+                        onPressed: () => _selectTool(FieldTool.shape),
+                      ),
+                      _ToolbarButton(
+                        icon: Icons.text_fields_rounded,
+                        iconColor: _penColor,
+                        label: 'テキスト',
+                        selected: _selectedTool == FieldTool.text,
+                        enabled: pageInteractionAvailable,
+                        onPressed: () => _selectTool(FieldTool.text),
+                      ),
+                      _ToolbarButton(
+                        icon: Icons.undo_rounded,
+                        label: '戻る',
+                        selected: null,
+                        enabled:
+                            pageInteractionAvailable && _canUndoCurrentTool,
+                        onPressed: _undo,
+                      ),
+                      _ToolbarButton(
+                        icon: Icons.redo_rounded,
+                        label: 'やり直し',
+                        selected: null,
+                        enabled:
+                            pageInteractionAvailable && _canRedoCurrentTool,
+                        onPressed: _redo,
+                      ),
+                      _ToolbarButton(
+                        icon: Icons.ios_share_rounded,
+                        label: _isExporting ? '書出中' : '書き出し',
+                        selected: null,
+                        enabled: !_isExporting,
+                        onPressed: _exportProject,
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
           ),
         ),
       ),

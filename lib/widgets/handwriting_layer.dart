@@ -15,14 +15,16 @@ double drawingStrokeWidth(DrawingStroke stroke, double pressure) {
   };
 }
 
-Color _drawingColor(DrawingStroke stroke) {
-  final double effectiveOpacity = switch (stroke.brush) {
+double _drawingOpacity(DrawingStroke stroke) {
+  final double brushOpacity = switch (stroke.brush) {
     DrawingBrush.highlighter => stroke.opacity.clamp(0.05, 0.55),
     _ => stroke.opacity.clamp(0.05, 1.0),
   };
-  return stroke.color.withValues(
-    alpha: (stroke.color.a * effectiveOpacity).clamp(0.0, 1.0),
-  );
+  return (stroke.color.a * brushOpacity).clamp(0.0, 1.0);
+}
+
+Color _drawingColor(DrawingStroke stroke) {
+  return stroke.color.withValues(alpha: _drawingOpacity(stroke));
 }
 
 Rect drawingStrokeBounds(DrawingStroke stroke, Size size) {
@@ -119,18 +121,35 @@ void paintDrawingStrokes(
   Iterable<DrawingStroke> strokes, {
   double widthScale = 1,
   String? selectedStrokeId,
+  Set<String> selectedStrokeIds = const <String>{},
 }) {
   for (final DrawingStroke stroke in strokes) {
     if (stroke.points.isEmpty) {
       continue;
     }
 
-    final Color color = _drawingColor(stroke);
+    final double opacity = _drawingOpacity(stroke);
+    final bool compositeAsSingleStroke = opacity < 0.999 &&
+        stroke.points.length > 1 &&
+        (stroke.kind == DrawingKind.freehand ||
+            stroke.kind == DrawingKind.polyline);
+    if (compositeAsSingleStroke) {
+      final double layerPadding =
+          drawingStrokeWidth(stroke, 1) * widthScale + 6;
+      canvas.saveLayer(
+        drawingStrokeBounds(stroke, size).inflate(layerPadding),
+        Paint()..color = Colors.white.withValues(alpha: opacity),
+      );
+    }
+    final Color color = compositeAsSingleStroke
+        ? stroke.color.withValues(alpha: 1)
+        : _drawingColor(stroke);
 
     if (stroke.kind == DrawingKind.text) {
       final DrawingPoint anchor = stroke.points.first;
-      final bool showPlaceholder =
-          stroke.text.isEmpty && selectedStrokeId == stroke.id;
+      final bool showPlaceholder = stroke.text.isEmpty &&
+          (selectedStrokeId == stroke.id ||
+              selectedStrokeIds.contains(stroke.id));
       if (stroke.text.isNotEmpty || showPlaceholder) {
         final TextPainter painter = TextPainter(
           text: TextSpan(
@@ -233,7 +252,12 @@ void paintDrawingStrokes(
       }
     }
 
-    if (selectedStrokeId == stroke.id) {
+    if (compositeAsSingleStroke) {
+      canvas.restore();
+    }
+
+    if (selectedStrokeId == stroke.id ||
+        selectedStrokeIds.contains(stroke.id)) {
       _paintSelection(canvas, size, stroke);
     }
   }
@@ -307,16 +331,22 @@ class HandwritingLayer extends StatelessWidget {
     super.key,
     required this.strokes,
     this.selectedStrokeId,
+    this.selectedStrokeIds = const <String>{},
   });
 
   final List<DrawingStroke> strokes;
   final String? selectedStrokeId;
+  final Set<String> selectedStrokeIds;
 
   @override
   Widget build(BuildContext context) {
     return IgnorePointer(
       child: CustomPaint(
-        painter: _HandwritingPainter(strokes, selectedStrokeId),
+        painter: _HandwritingPainter(
+          strokes,
+          selectedStrokeId,
+          selectedStrokeIds,
+        ),
         size: Size.infinite,
       ),
     );
@@ -324,10 +354,15 @@ class HandwritingLayer extends StatelessWidget {
 }
 
 class _HandwritingPainter extends CustomPainter {
-  const _HandwritingPainter(this.strokes, this.selectedStrokeId);
+  const _HandwritingPainter(
+    this.strokes,
+    this.selectedStrokeId,
+    this.selectedStrokeIds,
+  );
 
   final List<DrawingStroke> strokes;
   final String? selectedStrokeId;
+  final Set<String> selectedStrokeIds;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -336,12 +371,14 @@ class _HandwritingPainter extends CustomPainter {
       size,
       strokes,
       selectedStrokeId: selectedStrokeId,
+      selectedStrokeIds: selectedStrokeIds,
     );
   }
 
   @override
   bool shouldRepaint(covariant _HandwritingPainter oldDelegate) {
     return oldDelegate.strokes != strokes ||
-        oldDelegate.selectedStrokeId != selectedStrokeId;
+        oldDelegate.selectedStrokeId != selectedStrokeId ||
+        oldDelegate.selectedStrokeIds != selectedStrokeIds;
   }
 }

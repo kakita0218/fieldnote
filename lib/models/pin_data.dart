@@ -5,8 +5,10 @@ class PinData {
     required this.pageNumber,
     required this.xRatio,
     required this.yRatio,
+    this.documentId = 'main',
     this.directionDegrees = 0,
     this.photoCount = 0,
+    this.name = '',
     this.note = '',
     this.colorValue = 0xFF1976D2,
     this.opacity = 1,
@@ -22,12 +24,14 @@ class PinData {
   });
 
   final String id;
+  final String documentId;
   final int number;
   final int pageNumber;
   final double xRatio;
   final double yRatio;
   final double directionDegrees;
   final int photoCount;
+  final String name;
   final String note;
   final bool boardEnabled;
   final String boardTemplateId;
@@ -46,12 +50,14 @@ class PinData {
 
   PinData copyWith({
     String? id,
+    String? documentId,
     int? number,
     int? pageNumber,
     double? xRatio,
     double? yRatio,
     double? directionDegrees,
     int? photoCount,
+    String? name,
     String? note,
     int? colorValue,
     double? opacity,
@@ -67,12 +73,14 @@ class PinData {
   }) {
     return PinData(
       id: id ?? this.id,
+      documentId: documentId ?? this.documentId,
       number: number ?? this.number,
       pageNumber: pageNumber ?? this.pageNumber,
       xRatio: xRatio ?? this.xRatio,
       yRatio: yRatio ?? this.yRatio,
       directionDegrees: directionDegrees ?? this.directionDegrees,
       photoCount: photoCount ?? this.photoCount,
+      name: name ?? this.name,
       note: note ?? this.note,
       colorValue: colorValue ?? this.colorValue,
       opacity: opacity ?? this.opacity,

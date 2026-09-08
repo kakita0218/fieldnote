@@ -2,6 +2,9 @@ name: Build FieldNote iOS
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/ipa-20260823
 
 permissions:
   contents: read

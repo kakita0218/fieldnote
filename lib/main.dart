@@ -11,12 +11,16 @@ import 'models/project_summary.dart';
 import 'painters/blueprint_background.dart';
 import 'screens/pdf_viewer_screen.dart';
 import 'services/project_repository.dart';
+import 'services/mobile_capabilities.dart';
 import 'theme/app_colors.dart';
 import 'widgets/logo.dart';
+import 'widgets/android_storage_gate.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SystemChrome.setPreferredOrientations(<DeviceOrientation>[
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
     DeviceOrientation.landscapeLeft,
     DeviceOrientation.landscapeRight,
   ]);
@@ -50,7 +54,7 @@ class FieldNoteApp extends StatelessWidget {
               displayColor: AppColors.textPrimary,
             ),
       ),
-      home: const HomeScreen(),
+      home: const AndroidStorageGate(child: HomeScreen()),
     );
   }
 }
@@ -120,6 +124,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           projectId: id,
           projectName: name,
           isNewProject: true,
+          simplifiedMobile: isSimplifiedMobile(context),
         ),
       ),
     );
@@ -137,6 +142,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           projectId: project.id,
           projectName: project.name,
           exportOnOpen: exportOnOpen,
+          simplifiedMobile: isSimplifiedMobile(context),
         ),
       ),
     );
@@ -229,6 +235,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    if (isSimplifiedMobile(context)) {
+      return _buildMobileHome();
+    }
     return Scaffold(
       body: BlueprintBackground(
         child: SafeArea(
@@ -286,6 +295,51 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  Widget _buildMobileHome() {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: AppColors.panel,
+        title: const FieldNoteLogo(markSize: 36, fontSize: 24),
+      ),
+      body: BlueprintBackground(
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                FilledButton.icon(
+                  onPressed: _newProject,
+                  icon: const Icon(Icons.add_rounded),
+                  label: const Text('新しい案件'),
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 15),
+                  ),
+                ),
+                const SizedBox(height: 18),
+                const Row(
+                  children: <Widget>[
+                    Icon(Icons.schedule_rounded, color: AppColors.accent),
+                    SizedBox(width: 8),
+                    Text(
+                      '案件一覧',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Expanded(child: _buildProjectList(showAll: true)),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildRecentHeader() {
     return Row(
       children: <Widget>[
@@ -328,7 +382,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildProjectList() {
+  Widget _buildProjectList({bool showAll = false}) {
     if (_loading) {
       return const Center(child: CircularProgressIndicator());
     }
@@ -337,10 +391,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     return ListView.separated(
       padding: const EdgeInsets.only(bottom: 8),
-      itemCount: _visibleProjects.length,
+      itemCount: showAll ? _projects.length : _visibleProjects.length,
       separatorBuilder: (_, __) => const SizedBox(height: 8),
       itemBuilder: (BuildContext context, int index) {
-        final ProjectSummary project = _visibleProjects[index];
+        final ProjectSummary project =
+            showAll ? _projects[index] : _visibleProjects[index];
         return _ProjectCard(
           project: project,
           isDeleting: _deletingProjectIds.contains(project.id),

@@ -5,6 +5,7 @@ import '../models/drawing_stroke.dart';
 Map<String, dynamic> serializeDrawingStroke(DrawingStroke stroke) {
   return <String, dynamic>{
     'id': stroke.id,
+    'documentId': stroke.documentId,
     'pageNumber': stroke.pageNumber,
     'width': stroke.width,
     'color': stroke.color.toARGB32(),
@@ -62,6 +63,7 @@ DrawingStroke? deserializeDrawingStroke(
   if (points.isEmpty) return null;
   return DrawingStroke(
     id: id,
+    documentId: map['documentId']?.toString() ?? 'main',
     pageNumber: (map['pageNumber'] as num?)?.toInt() ?? defaultPageNumber,
     points: points,
     width: ((map['width'] as num?)?.toDouble() ?? 3).clamp(0.5, 120),

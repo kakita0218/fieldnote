@@ -22,6 +22,22 @@ class ProjectFileStore {
     required Uint8List bytes,
   }) async {}
 
+  static Future<void> savePdfDocument({
+    required String projectId,
+    required String projectName,
+    required String documentId,
+    required String documentName,
+    required String folderName,
+    required int pageCount,
+    required Uint8List bytes,
+  }) async {}
+
+  static Future<Uint8List?> loadPdfDocument({
+    required String projectId,
+    required String documentId,
+  }) async =>
+      null;
+
   static Future<void> importProjectAtomically({
     required String projectId,
     required String projectName,
@@ -45,7 +61,9 @@ class ProjectFileStore {
     required String projectId,
     required String projectName,
     required String pinId,
+    String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
     required String fileName,
     required Uint8List bytes,
@@ -59,29 +77,37 @@ class ProjectFileStore {
 
   static Future<Uint8List?> loadPhotoBytes({
     required String projectId,
+    String documentId = 'main',
     required String photoId,
     required int pinNumber,
+    String pinName = '',
     required String fileName,
   }) async =>
       null;
 
   static Future<void> saveEditedPhoto({
     required String projectId,
+    String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
     required Uint8List bytes,
   }) async {}
 
   static Future<Uint8List?> loadEditedPhotoBytes({
     required String projectId,
+    String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
   }) async =>
       null;
 
   static Future<void> deleteEditedPhoto({
     required String projectId,
+    String documentId = 'main',
     required int pinNumber,
+    String pinName = '',
     required String photoId,
   }) async {}
 
@@ -118,9 +144,28 @@ class ProjectFileStore {
 
   static Future<bool> hasProject(String projectId) async => false;
 
-  static Future<String?> sourcePdfPath(String projectId) async => null;
+  static Future<String?> sourcePdfPath(
+    String projectId, {
+    String documentId = 'main',
+  }) async =>
+      null;
 
-  static Future<String?> outputPdfPath(String projectId) async => null;
+  static Future<String?> saveMobileExportPdf({
+    required String projectId,
+    required String fileName,
+    required Uint8List bytes,
+  }) async =>
+      null;
 
-  static Future<Uint8List?> loadOutputPdf(String projectId) async => null;
+  static Future<String?> outputPdfPath(
+    String projectId, {
+    String documentId = 'main',
+  }) async =>
+      null;
+
+  static Future<Uint8List?> loadOutputPdf(
+    String projectId, {
+    String documentId = 'main',
+  }) async =>
+      null;
 }
