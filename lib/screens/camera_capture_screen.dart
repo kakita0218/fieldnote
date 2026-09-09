@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
@@ -10,6 +11,7 @@ import '../models/photo_data.dart';
 import '../models/photo_board.dart';
 import '../models/photo_board_layout.dart';
 import '../services/native_project_service.dart';
+import '../services/retryable_serial_queue.dart';
 
 class CameraCaptureScreen extends StatefulWidget {
   const CameraCaptureScreen({
@@ -34,9 +36,8 @@ class CameraCaptureScreen extends StatefulWidget {
 
   /// Saves the original JPEG and returns the separately generated thumbnail.
   ///
-  /// The camera screen serializes and awaits calls to this callback. Keeping
-  /// only one full-resolution image pending prevents rapid capture from
-  /// retaining an unbounded queue of JPEGs on memory-constrained iPads.
+  /// The camera screen serializes calls to this callback. Captures waiting for
+  /// persistence remain as disk-backed [XFile]s instead of full JPEG bytes.
   final Future<PhotoData?> Function(Uint8List bytes) onCaptured;
   final ValueChanged<String> onPhotoTap;
 
@@ -52,7 +53,7 @@ class _CameraThumbnail {
   });
 
   final String id;
-  final Uint8List bytes;
+  final Uint8List? bytes;
   final bool isPending;
 
   _CameraThumbnail copyWith({
@@ -66,6 +67,20 @@ class _CameraThumbnail {
       isPending: isPending ?? this.isPending,
     );
   }
+}
+
+class _PendingPhotoSave {
+  const _PendingPhotoSave({
+    required this.id,
+    required this.file,
+    required this.board,
+    required this.shootingDate,
+  });
+
+  final String id;
+  final XFile file;
+  final PhotoBoardConfig board;
+  final String shootingDate;
 }
 
 class _CameraCaptureScreenState extends State<CameraCaptureScreen>
@@ -99,8 +114,9 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen>
   late List<_CameraThumbnail> _recentPhotos;
   late PhotoBoardConfig _boardConfig;
   String? _emphasizedThumbnailId;
-  Future<void> _saveTail = Future<void>.value();
   Future<void>? _activeCapture;
+  final RetryableSerialQueue<String, _PendingPhotoSave> _photoSaveQueue =
+      RetryableSerialQueue<String, _PendingPhotoSave>();
   Timer? _focusIndicatorTimer;
   Offset? _focusPoint;
   bool _focusIndicatorVisible = false;
@@ -403,21 +419,14 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen>
       if (defaultTargetPlatform != TargetPlatform.iOS) {
         unawaited(SystemSound.play(SystemSoundType.click));
       }
-      final Uint8List originalBytes = await file.readAsBytes();
-      final Uint8List bytes = captureBoard.enabled
-          ? await NativeProjectService.composePhotoBoard(
-              jpegBytes: originalBytes,
-              businessName: captureBoard.businessName,
-              facilityName: captureBoard.facilityName,
-              shootingDate: _formatBoardDate(DateTime.now()),
-              shootingLocation: captureBoard.shootingLocation,
-              workStatus: captureBoard.stepLabel,
-              position: captureBoard.position.id,
-            )
-          : originalBytes;
-
       final String pendingId =
           'pending-${DateTime.now().microsecondsSinceEpoch}';
+      final _PendingPhotoSave pendingSave = _PendingPhotoSave(
+        id: pendingId,
+        file: file,
+        board: captureBoard,
+        shootingDate: _formatBoardDate(DateTime.now()),
+      );
       if (mounted) {
         setState(() {
           _photoCount += 1;
@@ -426,7 +435,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen>
             0,
             _CameraThumbnail(
               id: pendingId,
-              bytes: bytes,
+              bytes: null,
               isPending: true,
             ),
           );
@@ -446,14 +455,36 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen>
         );
       }
 
-      // Saving can take noticeably longer than AVCapturePhotoOutput becoming
-      // ready for the next shot. Queue the durable write, but release the
-      // shutter as soon as the captured image and thumbnail are prepared.
-      // _closeCamera still waits for the queue, so leaving the screen cannot
-      // discard an in-flight photo.
-      unawaited(_queueOriginalSave(pendingId, bytes, captureBoard));
+      // Queue a disk-backed capture and release the shutter immediately. The
+      // PDF back action waits for this queue before leaving the camera.
+      unawaited(
+        _photoSaveQueue.enqueue(
+          pendingSave.id,
+          pendingSave,
+          _saveOriginalPhoto,
+        ),
+      );
       if (captureBoard.enabled) {
-        _advanceBoardAfterSaved(captureBoard);
+        _advanceBoardAfterCaptureQueued(captureBoard);
+      }
+
+      // The full JPEG is already represented by its unique on-disk XFile in
+      // the queue. Decode only a small UI preview after persistence has begun.
+      try {
+        final Uint8List previewBytes = await _makeCaptureThumbnail(file);
+        if (mounted) {
+          final int index =
+              _recentPhotos.indexWhere((photo) => photo.id == pendingId);
+          if (index >= 0) {
+            setState(() {
+              _recentPhotos[index] =
+                  _recentPhotos[index].copyWith(bytes: previewBytes);
+            });
+          }
+        }
+      } catch (_) {
+        // Saving the original is authoritative; a preview failure must never
+        // discard a successfully captured photo.
       }
     } catch (error) {
       if (mounted) {
@@ -466,69 +497,80 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen>
     }
   }
 
-  Future<void> _queueOriginalSave(
-    String pendingId,
-    Uint8List bytes,
-    PhotoBoardConfig captureBoard,
-  ) {
-    _saveTail = _saveTail.then((_) async {
-      PhotoData? savedPhoto;
-      Object? saveError;
+  Future<Uint8List> _makeCaptureThumbnail(XFile file) async {
+    final Uint8List bytes = await file.readAsBytes();
+    final ui.Codec codec = await ui.instantiateImageCodec(
+      bytes,
+      targetWidth: 360,
+    );
+    try {
+      final ui.FrameInfo frame = await codec.getNextFrame();
       try {
-        savedPhoto = await widget.onCaptured(bytes);
-        if (savedPhoto == null) {
-          throw StateError('写真の保存結果を取得できませんでした。');
+        final ByteData? data =
+            await frame.image.toByteData(format: ui.ImageByteFormat.png);
+        if (data == null) {
+          throw StateError('撮影画像のプレビューを作成できませんでした。');
         }
-      } catch (error) {
-        saveError = error;
-      }
-
-      if (!mounted) return;
-
-      final PhotoData? result = savedPhoto;
-      setState(() {
-        final int index =
-            _recentPhotos.indexWhere((photo) => photo.id == pendingId);
-
-        if (result != null) {
-          if (index >= 0) {
-            _recentPhotos[index] = _recentPhotos[index].copyWith(
-              id: result.id,
-              bytes: result.bytes,
-              isPending: false,
-            );
-          }
-        } else {
-          if (index >= 0) {
-            _recentPhotos.removeAt(index);
-          }
-          _photoCount = (_photoCount - 1).clamp(0, 1 << 30).toInt();
-        }
-      });
-      if (saveError != null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('写真を保存できませんでした：$saveError')),
+        return data.buffer.asUint8List(
+          data.offsetInBytes,
+          data.lengthInBytes,
         );
+      } finally {
+        frame.image.dispose();
       }
-    }).catchError((Object error, StackTrace stackTrace) {
-      // Keep the serial queue usable after an unexpected storage/UI error.
-      if (!mounted) return;
-      setState(() {
-        final int index =
-            _recentPhotos.indexWhere((photo) => photo.id == pendingId);
-        if (index >= 0) {
-          _recentPhotos.removeAt(index);
-        }
-        _photoCount = (_photoCount - 1).clamp(0, 1 << 30).toInt();
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('写真を保存できませんでした：$error')),
-      );
-    });
-    return _saveTail;
+    } finally {
+      codec.dispose();
+    }
   }
 
-  void _advanceBoardAfterSaved(PhotoBoardConfig captured) {
+  Future<bool> _saveOriginalPhoto(_PendingPhotoSave pendingSave) async {
+    PhotoData? savedPhoto;
+    try {
+      final Uint8List originalBytes = await pendingSave.file.readAsBytes();
+      final PhotoBoardConfig captureBoard = pendingSave.board;
+      final Uint8List bytes = captureBoard.enabled
+          ? await NativeProjectService.composePhotoBoard(
+              jpegBytes: originalBytes,
+              businessName: captureBoard.businessName,
+              facilityName: captureBoard.facilityName,
+              shootingDate: pendingSave.shootingDate,
+              shootingLocation: captureBoard.shootingLocation,
+              workStatus: captureBoard.stepLabel,
+              position: captureBoard.position.id,
+            )
+          : originalBytes;
+      savedPhoto = await widget.onCaptured(bytes);
+      if (savedPhoto == null) {
+        throw StateError('写真の保存結果を取得できませんでした。');
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('写真を保存できませんでした：$error')),
+        );
+      }
+      return false;
+    }
+
+    if (mounted) {
+      final PhotoData result = savedPhoto;
+      setState(() {
+        final int index = _recentPhotos.indexWhere(
+          (photo) => photo.id == pendingSave.id,
+        );
+        if (index >= 0) {
+          _recentPhotos[index] = _recentPhotos[index].copyWith(
+            id: result.id,
+            bytes: result.bytes,
+            isPending: false,
+          );
+        }
+      });
+    }
+    return true;
+  }
+
+  void _advanceBoardAfterCaptureQueued(PhotoBoardConfig captured) {
     final Map<PhotoBoardTemplate, int> steps =
         Map<PhotoBoardTemplate, int>.from(_boardConfig.templateSteps);
     steps[captured.template] = math.min(
@@ -555,9 +597,27 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen>
 
     try {
       await _activeCapture;
-      await _saveTail;
+      await _photoSaveQueue.drain();
+      if (_photoSaveQueue.pendingCount > 0) {
+        await _photoSaveQueue.retryPending(_saveOriginalPhoto);
+      }
+      if (_photoSaveQueue.pendingCount > 0) {
+        if (mounted) {
+          setState(() => _closing = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                '未保存の写真が${_photoSaveQueue.pendingCount}枚あります。'
+                '空き容量を確認して、もう一度戻るを押してください。',
+              ),
+              duration: const Duration(seconds: 6),
+            ),
+          );
+        }
+        return;
+      }
     } finally {
-      if (mounted) {
+      if (mounted && _photoSaveQueue.pendingCount == 0) {
         setState(() => _allowPop = true);
         await Future<void>.delayed(Duration.zero);
         if (mounted) {
@@ -1503,7 +1563,7 @@ class _CameraThumbnailCard extends StatelessWidget {
     this.onTap,
   });
 
-  final Uint8List bytes;
+  final Uint8List? bytes;
   final bool isPending;
   final double width;
   final double height;
@@ -1536,12 +1596,24 @@ class _CameraThumbnailCard extends StatelessWidget {
           child: Stack(
             fit: StackFit.expand,
             children: [
-              Image.memory(
-                bytes,
-                fit: BoxFit.cover,
-                gaplessPlayback: true,
-                cacheWidth: 360,
-              ),
+              if (bytes != null)
+                Image.memory(
+                  bytes!,
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true,
+                  cacheWidth: 360,
+                )
+              else
+                const ColoredBox(
+                  color: Color(0xFF303030),
+                  child: Center(
+                    child: Icon(
+                      Icons.photo_rounded,
+                      color: Colors.white54,
+                      size: 30,
+                    ),
+                  ),
+                ),
               if (isPending)
                 Positioned(
                   right: 7,
